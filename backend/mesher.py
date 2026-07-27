@@ -1,4 +1,3 @@
-import gmsh
 import numpy as np
 import threading
 from typing import List, Tuple, Set
@@ -6,13 +5,26 @@ from models import SlabGeometry, FEMMesh, Triangle, Point2D, FEMNode, MeshReques
 
 _lock = threading.Lock()
 
-# Initialize Gmsh at import time (main thread)
-gmsh.initialize()
-gmsh.option.setNumber("General.Terminal", 0)
+# Gmsh needs native system libs (libGLU, X11) that may be missing on minimal
+# hosts. Import/initialize defensively so the whole API still starts; only the
+# /api/mesh endpoint degrades (the frontend has a built-in TS mesher fallback).
+_gmsh_import_error: Exception | None = None
+try:
+    import gmsh
+    # Initialize Gmsh at import time (main thread)
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+except Exception as e:  # ImportError or OSError (missing libGLU.so.1 etc.)
+    gmsh = None  # type: ignore[assignment]
+    _gmsh_import_error = e
 
 
 def _ensure_gmsh():
-    pass
+    if gmsh is None:
+        raise RuntimeError(
+            f"gmsh is unavailable on this server: {_gmsh_import_error}. "
+            "Install system libraries libglu1-mesa/libgl1 (see backend/Dockerfile)."
+        )
 
 def _point_on_segment(px: float, py: float, ax: float, ay: float,
                       bx: float, by: float, tol: float = 1e-8) -> bool:

@@ -281,12 +281,23 @@ def test_3_column_supported_4corners():
     print(f"  Column spring Kθ:      {kth:.0f} N·m/rad")
     print(f"  VERDICT:               {'PASS' if error_pct < 15 else 'FAIL'} (threshold: 15%)")
 
-    # Check corner nodes have ~0 deflection (column locations)
+    # Columns are modeled as ELASTIC compression springs (Kz = E·A/H), not rigid
+    # supports — so column nodes must show elastic shortening, NOT w = 0.
+    # By symmetry each column carries R = q·A/4, giving δ = R/Kz exactly.
+    kz_col = E_concrete * (col_w * col_d) / col_H          # 7.5e8 N/m
+    total_load_N = q_total_kpa * 1000 * a * a               # 360 kN
+    wz_expected = (total_load_N / 4) / kz_col               # ≈ 0.120 mm
     for nid in col_node_ids:
         for d in result.nodeDeflections:
             if d.nodeId == nid:
-                print(f"  Column node {nid}: wz = {d.wz*1000:.6f} mm (should be ~0)")
-                assert abs(d.wz) < 1e-6, f"Column node {nid} not properly constrained: wz={d.wz}"
+                print(f"  Column node {nid}: wz = {d.wz*1000:.6f} mm (elastic shortening, expected ≈ {wz_expected*1000:.4f} mm)")
+                assert abs(d.wz - wz_expected) < 0.15 * wz_expected, (
+                    f"Column node {nid} elastic shortening off: wz={d.wz}, expected≈{wz_expected}"
+                )
+                # And it must remain negligible vs span deflection
+                assert abs(d.wz) < 0.02 * abs(w_center) or abs(w_center) < 1e-9, (
+                    f"Column settlement {d.wz} too large relative to span deflection {w_center}"
+                )
 
     return error_pct, w_center, w_analytical
 

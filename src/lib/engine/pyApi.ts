@@ -219,6 +219,7 @@ export async function meshAndAnalyze(
         const clampT = t < 0 ? 0 : (t > 1 ? 1 : t);
         const px = w.startPoint.x + clampT * dx;
         const py = w.startPoint.y + clampT * dy;
+        const dist2 = (n.x - px) * (n.x - px) + (n.y - py) * (n.y - py);
         const wallTolSq = Math.max(0.0625, (meshSize * 0.5) * (meshSize * 0.5)); // 0.25m tolerance squared for robust boundary capture
         if (dist2 <= wallTolSq) {
           wallNodeIds.push(n.id);

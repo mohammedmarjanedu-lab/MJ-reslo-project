@@ -362,6 +362,7 @@
 
   let shiftHeld = $state(false);
   let contextHoleInfo: { slabId: string; holeIndex: number } | null = $state(null);
+  let canvasDragFileOver = $state(false);
   let lastMouseEvent: MouseEvent | null = null;
 
   function orthoPoint(start: Point2D, mouse: Point2D, shift: boolean): Point2D {
