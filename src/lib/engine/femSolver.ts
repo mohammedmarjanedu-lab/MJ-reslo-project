@@ -1590,13 +1590,23 @@ export function analyzeAllSlabs(
         }
       }
 
+      // Resultant recovery (ER polling: curvatures from the ROTATION gradient).
+      // Element DOF slots (identical in T3, Q4, Q8 formulations above):
+      //   slot 1 = θx — slope in the x-z plane (thin limit θx = dw/dx), κx = ∂θx/∂x
+      //   slot 2 = θy — slope in the y-z plane (thin limit θy = dw/dy), κy = ∂θy/∂y
+      // Engineering moment convention (sagging positive on gravity-loaded slabs,
+      // which deflect NEGATIVE downward in this solver): M = −D·w,ij, i.e.
+      //   κx = −∂θx/∂x   κy = −∂θy/∂y   κxy = −(∂θx/∂y + ∂θy/∂x)
+      // (The previous version read the two slots swapped and with inconsistent
+      // signs — a regression caught by the cylindrical-bending strip benchmark,
+      // where it returned κxy ≈ w,yy instead of My ≈ qL²/8.)
       let κx = 0, κy = 0, κxy = 0;
       for (let i = 0; i < npe; i++) {
-        const theta_x = u_e[3 * i + 1]; // Rotation about X (d_w / d_y)
-        const theta_y = u_e[3 * i + 2]; // Rotation about Y (-d_w / d_x)
-        κx += dN_dx[i] * theta_y;  // d^2_w / d_x^2
-        κy += dN_dy[i] * theta_x;  // d^2_w / d_y^2
-        κxy += dN_dx[i] * theta_x + dN_dy[i] * theta_y; // 2 * d^2_w / (dx dy)
+        const theta_x = u_e[3 * i + 1]; // slope in x (dw/dx)
+        const theta_y = u_e[3 * i + 2]; // slope in y (dw/dy)
+        κx -= dN_dx[i] * theta_x;
+        κy -= dN_dy[i] * theta_y;
+        κxy -= dN_dy[i] * theta_x + dN_dx[i] * theta_y;
       }
 
       const mx = (Dmat[0][0] * κx + Dmat[0][1] * κy);
