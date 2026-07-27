@@ -48,7 +48,7 @@ logger = logging.getLogger("uvicorn")
 
 from models import (
     AnalysisRequest, AnalysisResponse, MultiSlabAnalysisRequest, MultiSlabAnalysisResponse,
-    SlabAnalysisResult, NodeDeflection, Point2D, MeshRequest, FEMNode, FEMMesh, Triangle,
+    SlabAnalysisResult, NodeDeflection, ElementMoment, ElementShear, PunchingStress, Point2D, MeshRequest, FEMNode, FEMMesh, Triangle,
     ColumnSupport, WallSupport
 )
 from mesher import generate_mesh
@@ -640,7 +640,7 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
                 already_linked.add(slave_id)
 
 
-    # Shear Walls Fixities — fix Ux, Uy, Uz (translations) at wall nodes
+    # Shear Walls Fixities — fix Ux, Uy, Uz (pin support) at wall nodes
     for nid in wall_node_ids_set:
         if nid not in slave_nodes and nid in node_fixities:
             node_fixities[nid][0] = 1  # Ux
@@ -956,17 +956,180 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
         lt_factor = compute_long_term_multiplier(xi=2.0)
         cracked_wz_max = round(max_wz * 2.0 * (1.0 + lt_factor), 6)
 
-    # Calculate Center of Rigidity
+    # Recover Element Bending Moments, Shears & Punching Shear
+    E_val = request.elasticModulus or 25e9
+    h_val = request.thickness or 0.2
+    nu_val = request.poissonRatio or 0.2
+    D_plate = E_val * (h_val ** 3) / (12.0 * (1.0 - nu_val ** 2))
+
+    nn_mesh = len(mesh.nodes)
+    nodal_mx_k = [0.0] * (nn_mesh + 1)
+    nodal_my_k = [0.0] * (nn_mesh + 1)
+    nodal_mxy_k = [0.0] * (nn_mesh + 1)
+    nodal_area_k = [0.0] * (nn_mesh + 1)
+
+    node_coords_k = {n.id: (n.x, n.y) for n in mesh.nodes}
+    raw_elem_data_k = []
+
+    for elem in mesh.elements:
+        nids = elem.nodeIds
+        if len(nids) < 3:
+            continue
+        p1 = node_coords_k.get(nids[0])
+        p2 = node_coords_k.get(nids[1])
+        p3 = node_coords_k.get(nids[2])
+        if not p1 or not p2 or not p3:
+            continue
+
+        twoA = (p2[0] * p3[1] - p3[0] * p2[1]) + (p3[0] * p1[1] - p1[0] * p3[1]) + (p1[0] * p2[1] - p2[0] * p1[1])
+        area = 0.5 * abs(twoA)
+        if area < 1e-12:
+            continue
+
+        b1 = p2[1] - p3[1]; b2 = p3[1] - p1[1]; b3 = p1[1] - p2[1]
+        c1 = p3[0] - p2[0]; c2 = p1[0] - p3[0]; c3 = p2[0] - p1[0]
+
+        kn1, kn2, kn3 = kratos_nodes_map.get(nids[0]), kratos_nodes_map.get(nids[1]), kratos_nodes_map.get(nids[2])
+        rx1, ry1 = (kn1.GetSolutionStepValue(KM.ROTATION)[0], kn1.GetSolutionStepValue(KM.ROTATION)[1]) if kn1 else (0.0, 0.0)
+        rx2, ry2 = (kn2.GetSolutionStepValue(KM.ROTATION)[0], kn2.GetSolutionStepValue(KM.ROTATION)[1]) if kn2 else (0.0, 0.0)
+        rx3, ry3 = (kn3.GetSolutionStepValue(KM.ROTATION)[0], kn3.GetSolutionStepValue(KM.ROTATION)[1]) if kn3 else (0.0, 0.0)
+
+        dry_dx = (b1 * ry1 + b2 * ry2 + b3 * ry3) / twoA
+        dry_dy = (c1 * ry1 + c2 * ry2 + c3 * ry3) / twoA
+        drx_dx = (b1 * rx1 + b2 * rx2 + b3 * rx3) / twoA
+        drx_dy = (c1 * rx1 + c2 * rx2 + c3 * rx3) / twoA
+
+        kappa_x = dry_dx
+        kappa_y = -drx_dy
+        chi_xy = dry_dy - drx_dx
+
+        mx = (D_plate * (kappa_x + nu_val * kappa_y)) / 1000.0
+        my = (D_plate * (kappa_y + nu_val * kappa_x)) / 1000.0
+        mxy = (D_plate * 0.5 * (1.0 - nu_val) * chi_xy) / 1000.0
+
+        m_avg = 0.5 * (mx + my)
+        radius = math.hypot(0.5 * (mx - my), mxy)
+        m1 = m_avg + radius
+        m2 = m_avg - radius
+        angle = 0.5 * math.degrees(math.atan2(2.0 * mxy, mx - my)) if abs(mx - my) > 1e-12 or abs(mxy) > 1e-12 else 0.0
+
+        mxd_pos = mx + abs(mxy) if mx >= -abs(mxy) else 0.0
+        myd_pos = my + abs(mxy) if my >= -abs(mxy) else 0.0
+        mxd_neg = mx - abs(mxy) if mx <= abs(mxy) else 0.0
+        myd_neg = my - abs(mxy) if my <= abs(mxy) else 0.0
+
+        raw_elem_data_k.append({
+            'id': elem.id, 'nids': nids, 'area': area,
+            'b': [b1, b2, b3], 'c': [c1, c2, c3], 'twoA': twoA,
+            'mx': mx, 'my': my, 'mxy': mxy,
+            'm1': m1, 'm2': m2, 'angle': angle,
+            'mxd_pos': mxd_pos, 'myd_pos': myd_pos,
+            'mxd_neg': mxd_neg, 'myd_neg': myd_neg
+        })
+
+        for nid in nids:
+            if nid <= nn_mesh:
+                nodal_mx_k[nid] += mx * area
+                nodal_my_k[nid] += my * area
+                nodal_mxy_k[nid] += mxy * area
+                nodal_area_k[nid] += area
+
+    for nid in range(1, nn_mesh + 1):
+        if nodal_area_k[nid] > 1e-12:
+            nodal_mx_k[nid] /= nodal_area_k[nid]
+            nodal_my_k[nid] /= nodal_area_k[nid]
+            nodal_mxy_k[nid] /= nodal_area_k[nid]
+
+    element_moments_k = []
+    element_shears_k = []
+    min_mx = min_my = min_mxy = min_vx = min_vy = float('inf')
+    max_mx = max_my = max_mxy = max_vx = max_vy = float('-inf')
+
+    for ed in raw_elem_data_k:
+        nids = ed['nids']
+        spr_mx = (nodal_mx_k[nids[0]] + nodal_mx_k[nids[1]] + nodal_mx_k[nids[2]]) / 3.0
+        spr_my = (nodal_my_k[nids[0]] + nodal_my_k[nids[1]] + nodal_my_k[nids[2]]) / 3.0
+        spr_mxy = (nodal_mxy_k[nids[0]] + nodal_mxy_k[nids[1]] + nodal_mxy_k[nids[2]]) / 3.0
+
+        em = ElementMoment(
+            elementId=ed['id'],
+            mx=round(ed['mx'], 4), my=round(ed['my'], 4), mxy=round(ed['mxy'], 4),
+            m1=round(ed['m1'], 4), m2=round(ed['m2'], 4), angle=round(ed['angle'], 2),
+            mxd_pos=round(ed['mxd_pos'], 4), myd_pos=round(ed['myd_pos'], 4),
+            mxd_neg=round(ed['mxd_neg'], 4), myd_neg=round(ed['myd_neg'], 4),
+            spr_mx=round(spr_mx, 4), spr_my=round(spr_my, 4), spr_mxy=round(spr_mxy, 4)
+        )
+        element_moments_k.append(em)
+
+        min_mx = min(min_mx, ed['mx']); max_mx = max(max_mx, ed['mx'])
+        min_my = min(min_my, ed['my']); max_my = max(max_my, ed['my'])
+        min_mxy = min(min_mxy, ed['mxy']); max_mxy = max(max_mxy, ed['mxy'])
+
+        b, c, twoA = ed['b'], ed['c'], ed['twoA']
+        dmx_dx = (b[0] * nodal_mx_k[nids[0]] + b[1] * nodal_mx_k[nids[1]] + b[2] * nodal_mx_k[nids[2]]) / twoA
+        dmxy_dy = (c[0] * nodal_mxy_k[nids[0]] + c[1] * nodal_mxy_k[nids[1]] + c[2] * nodal_mxy_k[nids[2]]) / twoA
+        dmxy_dx = (b[0] * nodal_mxy_k[nids[0]] + b[1] * nodal_mxy_k[nids[1]] + b[2] * nodal_mxy_k[nids[2]]) / twoA
+        dmy_dy = (c[0] * nodal_my_k[nids[0]] + c[1] * nodal_my_k[nids[1]] + c[2] * nodal_my_k[nids[2]]) / twoA
+
+        vx = dmx_dx + dmxy_dy
+        vy = dmxy_dx + dmy_dy
+        v1 = math.hypot(vx, vy)
+        v_angle = math.degrees(math.atan2(vy, vx)) if abs(vx) > 1e-12 or abs(vy) > 1e-12 else 0.0
+
+        element_shears_k.append(ElementShear(
+            elementId=ed['id'],
+            vx=round(vx, 3), vy=round(vy, 3),
+            v1=round(v1, 3), angle=round(v_angle, 2)
+        ))
+        min_vx = min(min_vx, vx); max_vx = max(max_vx, vx)
+        min_vy = min(min_vy, vy); max_vy = max(max_vy, vy)
+
+    if min_mx == float('inf'): min_mx = max_mx = 0.0
+    if min_my == float('inf'): min_my = max_my = 0.0
+    if min_mxy == float('inf'): min_mxy = max_mxy = 0.0
+    if min_vx == float('inf'): min_vx = max_vx = 0.0
+    if min_vy == float('inf'): min_vy = max_vy = 0.0
+
+    column_punching_k = []
+    d_eff_k = max(0.05, h_val - 0.03)
+    vc_cap_k = 0.25 * math.sqrt(25.0)
+
+    if request.columnNodeIds:
+        for ci, cnid in enumerate(request.columnNodeIds):
+            knode = kratos_nodes_map.get(cnid)
+            if knode:
+                disp_z = knode.GetSolutionStepValue(KM.DISPLACEMENT)[2]
+                cw = request.columnWidths[ci] if ci < len(request.columnWidths) else 0.3
+                cd = request.columnDepths[ci] if ci < len(request.columnDepths) else 0.3
+                ch = request.columnHeights[ci] if ci < len(request.columnHeights) else 3.0
+                kz_col = (E_val * cw * cd) / ch
+                Rz_col = abs(kz_col * disp_z) / 1000.0
+                bo_k = 2.0 * (cw + d_eff_k) + 2.0 * (cd + d_eff_k)
+                vu_k = (Rz_col * 1000.0) / (bo_k * d_eff_k * 1000.0) if (bo_k * d_eff_k) > 0 else 0.0
+                ratio_k = vu_k / vc_cap_k if vc_cap_k > 0 else 0.0
+                st_k = "OK" if ratio_k <= 1.0 else ("WARNING" if ratio_k <= 1.2 else "FAIL")
+                column_punching_k.append(PunchingStress(
+                    nodeId=cnid, force_kN=round(Rz_col, 2), stress_MPa=round(vu_k, 3),
+                    capacity_MPa=round(vc_cap_k, 3), ratio=round(ratio_k, 3), status=st_k,
+                    v_u_direct=round(vu_k, 3)
+                ))
+
     cr_x, cr_y = _calculate_cr_analytical(request)
 
     return AnalysisResponse(
         success=True,
         nodeDeflections=node_deflections,
-        minWz=round(min_wz, 10),
-        maxWz=round(max_wz, 10),
+        elementMoments=element_moments_k,
+        elementShears=element_shears_k,
+        columnPunching=column_punching_k,
+        minWz=round(min_wz, 10), maxWz=round(max_wz, 10),
+        minMx=round(min_mx, 4), maxMx=round(max_mx, 4),
+        minMy=round(min_my, 4), maxMy=round(max_my, 4),
+        minMxy=round(min_mxy, 4), maxMxy=round(max_mxy, 4),
+        minVx=round(min_vx, 3), maxVx=round(max_vx, 3),
+        minVy=round(min_vy, 3), maxVy=round(max_vy, 3),
         solverTime=round(solver_time, 4),
-        crX=round(cr_x, 6),
-        crY=round(cr_y, 6),
+        crX=round(cr_x, 6), crY=round(cr_y, 6),
         adaptive_iterations=1,
         cracked_deflection_max=cracked_wz_max
     )

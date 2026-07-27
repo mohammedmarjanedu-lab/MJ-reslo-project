@@ -4,10 +4,11 @@ from scipy.sparse.linalg import spsolve
 from typing import List, Tuple
 import time
 import warnings
+import math
 from models import FEMMesh, Triangle, Point2D
 from models import (
     AnalysisRequest, AnalysisResponse,
-    NodeDeflection
+    NodeDeflection, ElementMoment, ElementShear, PunchingStress
 )
 
 # DOF offsets per node (flat shell: u, v, w, θx, θy, θz)
@@ -828,7 +829,7 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
     u = np.zeros(ndof)
     u[free_dofs] = u_free
 
-    # Node deflections (only output — moments/shears/punching removed)
+    # Node deflections
     node_deflections = []
     for n in range(nn):
         base = NDOF_PER_NODE * n
@@ -846,10 +847,180 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
     min_wz = min(all_wz) if all_wz else 0.0
     max_wz = max(abs(w) for w in all_wz) if all_wz else 0.0
 
+    # -------------------------------------------------------------
+    # Element Bending Moments, Wood-Armer, SPR, Shears & Punching
+    # -------------------------------------------------------------
+    D_plate = E * (h ** 3) / (12.0 * (1.0 - nu ** 2))
+
+    nodal_mx = [0.0] * nn
+    nodal_my = [0.0] * nn
+    nodal_mxy = [0.0] * nn
+    nodal_area = [0.0] * nn
+
+    raw_element_data = []
+
+    for elem in mesh.elements:
+        nids = elem.nodeIds
+        if len(nids) < 3:
+            continue
+        p1 = nodes_xy[nids[0] - 1]
+        p2 = nodes_xy[nids[1] - 1]
+        p3 = nodes_xy[nids[2] - 1]
+
+        twoA = (p2[0] * p3[1] - p3[0] * p2[1]) + (p3[0] * p1[1] - p1[0] * p3[1]) + (p1[0] * p2[1] - p2[0] * p1[1])
+        area = 0.5 * abs(twoA)
+        if area < 1e-12:
+            continue
+
+        b1 = p2[1] - p3[1]; b2 = p3[1] - p1[1]; b3 = p1[1] - p2[1]
+        c1 = p3[0] - p2[0]; c2 = p1[0] - p3[0]; c3 = p2[0] - p1[0]
+
+        rx1, ry1 = u[NDOF_PER_NODE * (nids[0]-1) + RX], u[NDOF_PER_NODE * (nids[0]-1) + RY]
+        rx2, ry2 = u[NDOF_PER_NODE * (nids[1]-1) + RX], u[NDOF_PER_NODE * (nids[1]-1) + RY]
+        rx3, ry3 = u[NDOF_PER_NODE * (nids[2]-1) + RX], u[NDOF_PER_NODE * (nids[2]-1) + RY]
+
+        dry_dx = (b1 * ry1 + b2 * ry2 + b3 * ry3) / twoA
+        dry_dy = (c1 * ry1 + c2 * ry2 + c3 * ry3) / twoA
+        drx_dx = (b1 * rx1 + b2 * rx2 + b3 * rx3) / twoA
+        drx_dy = (c1 * rx1 + c2 * rx2 + c3 * rx3) / twoA
+
+        kappa_x = dry_dx
+        kappa_y = -drx_dy
+        chi_xy = dry_dy - drx_dx
+
+        mx = (D_plate * (kappa_x + nu * kappa_y)) / 1000.0
+        my = (D_plate * (kappa_y + nu * kappa_x)) / 1000.0
+        mxy = (D_plate * 0.5 * (1.0 - nu) * chi_xy) / 1000.0
+
+        m_avg = 0.5 * (mx + my)
+        radius = math.hypot(0.5 * (mx - my), mxy)
+        m1 = m_avg + radius
+        m2 = m_avg - radius
+        angle = 0.5 * math.degrees(math.atan2(2.0 * mxy, mx - my)) if abs(mx - my) > 1e-12 or abs(mxy) > 1e-12 else 0.0
+
+        mxd_pos = mx + abs(mxy) if mx >= -abs(mxy) else 0.0
+        myd_pos = my + abs(mxy) if my >= -abs(mxy) else 0.0
+        mxd_neg = mx - abs(mxy) if mx <= abs(mxy) else 0.0
+        myd_neg = my - abs(mxy) if my <= abs(mxy) else 0.0
+
+        raw_element_data.append({
+            'id': elem.id, 'nids': nids, 'area': area,
+            'b': [b1, b2, b3], 'c': [c1, c2, c3], 'twoA': twoA,
+            'mx': mx, 'my': my, 'mxy': mxy,
+            'm1': m1, 'm2': m2, 'angle': angle,
+            'mxd_pos': mxd_pos, 'myd_pos': myd_pos,
+            'mxd_neg': mxd_neg, 'myd_neg': myd_neg
+        })
+
+        for nid in nids:
+            idx = nid - 1
+            nodal_mx[idx] += mx * area
+            nodal_my[idx] += my * area
+            nodal_mxy[idx] += mxy * area
+            nodal_area[idx] += area
+
+    for i in range(nn):
+        if nodal_area[i] > 1e-12:
+            nodal_mx[i] /= nodal_area[i]
+            nodal_my[i] /= nodal_area[i]
+            nodal_mxy[i] /= nodal_area[i]
+
+    element_moments = []
+    element_shears = []
+    min_mx = min_my = min_mxy = min_vx = min_vy = float('inf')
+    max_mx = max_my = max_mxy = max_vx = max_vy = float('-inf')
+
+    for ed in raw_element_data:
+        nids = ed['nids']
+        spr_mx = (nodal_mx[nids[0]-1] + nodal_mx[nids[1]-1] + nodal_mx[nids[2]-1]) / 3.0
+        spr_my = (nodal_my[nids[0]-1] + nodal_my[nids[1]-1] + nodal_my[nids[2]-1]) / 3.0
+        spr_mxy = (nodal_mxy[nids[0]-1] + nodal_mxy[nids[1]-1] + nodal_mxy[nids[2]-1]) / 3.0
+
+        em = ElementMoment(
+            elementId=ed['id'],
+            mx=round(ed['mx'], 4),
+            my=round(ed['my'], 4),
+            mxy=round(ed['mxy'], 4),
+            m1=round(ed['m1'], 4),
+            m2=round(ed['m2'], 4),
+            angle=round(ed['angle'], 2),
+            mxd_pos=round(ed['mxd_pos'], 4),
+            myd_pos=round(ed['myd_pos'], 4),
+            mxd_neg=round(ed['mxd_neg'], 4),
+            myd_neg=round(ed['myd_neg'], 4),
+            spr_mx=round(spr_mx, 4),
+            spr_my=round(spr_my, 4),
+            spr_mxy=round(spr_mxy, 4)
+        )
+        element_moments.append(em)
+
+        min_mx = min(min_mx, ed['mx']); max_mx = max(max_mx, ed['mx'])
+        min_my = min(min_my, ed['my']); max_my = max(max_my, ed['my'])
+        min_mxy = min(min_mxy, ed['mxy']); max_mxy = max(max_mxy, ed['mxy'])
+
+        b, c, twoA = ed['b'], ed['c'], ed['twoA']
+        dmx_dx = (b[0] * nodal_mx[nids[0]-1] + b[1] * nodal_mx[nids[1]-1] + b[2] * nodal_mx[nids[2]-1]) / twoA
+        dmxy_dy = (c[0] * nodal_mxy[nids[0]-1] + c[1] * nodal_mxy[nids[1]-1] + c[2] * nodal_mxy[nids[2]-1]) / twoA
+        dmxy_dx = (b[0] * nodal_mxy[nids[0]-1] + b[1] * nodal_mxy[nids[1]-1] + b[2] * nodal_mxy[nids[2]-1]) / twoA
+        dmy_dy = (c[0] * nodal_my[nids[0]-1] + c[1] * nodal_my[nids[1]-1] + c[2] * nodal_my[nids[2]-1]) / twoA
+
+        vx = dmx_dx + dmxy_dy
+        vy = dmxy_dx + dmy_dy
+        v1 = math.hypot(vx, vy)
+        v_angle = math.degrees(math.atan2(vy, vx)) if abs(vx) > 1e-12 or abs(vy) > 1e-12 else 0.0
+
+        element_shears.append(ElementShear(
+            elementId=ed['id'],
+            vx=round(vx, 3), vy=round(vy, 3),
+            v1=round(v1, 3), angle=round(v_angle, 2)
+        ))
+        min_vx = min(min_vx, vx); max_vx = max(max_vx, vx)
+        min_vy = min(min_vy, vy); max_vy = max(max_vy, vy)
+
+    column_punching = []
+    d_eff = max(0.05, h - 0.03)
+    fck = 25.0
+    vc_capacity = 0.25 * math.sqrt(fck)
+
+    for ci, nidx in enumerate(col_node_indices):
+        w_def = u[NDOF_PER_NODE * nidx + W]
+        wcol = col_widths[ci] if ci < len(col_widths) else 0.3
+        dcol = col_depths[ci] if ci < len(col_depths) else 0.3
+        k_spring = col_spring_map.get(nidx, 1e8)
+        Rz = abs(k_spring * w_def) / 1000.0
+        bo = 2.0 * (wcol + d_eff) + 2.0 * (dcol + d_eff)
+        vu_stress = (Rz * 1000.0) / (bo * d_eff * 1000.0) if (bo * d_eff) > 0 else 0.0
+        ratio = vu_stress / vc_capacity if vc_capacity > 0 else 0.0
+        status = "OK" if ratio <= 1.0 else ("WARNING" if ratio <= 1.2 else "FAIL")
+
+        column_punching.append(PunchingStress(
+            nodeId=nidx + 1,
+            force_kN=round(Rz, 2),
+            stress_MPa=round(vu_stress, 3),
+            capacity_MPa=round(vc_capacity, 3),
+            ratio=round(ratio, 3),
+            status=status,
+            v_u_direct=round(vu_stress, 3)
+        ))
+
+    if min_mx == float('inf'): min_mx = max_mx = 0.0
+    if min_my == float('inf'): min_my = max_my = 0.0
+    if min_mxy == float('inf'): min_mxy = max_mxy = 0.0
+    if min_vx == float('inf'): min_vx = max_vx = 0.0
+    if min_vy == float('inf'): min_vy = max_vy = 0.0
+
     return AnalysisResponse(
         success=True,
         nodeDeflections=node_deflections,
+        elementMoments=element_moments,
+        elementShears=element_shears,
+        columnPunching=column_punching,
         minWz=round(min_wz, 10),
         maxWz=round(max_wz, 10),
+        minMx=round(min_mx, 4), maxMx=round(max_mx, 4),
+        minMy=round(min_my, 4), maxMy=round(max_my, 4),
+        minMxy=round(min_mxy, 4), maxMxy=round(max_mxy, 4),
+        minVx=round(min_vx, 3), maxVx=round(max_vx, 3),
+        minVy=round(min_vy, 3), maxVy=round(max_vy, 3),
         solverTime=round(solver_time, 4),
     )

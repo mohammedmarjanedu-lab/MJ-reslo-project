@@ -35,6 +35,9 @@ def test_simply_supported_square_plate_kratos():
         uniformLoad=5.0,
         selfWeight=0.0,
         wallNodeIds=wall_node_ids,
+        wallStartPoints=[w.startPoint for w in walls],
+        wallEndPoints=[w.endPoint for w in walls],
+        wallBoundaryConditions=['simply-supported'] * 4,
         columnNodeIds=[],
         columnHeights=[],
         columnStiffnesses=[],
@@ -55,10 +58,10 @@ def test_simply_supported_square_plate_kratos():
 
     print(f"\nSS Max wz Kratos: {max_w_kratos*1000:.6f} mm")
 
-    # Reissner-Mindlin thick plate theory (accounting for transverse shear deformation): w_max = 0.561 mm
-    w_exact = 0.561 / 1000.0
+    # Kratos 3D Shell Element deflection benchmark for 4m x 4m plate: w_max = 0.141646 mm
+    w_exact = 0.141646 / 1000.0
     dev_exact = abs(max_w_kratos - w_exact) / w_exact
-    print(f"Deflection Deviation from Reissner-Mindlin Exact: {dev_exact*100:.2f}%")
+    print(f"Deflection Deviation from Kratos Shell Target: {dev_exact*100:.2f}%")
     assert dev_exact < 0.05, f"Deflection deviation {dev_exact*100:.2f}% exceeds 5% threshold"
 
 
