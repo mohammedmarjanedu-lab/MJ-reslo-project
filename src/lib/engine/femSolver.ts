@@ -7,6 +7,7 @@ import type {
 import { generateSlabMesh } from './meshGenerator';
 import { pointInPolygon, distance, polygonSignedArea, polygonCentroid } from './mathEngine';
 import { runSlabDesign } from './is456Design';
+import { computeDKTStiffness, computeDKTElementLoad } from './dktSolver';
 
 function pointToSegmentDist(p: Point2D, a: Point2D, b: Point2D): number {
   const dx = b.x - a.x, dy = b.y - a.y;
@@ -15,6 +16,28 @@ function pointToSegmentDist(p: Point2D, a: Point2D, b: Point2D): number {
   let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
   t = Math.max(0, Math.min(1, t));
   return distance(p, { x: a.x + t * dx, y: a.y + t * dy });
+}
+
+export function pointToPolygonDist(p: Point2D, poly: Point2D[]): number {
+  if (poly.length < 3) return Infinity;
+  let minD = Infinity;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const d = pointToSegmentDist(p, a, b);
+    if (d < minD) minD = d;
+  }
+  return minD;
+}
+
+function findPolygonIntersectingSegments(poly: Point2D[], segmentA: Point2D, segmentB: Point2D): Point2D[] {
+  const pts: Point2D[] = [];
+  for (let i = 0; i < poly.length; i++) {
+    const j = (i + 1) % poly.length;
+    const inter = lineSegmentIntersection(poly[i], poly[j], segmentA, segmentB);
+    if (inter) pts.push(inter);
+  }
+  return pts;
 }
 
 /**
@@ -461,108 +484,25 @@ function computeQ4ElementLoad(nodes: Point2D[], q: number): number[] {
 }
 
 /**
- * Compute the 9×9 element stiffness matrix for a constant-strain triangle (T3) Mindlin-Reissner plate.
- * 3 nodes × 3 DOF (w, θx, θy) = 9 DOF.
- * Uses 1-point Gauss integration (centroid) — constant B matrices.
- */
 function computeT3PlateStiffness(
   nodes: Point2D[],
   E: number, ν: number, t: number
 ): number[][] {
-  const x1 = nodes[0].x, y1 = nodes[0].y;
-  const x2 = nodes[1].x, y2 = nodes[1].y;
-  const x3 = nodes[2].x, y3 = nodes[2].y;
-
-  const detJ = (x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1);
-  const area = detJ / 2;
-  if (area < 1e-15) return Array.from({ length: 9 }, () => new Array(9).fill(0));
-
-  // Shape function derivatives (constant)
-  const dN1dx = (y2 - y3) / detJ;
-  const dN1dy = (x3 - x2) / detJ;
-  const dN2dx = (y3 - y1) / detJ;
-  const dN2dy = (x1 - x3) / detJ;
-  const dN3dx = (y1 - y2) / detJ;
-  const dN3dy = (x2 - x1) / detJ;
-
-  // Shape functions at centroid (ξ=1/3, η=1/3 in natural coords)
-  const N1 = 1 / 3, N2 = 1 / 3, N3 = 1 / 3;
-  const N = [N1, N2, N3];
-  const dNdx = [dN1dx, dN2dx, dN3dx];
-  const dNdy = [dN1dy, dN2dy, dN3dy];
-
-  const D = E * t * t * t / (12 * (1 - ν * ν));
-  const Db = [
-    [D, D * ν, 0],
-    [D * ν, D, 0],
-    [0, 0, D * (1 - ν) / 2],
+  const x = [nodes[0].x, nodes[1].x, nodes[2].x];
+  const y = [nodes[0].y, nodes[1].y, nodes[2].y];
+  const D_coef = E * Math.pow(t, 3) / (12 * (1 - ν * ν));
+  const D = [
+    [D_coef, D_coef * ν, 0],
+    [D_coef * ν, D_coef, 0],
+    [0, 0, D_coef * (1 - ν) / 2]
   ];
-  const Gmod = E / (2 * (1 + ν));
-  const κ = 5 / 6;
-  const Ds = Gmod * t * κ;
-
-  // Bending Bb (3×9)
-  const Bb: number[][] = Array.from({ length: 3 }, () => new Array(9).fill(0));
-  for (let i = 0; i < 3; i++) {
-    Bb[0][3 * i + 1] = dNdx[i];
-    Bb[1][3 * i + 2] = dNdy[i];
-    Bb[2][3 * i + 1] = dNdy[i];
-    Bb[2][3 * i + 2] = dNdx[i];
-  }
-
-  // Shear Bs (2×9)
-  const Bs: number[][] = Array.from({ length: 2 }, () => new Array(9).fill(0));
-  for (let i = 0; i < 3; i++) {
-    Bs[0][3 * i] = dNdx[i];
-    Bs[0][3 * i + 1] = -N[i];
-    Bs[1][3 * i] = dNdy[i];
-    Bs[1][3 * i + 2] = -N[i];
-  }
-
-  const Ke: number[][] = Array.from({ length: 9 }, () => new Array(9).fill(0));
-
-  // Bending contribution: A * (Bb^T * Db * Bb)
-  const tempB = Array.from({ length: 3 }, () => new Array(9).fill(0));
-  for (let r = 0; r < 3; r++) {
-    for (let c = 0; c < 9; c++) {
-      let sum = 0;
-      for (let k = 0; k < 3; k++) sum += Db[r][k] * Bb[k][c];
-      tempB[r][c] = sum;
-    }
-  }
-  for (let r = 0; r < 9; r++) {
-    for (let c = 0; c < 9; c++) {
-      let sum = 0;
-      for (let k = 0; k < 3; k++) sum += Bb[k][r] * tempB[k][c];
-      Ke[r][c] += sum * area;
-    }
-  }
-
-  // Shear contribution: A * (Bs^T * Ds * Bs)
-  for (let r = 0; r < 9; r++) {
-    for (let c = 0; c < 9; c++) {
-      let sum = 0;
-      for (let k = 0; k < 2; k++) sum += Bs[k][r] * Ds * Bs[k][c];
-      Ke[r][c] += sum * area;
-    }
-  }
-
-  return Ke;
+  return computeDKTStiffness(x, y, D);
 }
 
 function computeT3ElementLoad(nodes: Point2D[], q: number): number[] {
-  const x1 = nodes[0].x, y1 = nodes[0].y;
-  const x2 = nodes[1].x, y2 = nodes[1].y;
-  const x3 = nodes[2].x, y3 = nodes[2].y;
-  const detJ = (x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1);
-  const area = Math.abs(detJ) / 2;
-  if (area < 1e-15) return new Array(9).fill(0);
-  // Consistent load: fe_i = N_i * q * A / 3  (each node gets 1/3 of total load)
-  const fe = new Array(9).fill(0);
-  for (let i = 0; i < 3; i++) {
-    fe[3 * i] = q * area / 3;
-  }
-  return fe;
+  const x = [nodes[0].x, nodes[1].x, nodes[2].x];
+  const y = [nodes[0].y, nodes[1].y, nodes[2].y];
+  return computeDKTElementLoad(x, y, q);
 }
 
 function findClosestNode(nodes: FEMNode[], p: Point2D): number {
@@ -954,8 +894,16 @@ export function analyzeAllSlabs(
         Ke = computeQ8PlateStiffness(elemNodes, E, ν, t_elem);
         fe = computeQ8ElementLoad(elemNodes, q_elem);
       } else if (npe === 3) {
-        Ke = computeT3PlateStiffness(elemNodes, E, ν, t_elem);
-        fe = computeT3ElementLoad(elemNodes, q_elem);
+        const x = [elemNodes[0].x, elemNodes[1].x, elemNodes[2].x];
+        const y = [elemNodes[0].y, elemNodes[1].y, elemNodes[2].y];
+        const D_coef = E * Math.pow(t_elem, 3) / (12 * (1 - ν * ν));
+        const D = [
+          [D_coef, D_coef * ν, 0],
+          [D_coef * ν, D_coef, 0],
+          [0, 0, D_coef * (1 - ν) / 2]
+        ];
+        Ke = computeDKTStiffness(x, y, D);
+        fe = computeDKTElementLoad(x, y, q_elem);
       } else {
         Ke = computeQ4PlateStiffness(elemNodes, E, ν, t_elem);
         fe = computeQ4ElementLoad(elemNodes, q_elem);

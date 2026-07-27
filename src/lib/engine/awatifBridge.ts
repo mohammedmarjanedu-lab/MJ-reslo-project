@@ -50,7 +50,7 @@ export function createAwatifModel() {
         nodes: e.nodeIds,
         thickness: slab.thickness,
         elasticity: slab.elasticModulus || 25e9,
-        poissonRatio: slab.poissonRatio || 0.2
+        poissonRatio: 0.2
       }));
 
       const supports: AwatifSupport[] = [];
