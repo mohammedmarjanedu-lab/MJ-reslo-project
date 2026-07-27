@@ -21,7 +21,7 @@ function pointToSegmentDist(p: Point2D, a: Point2D, b: Point2D): number {
  * Check if two slab polygons touch, overlap, or share an edge within tolerance.
  * Used to detect connected components for multi-slab analysis.
  */
-function slabsTouch(a: Point2D[], b: Point2D[], tol = 0.75): boolean {
+export function slabsTouch(a: Point2D[], b: Point2D[], tol = 0.75): boolean {
   if (a.length < 3 || b.length < 3) return false;
   // Quick bounding-box check
   const aMinX = Math.min(...a.map(v => v.x)), aMaxX = Math.max(...a.map(v => v.x));
@@ -600,7 +600,10 @@ function findPolygonIntersectingSegments(poly: Point2D[], segmentA: Point2D, seg
   for (let i = 0; i < poly.length; i++) {
     const j = (i + 1) % poly.length;
     const inter = lineSegmentIntersection(poly[i], poly[j], segmentA, segmentB);
-    if (inter) pts.push(inter);
+    if (inter) {
+      // Dedupe: an intersection at a polygon vertex is reported by both adjacent edges
+      if (!pts.some(p => Math.hypot(p.x - inter.x, p.y - inter.y) < 1e-9)) pts.push(inter);
+    }
   }
   return pts;
 }
@@ -616,9 +619,13 @@ export function findCollinearSlabEdge(poly: Point2D[], a: Point2D, b: Point2D, t
     // Direction vectors must be parallel
     const cross = Math.abs((b.x - a.x) * e_dy - (b.y - a.y) * e_dx);
     if (cross > tol) continue;
-    // Distance from point a to the line through (p1,p2) must be ~0 (same line)
-    const distA = pointToSegmentDist(a, p1, p2);
-    if (distA > tol) continue;
+    // Perpendicular distance from (a,b) to the LINE through (p1,p2) must be ~0 (same line).
+    // Use the infinite line (not the segment) so partial/T-junction overlaps are detected —
+    // point overlap is handled by the parametric projection below.
+    const lineLen = Math.sqrt(e_len2);
+    const distLineA = Math.abs((a.x - p1.x) * e_dy - (a.y - p1.y) * e_dx) / lineLen;
+    const distLineB = Math.abs((b.x - p1.x) * e_dy - (b.y - p1.y) * e_dx) / lineLen;
+    if (distLineA > tol || distLineB > tol) continue;
     // Project (a,b) onto (p1,p2) to find overlapping portion
     const t_a = ((a.x - p1.x) * e_dx + (a.y - p1.y) * e_dy) / e_len2;
     const t_b = ((b.x - p1.x) * e_dx + (b.y - p1.y) * e_dy) / e_len2;
@@ -891,7 +898,196 @@ export function analyzeAllSlabs(
 
   const ndof = nextExtraDof;
   if (ndof === 0) return { results: [], warnings: [] };
-  
+
+  // ─── 2b. Edge constraints (ETABS-style automatic line constraints) ───
+  // Meshes of touching slabs are generated independently, so boundary nodes along a shared
+  // edge do not always coincide (T-junctions, offset grids). Merging alone would leave those
+  // nodes untied, tearing the joint (contour "cracks"). For every unshared boundary node of
+  // slab A lying on slab B's boundary segment, tie its DOFs by linear interpolation of the two
+  // bracketing B-side boundary nodes:  u_slave − (1−t)·u_B1 − t·u_B2 = 0  (penalty MPC).
+  // Hinged (discontinuous) joints tie translations only; rotations stay free.
+  interface MpcTerm { dof: number; weight: number }
+  interface MpcConstraint { slaveDof: number; masters: MpcTerm[] }
+  const mpcConstraints: MpcConstraint[] = [];
+
+  {
+    // global node exemplars: globalIdx -> [{slabId, localId}], and reverse sets
+    const owners = new Map<number, { slabId: string; localId: number }[]>();
+    for (const n of allNodes) {
+      const g = n.globalIdx!;
+      let arr = owners.get(g);
+      if (!arr) { arr = []; owners.set(g, arr); }
+      arr.push({ slabId: n.slabId, localId: n.localId });
+    }
+    const ownedBySlab = new Map<string, Set<number>>(); // slabId -> globalIdx it touches (merged or own)
+    for (const [g, arr] of owners) {
+      for (const o of arr) {
+        let s = ownedBySlab.get(o.slabId);
+        if (!s) { s = new Set(); ownedBySlab.set(o.slabId, s); }
+        s.add(g);
+      }
+    }
+
+    const edgeTol = Math.max(mergeTol, meshSize * 0.45);
+    const tiedSlaves = new Set<number>();
+
+    const isPointDiscontinuous = (slabId: string, p: Point2D, tol: number): boolean => {
+      const s = slabMeshes.find(sm => sm.slab.id === slabId)?.slab;
+      if (!s || !s.discontinuousEdges) return false;
+      for (const seg of s.discontinuousEdges) {
+        if (pointToSegmentDist(p, seg.startPoint, seg.endPoint) < tol) return true;
+      }
+      return false;
+    };
+
+    // Bipartite per-pair tying (identical rule to the backend kratos_solver):
+    // slaves come ONLY from the sparser side of each interface pair, masters ONLY from
+    // the denser side, so the constraint graph is acyclic by construction — bidirectional
+    // tying would create circular slave<->master penalty webs that lock the joint to ~0.
+    for (let ia = 0; ia < slabMeshes.length; ia++) {
+      const slabA = slabMeshes[ia].slab;
+      for (let ib = ia + 1; ib < slabMeshes.length; ib++) {
+        const slabB = slabMeshes[ib].slab;
+        if (!slabsTouch(slabA.vertices, slabB.vertices, Math.max(0.75, meshSize * 1.5))) continue;
+        const bOwned = ownedBySlab.get(slabB.id) ?? new Set<number>();
+        const aOwned = ownedBySlab.get(slabA.id) ?? new Set<number>();
+
+        // 1. Interface overlaps between the two polygons (deduped — a shared segment
+        //    coincides with an edge of BOTH polygons).
+        interface InterfaceSeg {
+          p: Point2D; q: Point2D;
+          param: (n: Point2D) => number;
+          onSeg: (n: Point2D) => boolean;
+        }
+        const segs: InterfaceSeg[] = [];
+        const seenSegKeys = new Set<string>();
+        for (const [sv, dv] of [[slabA.vertices, slabB.vertices], [slabB.vertices, slabA.vertices]] as const) {
+          for (let ei = 0; ei < sv.length; ei++) {
+            const a1 = sv[ei], a2 = sv[(ei + 1) % sv.length];
+            const col = findCollinearSlabEdge(dv, a1, a2, edgeTol);
+            if (!col) continue;
+            const p = col.edgeA, q = col.edgeB;
+            const sdx = q.x - p.x, sdy = q.y - p.y;
+            const slen2 = sdx * sdx + sdy * sdy;
+            if (slen2 < 1e-12) continue;
+            const k1 = `${Math.round(p.x * 1000)},${Math.round(p.y * 1000)}`;
+            const k2 = `${Math.round(q.x * 1000)},${Math.round(q.y * 1000)}`;
+            const key = k1 < k2 ? `${k1}|${k2}` : `${k2}|${k1}`;
+            if (seenSegKeys.has(key)) continue;
+            seenSegKeys.add(key);
+            const ws = Math.sqrt(slen2);
+            const param = (n: Point2D) => ((n.x - p.x) * sdx + (n.y - p.y) * sdy) / slen2;
+            const onSeg = (n: Point2D) => {
+              const s = param(n);
+              if (s < -edgeTol * 1.01 / ws - 0.01 || s > 1.01) return false;
+              return pointToSegmentDist(n, p, q) < edgeTol;
+            };
+            segs.push({ p, q, param, onSeg });
+          }
+        }
+        if (segs.length === 0) continue;
+
+        // 2. Per-segment node sets: every node each side touches on the segment,
+        //    and the unshared (unmerged) untied nodes that may become slaves.
+        interface SegData {
+          seg: InterfaceSeg;
+          aOn: { g: number; s: number }[];
+          bOn: { g: number; s: number }[];
+          aFree: { g: number; s: number }[];
+          bFree: { g: number; s: number }[];
+        }
+        const segData: SegData[] = [];
+        let aTotal = 0, bTotal = 0;
+        for (const seg of segs) {
+          const aOn: { g: number; s: number }[] = [];
+          for (const g of aOwned) {
+            const n = globalNodes[g];
+            if (seg.onSeg(n)) aOn.push({ g, s: seg.param(n) });
+          }
+          aOn.sort((u, v) => u.s - v.s);
+          const bOn: { g: number; s: number }[] = [];
+          for (const g of bOwned) {
+            const n = globalNodes[g];
+            if (seg.onSeg(n)) bOn.push({ g, s: seg.param(n) });
+          }
+          bOn.sort((u, v) => u.s - v.s);
+          const aFree = aOn.filter(e => !bOwned.has(e.g) && !tiedSlaves.has(e.g));
+          const bFree = bOn.filter(e => !aOwned.has(e.g) && !tiedSlaves.has(e.g));
+          aTotal += aOn.length;
+          bTotal += bOn.length;
+          segData.push({ seg, aOn, bOn, aFree, bFree });
+        }
+
+        // 3. ONE direction per pair: the side with FEWER interface nodes slaves to the
+        //    denser side; equal counts break deterministically (lower index side slaves).
+        const aSlavesToB = aTotal <= bTotal;
+        const slaveSlabId = aSlavesToB ? slabA.id : slabB.id;
+        const masterSlabId = aSlavesToB ? slabB.id : slabA.id;
+
+        for (const { seg, aOn, bOn, aFree, bFree } of segData) {
+          const masterCand = aSlavesToB ? bOn : aOn;
+          const slavePool = aSlavesToB ? aFree : bFree;
+          if (masterCand.length < 2 || slavePool.length === 0) continue;
+
+          for (const { g, s: sA } of slavePool) {
+            const n = globalNodes[g];
+
+            // Find bracketing master nodes around sA
+            let lo = -1, hi = -1;
+            for (let k = 0; k < masterCand.length; k++) {
+              if (masterCand[k].s <= sA + 1e-9) lo = k;
+              if (hi < 0 && masterCand[k].s >= sA - 1e-9) hi = k;
+            }
+            if (lo < 0 || hi < 0) {
+              lo = sA < masterCand[0].s ? 0 : masterCand.length - 2;
+              hi = lo + 1;
+            }
+            if (lo === hi) { lo = Math.max(0, lo - 1); hi = lo + 1; }
+            if (lo < 0 || hi >= masterCand.length || masterCand[lo].g === masterCand[hi].g) continue;
+            const s1 = masterCand[lo].s, s2 = masterCand[hi].s;
+            if (s2 - s1 < 1e-9) continue;
+            let t = (sA - s1) / (s2 - s1);
+            t = Math.max(0, Math.min(1, t));
+
+            // Skip near-coincident cases that merging should have handled (keeps system clean)
+            const nM1 = globalNodes[masterCand[lo].g], nM2 = globalNodes[masterCand[hi].g];
+            if (Math.hypot(n.x - nM1.x, n.y - nM1.y) < mergeTol || Math.hypot(n.x - nM2.x, n.y - nM2.y) < mergeTol) continue;
+
+            // Hinge if either side marks this joint discontinuous
+            const mid = { x: n.x, y: n.y };
+            const hinge = isPointDiscontinuous(slabA.id, mid, edgeTol) || isPointDiscontinuous(slabB.id, mid, edgeTol);
+
+            // Resolve exemplar (slabId, localId) for correct DOF routing (incl. unmerged rotations)
+            const sOwn = (owners.get(g) ?? []).find(o => o.slabId === slaveSlabId);
+            const m1Own = (owners.get(masterCand[lo].g) ?? []).find(o => o.slabId === masterSlabId)
+              ?? (owners.get(masterCand[lo].g) ?? [])[0];
+            const m2Own = (owners.get(masterCand[hi].g) ?? []).find(o => o.slabId === masterSlabId)
+              ?? (owners.get(masterCand[hi].g) ?? [])[0];
+            if (!sOwn || !m1Own || !m2Own) continue;
+
+            const slaveDofs = getNodeDofs(sOwn.slabId, sOwn.localId, g);
+            const mDofs1 = getNodeDofs(m1Own.slabId, m1Own.localId, masterCand[lo].g);
+            const mDofs2 = getNodeDofs(m2Own.slabId, m2Own.localId, masterCand[hi].g);
+
+            const nCouple = hinge ? 1 : 3; // hinge: w only; continuous: w, rx, ry
+            for (let d = 0; d < nCouple; d++) {
+              mpcConstraints.push({
+                slaveDof: slaveDofs[d],
+                masters: [
+                  { dof: mDofs1[d], weight: 1 - t },
+                  { dof: mDofs2[d], weight: t },
+                ],
+              });
+            }
+            tiedSlaves.add(g);
+          }
+        }
+      }
+    }
+
+  }
+
+
   onProgress?.(0.15);
 
   // 3. Compute bandwidth considering all element DOFs (including unmerged rotational DOFs)
@@ -907,6 +1103,13 @@ export function analyzeAllSlabs(
       const minD = Math.min(...elemDofs);
       const maxD = Math.max(...elemDofs);
       const diff = maxD - minD;
+      if (diff > maxDiff) maxDiff = diff;
+    }
+  }
+  // Account for edge-constraint (MPC) coupling spans so penalty terms land inside the band
+  for (const mpc of mpcConstraints) {
+    for (const m of mpc.masters) {
+      const diff = Math.abs(m.dof - mpc.slaveDof);
       if (diff > maxDiff) maxDiff = diff;
     }
   }
@@ -1172,7 +1375,12 @@ export function analyzeAllSlabs(
 
     for (const { slab } of slabMeshes) {
       const intersectPts = findPolygonIntersectingSegments(slab.vertices, a, b);
-      if (intersectPts.length >= 2) {
+      // A wall that merely T-touches a slab edge at one point provides no support chord
+      // inside that slab — degenerate duplicates must not clamp nearby boundary nodes.
+      const chordLen = intersectPts.length >= 2
+        ? Math.hypot(intersectPts[1].x - intersectPts[0].x, intersectPts[1].y - intersectPts[0].y)
+        : 0;
+      if (intersectPts.length >= 2 && chordLen > 1e-6) {
         for (let i = 0; i < globalNodes.length; i++) {
           if (pointToSegmentDist(globalNodes[i], intersectPts[0], intersectPts[1]) < searchTol) {
             bc[i * 3] = true;
@@ -1205,6 +1413,34 @@ export function analyzeAllSlabs(
 
   onProgress?.(0.50);
 
+  // 6b. Apply edge-constraint MPC penalties (u_slave − Σw·u_master = 0).
+  // Applied only now that the support mask bc[] is known:
+  //  - constraints whose SLAVE dof is support-constrained are dropped (otherwise the
+  //    orphaned α·w² diagonal on the masters would artificially pin them to ~0);
+  //  - a clamped MASTER contributes zero (row is normalized to identity right after).
+  if (mpcConstraints.length > 0) {
+    let maxDiag = 0;
+    for (let i = 0; i < ndof; i++) { const d = Math.abs(K_band[i][0]); if (d > maxDiag) maxDiag = d; }
+    const alpha = Math.min(1e12, Math.max(1e8, maxDiag * 1e6));
+    const addPenalty = (r: number, c: number, v: number) => {
+      const lo = Math.min(r, c), hi = Math.max(r, c);
+      if ((hi - lo) < bw) K_band[lo][hi - lo] += v;
+    };
+    for (const mpc of mpcConstraints) {
+      if (bc[mpc.slaveDof]) continue; // slave restrained — constraint meaningless, would pin masters
+      // c-vector: [1 (slave), -w1, -w2, ...]; penalty = alpha · c·cᵀ (symmetric)
+      const terms: { dof: number; c: number }[] = [{ dof: mpc.slaveDof, c: 1 }];
+      for (const m of mpc.masters) terms.push({ dof: m.dof, c: -m.weight });
+      for (let ia = 0; ia < terms.length; ia++) {
+        for (let ib = ia; ib < terms.length; ib++) {
+          const a = terms[ia], b = terms[ib];
+          if (a.dof === b.dof && ia !== ib) continue;
+          addPenalty(a.dof, b.dof, alpha * a.c * b.c);
+        }
+      }
+    }
+  }
+
   let supportCount = 0;
   for (let i = 0; i < ndof; i++) {
     if (bc[i]) {
@@ -1223,6 +1459,9 @@ export function analyzeAllSlabs(
 
   // 7. Solve Global System
   const { u: u_global, warnings: solverWarnings } = solveBanded(K_band, f_global, bw);
+  if (mpcConstraints.length > 0) {
+    solverWarnings.push(`Edge constraints: ${mpcConstraints.length} interface node-DOFs tied across slab joints (continuous mesh tying)`);
+  }
 
   onProgress?.(0.70);
 

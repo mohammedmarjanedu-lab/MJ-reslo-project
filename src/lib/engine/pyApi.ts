@@ -1,5 +1,6 @@
 import { generateSlabMesh } from './meshGenerator';
 import { pointInPolygon } from './mathEngine';
+import { findCollinearSlabEdge, slabsTouch } from './femSolver';
 
 function getInitialApiBase(): string {
   if (typeof window !== 'undefined') {
@@ -529,7 +530,8 @@ export async function meshAndAnalyzeAllSlabs(
         elasticModulus: (slab.elasticModulus ? slab.elasticModulus * 1000 : 25e9) * (slab.crackingModifier ?? 1.0),
         poissonRatio,
         uniformLoad: (slab.uniformLoad || 5.0) + (slab.partitionLoad ?? 0),
-        selfWeight: 25 * (slab.thickness || 0.2)
+        selfWeight: 25 * (slab.thickness || 0.2),
+        discontinuousEdges: (slab.discontinuousEdges || []).map((e: any) => ({ startPoint: e.startPoint, endPoint: e.endPoint }))
       })),
       walls: walls.map(w => ({ startPoint: w.startPoint, endPoint: w.endPoint, thickness: w.thickness ?? 0.25, height: w.height ?? 3.0, elasticModulus: w.elasticModulus || 25e9 })),
       columns: columns.map(c => ({ position: c.position, width: c.width || 0.3, depth: c.depth || 0.3, height: c.height || 3.0, elasticModulus: (c.elasticModulus || 25e6) * 1000, shape: c.shape || 'rectangular', diameter: (c.diameter || 500) / 1000, concreteGrade: c.concreteGrade || 'M25' })),
@@ -730,6 +732,190 @@ export async function meshAndAnalyzeAllSlabs(
     }
   }
 
+  // ── ETABS-style edge (line) constraints: T-junction MPC ties across non-conformal joints ──
+  // Mirrors femSolver.ts §2b and backend kratos_solver._detect_interface_constraints
+  // (identical bipartite rule so all three solver paths converge to the same behavior).
+  // Slab meshes are generated independently, so boundary nodes along a shared edge do
+  // not always coincide (offset grids, T-junctions). Merging + near-pair equalDOF above
+  // would leave those nodes untied, visibly tearing the joint in contours. For every
+  // unshared boundary node of the sparser side lying on the denser side's boundary
+  // segment, tie it by linear interpolation of the two bracketing master nodes:
+  //   u_slave − (1−t)·u_M1 − t·u_M2 = 0   (weighted multi-master MPC, backend 1..6 DOFs)
+  // Nodes already coupled by equalDOF (coincident twins) are never made slaves again
+  // (a DOF can be a slave only once), and tying is ONE direction per interface pair so
+  // no circular slave↔master webs can form. Hinged joints tie translations (W) only.
+  interface PyMpcTerm { nodeId: number; weight: number }
+  interface PyMpcConstraint { slaveNodeId: number; slaveDof: number; masters: PyMpcTerm[] }
+  const mpcConstraints: PyMpcConstraint[] = [];
+  {
+    // Unique-node ownership: uniqueId (1-indexed) -> original (slabId, localId) exemplars
+    const owners = new Map<number, { slabId: string; localId: number }[]>();
+    for (const n of allNodes) {
+      if (n.globalIdx === undefined) continue;
+      const g = n.globalIdx + 1;
+      let arr = owners.get(g);
+      if (!arr) { arr = []; owners.set(g, arr); }
+      arr.push({ slabId: n.slabId, localId: n.localId });
+    }
+    const ownedBySlab = new Map<string, Set<number>>();
+    for (const [g, arr] of owners) {
+      for (const o of arr) {
+        let s = ownedBySlab.get(o.slabId);
+        if (!s) { s = new Set(); ownedBySlab.set(o.slabId, s); }
+        s.add(g);
+      }
+    }
+    const nodeById = new Map<number, UniquePyNodeRef>(uniqueNodes.map(n => [n.id, n]));
+    const edgeTol = Math.max(mergeTol, meshSize * 0.45);
+    const tiedSlaves = new Set<number>();
+
+    // Nodes already translation/rotation-coupled by equalDOF pairs: never MPC slaves
+    const eqPaired = new Set<number>();
+    for (const c of equalDofConstraints) {
+      eqPaired.add(c.nodeIdA);
+      eqPaired.add(c.nodeIdB);
+    }
+
+    const isPointDiscontinuous = (slabId: string, p: { x: number; y: number }, tol: number): boolean => {
+      const s = slabMeshes.find(sm => sm.slab.id === slabId)?.slab;
+      if (!s || !s.discontinuousEdges) return false;
+      for (const seg of s.discontinuousEdges) {
+        if (pointToSegmentDist(p, seg.startPoint, seg.endPoint) < tol) return true;
+      }
+      return false;
+    };
+
+    interface PyInterfaceSeg {
+      p: { x: number; y: number }; q: { x: number; y: number };
+      param: (n: { x: number; y: number }) => number;
+      onSeg: (n: { x: number; y: number }) => boolean;
+    }
+
+    for (let ia = 0; ia < slabMeshes.length; ia++) {
+      const slabA = slabMeshes[ia].slab;
+      for (let ib = ia + 1; ib < slabMeshes.length; ib++) {
+        const slabB = slabMeshes[ib].slab;
+        if (!slabsTouch(slabA.vertices, slabB.vertices, Math.max(0.75, meshSize * 1.5))) continue;
+        const bOwned = ownedBySlab.get(slabB.id) ?? new Set<number>();
+        const aOwned = ownedBySlab.get(slabA.id) ?? new Set<number>();
+
+        // 1. Interface overlaps (deduped — shared segment appears as an edge of both polygons)
+        const segs: PyInterfaceSeg[] = [];
+        const seenSegKeys = new Set<string>();
+        for (const [sv, dv] of [[slabA.vertices, slabB.vertices], [slabB.vertices, slabA.vertices]] as const) {
+          for (let ei = 0; ei < sv.length; ei++) {
+            const a1 = sv[ei], a2 = sv[(ei + 1) % sv.length];
+            const col = findCollinearSlabEdge(dv, a1, a2, edgeTol);
+            if (!col) continue;
+            const p = col.edgeA, q = col.edgeB;
+            const sdx = q.x - p.x, sdy = q.y - p.y;
+            const slen2 = sdx * sdx + sdy * sdy;
+            if (slen2 < 1e-12) continue;
+            const k1 = `${Math.round(p.x * 1000)},${Math.round(p.y * 1000)}`;
+            const k2 = `${Math.round(q.x * 1000)},${Math.round(q.y * 1000)}`;
+            const key = k1 < k2 ? `${k1}|${k2}` : `${k2}|${k1}`;
+            if (seenSegKeys.has(key)) continue;
+            seenSegKeys.add(key);
+            const ws = Math.sqrt(slen2);
+            const param = (n: { x: number; y: number }) => ((n.x - p.x) * sdx + (n.y - p.y) * sdy) / slen2;
+            const onSeg = (n: { x: number; y: number }) => {
+              const s = param(n);
+              if (s < -edgeTol * 1.01 / ws - 0.01 || s > 1.01) return false;
+              return pointToSegmentDist(n, p, q) < edgeTol;
+            };
+            segs.push({ p, q, param, onSeg });
+          }
+        }
+        if (segs.length === 0) continue;
+
+        // 2. Per-segment node sets
+        interface PySegData {
+          seg: PyInterfaceSeg;
+          aOn: { g: number; s: number }[];
+          bOn: { g: number; s: number }[];
+          aFree: { g: number; s: number }[];
+          bFree: { g: number; s: number }[];
+        }
+        const segData: PySegData[] = [];
+        let aTotal = 0, bTotal = 0;
+        for (const seg of segs) {
+          const aOn: { g: number; s: number }[] = [];
+          for (const g of aOwned) {
+            const n = nodeById.get(g);
+            if (n && seg.onSeg(n)) aOn.push({ g, s: seg.param(n) });
+          }
+          aOn.sort((u, v) => u.s - v.s);
+          const bOn: { g: number; s: number }[] = [];
+          for (const g of bOwned) {
+            const n = nodeById.get(g);
+            if (n && seg.onSeg(n)) bOn.push({ g, s: seg.param(n) });
+          }
+          bOn.sort((u, v) => u.s - v.s);
+          const aFree = aOn.filter(e => !bOwned.has(e.g) && !tiedSlaves.has(e.g) && !eqPaired.has(e.g));
+          const bFree = bOn.filter(e => !aOwned.has(e.g) && !tiedSlaves.has(e.g) && !eqPaired.has(e.g));
+          aTotal += aOn.length;
+          bTotal += bOn.length;
+          segData.push({ seg, aOn, bOn, aFree, bFree });
+        }
+
+        // 3. ONE direction per pair: sparser side slaves to the denser side
+        //    (equal counts: lower-index side slaves).
+        const aSlavesToB = aTotal <= bTotal;
+
+        for (const { seg, aOn, bOn, aFree, bFree } of segData) {
+          const masterCand = aSlavesToB ? bOn : aOn;
+          const slavePool = aSlavesToB ? aFree : bFree;
+          if (masterCand.length < 2 || slavePool.length === 0) continue;
+
+          for (const { g, s: sA } of slavePool) {
+            const n = nodeById.get(g)!;
+
+            // Find bracketing master nodes around sA
+            let lo = -1, hi = -1;
+            for (let k = 0; k < masterCand.length; k++) {
+              if (masterCand[k].s <= sA + 1e-9) lo = k;
+              if (hi < 0 && masterCand[k].s >= sA - 1e-9) hi = k;
+            }
+            if (lo < 0 || hi < 0) {
+              lo = sA < masterCand[0].s ? 0 : masterCand.length - 2;
+              hi = lo + 1;
+            }
+            if (lo === hi) { lo = Math.max(0, lo - 1); hi = lo + 1; }
+            if (lo < 0 || hi >= masterCand.length || masterCand[lo].g === masterCand[hi].g) continue;
+            const s1 = masterCand[lo].s, s2 = masterCand[hi].s;
+            if (s2 - s1 < 1e-9) continue;
+            let t = (sA - s1) / (s2 - s1);
+            t = Math.max(0, Math.min(1, t));
+
+            // Skip near-coincident cases that merging/equalDOF coupling already handles
+            const nM1 = nodeById.get(masterCand[lo].g)!, nM2 = nodeById.get(masterCand[hi].g)!;
+            if (Math.hypot(n.x - nM1.x, n.y - nM1.y) < mergeTol || Math.hypot(n.x - nM2.x, n.y - nM2.y) < mergeTol) continue;
+
+            // Hinge if either side marks this joint discontinuous
+            const hinge = isPointDiscontinuous(slabA.id, n, edgeTol) || isPointDiscontinuous(slabB.id, n, edgeTol);
+
+            // Backend DOF numbering (1..6): W=3, RX=4, RY=5 — shell bending set
+            const dofs = hinge ? [3] : [3, 4, 5];
+            for (const d of dofs) {
+              mpcConstraints.push({
+                slaveNodeId: g,
+                slaveDof: d,
+                masters: [
+                  { nodeId: masterCand[lo].g, weight: 1 - t },
+                  { nodeId: masterCand[hi].g, weight: t },
+                ],
+              });
+            }
+            tiedSlaves.add(g);
+          }
+        }
+      }
+    }
+    if (mpcConstraints.length > 0) {
+      console.log(`[Reslo FEM] Edge constraints: ${tiedSlaves.size} interface node-DOFs tied across slab joints (continuous mesh tying, ${mpcConstraints.length} MPCs)`);
+    }
+  }
+
   // Re-map slab elements to the global node IDs and collect per-element properties
   const globalElements: PyElement[] = [];
   const elementLoads: number[] = [];
@@ -926,7 +1112,8 @@ export async function meshAndAnalyzeAllSlabs(
     beamElasticModuli,
     dropPanels: activeDropPanels,
     partitionWallSegments: computePartitionWallSegments(nonStructuralWalls, polylineNonStructuralWalls),
-    equalDofConstraints
+    equalDofConstraints,
+    mpcConstraints
   };
 
   const warnings: string[] = [];

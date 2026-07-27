@@ -28,7 +28,7 @@ import warnings
 import logging
 import sys
 import io
-from typing import List, Tuple, Dict, Set, Optional
+from typing import Any, List, Tuple, Dict, Set, Optional
 from scipy.spatial import cKDTree
 
 # Configure OpenMP parallel execution for Kratos
@@ -49,7 +49,7 @@ logger = logging.getLogger("uvicorn")
 from models import (
     AnalysisRequest, AnalysisResponse, MultiSlabAnalysisRequest, MultiSlabAnalysisResponse,
     SlabAnalysisResult, NodeDeflection, Point2D, MeshRequest, FEMNode, FEMMesh, Triangle,
-    ColumnSupport, WallSupport
+    ColumnSupport, WallSupport, MpcConstraint, MpcTerm, EqualDofConstraint
 )
 from mesher import generate_mesh
 
@@ -674,16 +674,76 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
             node_fixities[w_nid][3] = 1  # Rx
             node_fixities[w_nid][4] = 1  # Ry
 
-    # Equal DOF Constraints (e.g. C0 hinges and multi-slab interface constraints)
+    # Union-Find Audit for Floating/Unsupported Component Stabilization.
+    # NOTE: runs BEFORE constraint creation below so the slave-restraint guards
+    # (equalDOF / MPC) observe the final fixity state — a slave DOF must never be
+    # fixed, so stabilized nodes are correctly excluded from constraint creation.
+    all_node_ids = set(kratos_nodes_map.keys())
+    uf = UnionFind(all_node_ids)
+
+    for tri in elem_nodes:
+        for k in range(len(tri) - 1):
+            uf.union(tri[k], tri[k + 1])
+        if len(tri) > 2:
+            uf.union(tri[0], tri[-1])
+
+    for col_idx, nidx in enumerate(col_node_indices):
+        master_id = nidx + 1
+        base_node_id = col_idx + 1000001
+        uf.union(master_id, base_node_id)
+        patch = col_node_patches.get(nidx, [])
+        for p_nid in patch:
+            uf.union(master_id, p_nid + 1)
+
+    if request.equalDofConstraints:
+        for eq_c in request.equalDofConstraints:
+            if eq_c.nodeIdA and eq_c.nodeIdB:
+                uf.union(int(eq_c.nodeIdA), int(eq_c.nodeIdB))
+
+    if getattr(request, 'mpcConstraints', None):
+        for mpc in request.mpcConstraints:
+            for m in mpc.masters:
+                if mpc.slaveNodeId and m.nodeId:
+                    uf.union(int(mpc.slaveNodeId), int(m.nodeId))
+
+    supported_roots = set()
+    for nid in all_node_ids:
+        is_sup = False
+        if nid >= 1000001:
+            is_sup = True
+        else:
+            fix = node_fixities.get(nid, [0, 0, 0, 0, 0, 0])
+            if fix[0] == 1 or fix[1] == 1 or fix[2] == 1:
+                is_sup = True
+        if is_sup:
+            supported_roots.add(uf.find(nid))
+
+    unsupported_count = 0
+    for nid in all_node_ids:
+        root = uf.find(nid)
+        if root not in supported_roots:
+            node_fixities[nid] = [1, 1, 1, 1, 1, 1]
+            unsupported_count += 1
+
+    if unsupported_count > 0:
+        logger.warning(f"Solver stabilized: fully fixed {unsupported_count} unsupported/floating nodes to prevent singular matrix error.")
+
+    # Equal DOF Constraints (e.g. C0 hinges and multi-slab interface constraints).
+    # A slave DOF must never be support-restrained (Kratos forbids fixing a slave):
+    # skip DOFs already fixed on the slave (B) side — the support restraint wins,
+    # consistent with the MPC guard and the TS worker's `if (bc[slaveDof]) continue;`.
     if request.equalDofConstraints:
         for eq_c in request.equalDofConstraints:
             if (eq_c.nodeIdA and eq_c.nodeIdB and int(eq_c.nodeIdA) != int(eq_c.nodeIdB)
                     and eq_c.nodeIdA in kratos_nodes_map and eq_c.nodeIdB in kratos_nodes_map):
                 knodeA = kratos_nodes_map[int(eq_c.nodeIdA)]
                 knodeB = kratos_nodes_map[int(eq_c.nodeIdB)]
+                fixB = node_fixities.get(int(eq_c.nodeIdB))
                 dof_vars = [KM.DISPLACEMENT_X, KM.DISPLACEMENT_Y, KM.DISPLACEMENT_Z, KM.ROTATION_X, KM.ROTATION_Y, KM.ROTATION_Z]
                 for d_idx in eq_c.dofs:
                     if 1 <= d_idx <= 6:
+                        if fixB is not None and fixB[d_idx - 1] == 1:
+                            continue  # slave DOF is restrained — support condition takes precedence
                         var = dof_vars[d_idx - 1]
                         model_part.CreateNewMasterSlaveConstraint(
                             "LinearMasterSlaveConstraint",
@@ -693,6 +753,45 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
                             1.0, 0.0
                         )
                         constraint_counter += 1
+
+    # Weighted multi-master MPCs (ETABS-style edge constraints for non-conformal
+    # multi-slab joints): u_slave = Σ w_i·u_master_i via LinearMasterSlaveConstraint.
+    # Ties whose slave DOF is support-restrained are skipped (a slave cannot be fixed).
+    if getattr(request, 'mpcConstraints', None):
+        dof_vars_m = [KM.DISPLACEMENT_X, KM.DISPLACEMENT_Y, KM.DISPLACEMENT_Z, KM.ROTATION_X, KM.ROTATION_Y, KM.ROTATION_Z]
+        for mpc in request.mpcConstraints:
+            sid = int(mpc.slaveNodeId)
+            if sid not in kratos_nodes_map:
+                continue
+            d_idx = int(mpc.slaveDof) - 1
+            if not (0 <= d_idx < 6):
+                continue
+            if sid in node_fixities and node_fixities[sid][d_idx] == 1:
+                continue  # restrained slave — fixing a slave is invalid in Kratos
+            var = dof_vars_m[d_idx]
+            slave_dof = kratos_nodes_map[sid].GetDof(var)
+            master_dofs: List[Any] = []
+            for m in mpc.masters:
+                mid = int(m.nodeId)
+                if mid in kratos_nodes_map and mid != sid:
+                    master_dofs.append((kratos_nodes_map[mid], float(m.weight)))
+            if not master_dofs:
+                continue
+            W = KM.Matrix(1, len(master_dofs))
+            dof_list = []
+            for mi, (mk, w) in enumerate(master_dofs):
+                dof_list.append(mk.GetDof(var))
+                W[0, mi] = w
+            Cvec = KM.Vector(1)
+            Cvec[0] = 0.0
+            model_part.CreateNewMasterSlaveConstraint(
+                "LinearMasterSlaveConstraint",
+                constraint_counter,
+                dof_list,
+                [slave_dof],
+                W, Cvec
+            )
+            constraint_counter += 1
 
 
 
@@ -778,51 +877,6 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
 
                 beam_ele_tag = b_idx * 1000 + i + 8000000
                 model_part.CreateNewElement("CrLinearBeamElement3D2N", beam_ele_tag, [n_start_id, n_end_id], prop_beam_seg)
-
-    # Union-Find Audit for Floating/Unsupported Component Stabilization
-    all_node_ids = set(kratos_nodes_map.keys())
-    uf = UnionFind(all_node_ids)
-
-    for tri in elem_nodes:
-        for k in range(len(tri) - 1):
-            uf.union(tri[k], tri[k + 1])
-        if len(tri) > 2:
-            uf.union(tri[0], tri[-1])
-
-    for col_idx, nidx in enumerate(col_node_indices):
-        master_id = nidx + 1
-        base_node_id = col_idx + 1000001
-        uf.union(master_id, base_node_id)
-        patch = col_node_patches.get(nidx, [])
-        for p_nid in patch:
-            uf.union(master_id, p_nid + 1)
-
-    if request.equalDofConstraints:
-        for eq_c in request.equalDofConstraints:
-            if eq_c.nodeIdA and eq_c.nodeIdB:
-                uf.union(int(eq_c.nodeIdA), int(eq_c.nodeIdB))
-
-    supported_roots = set()
-    for nid in all_node_ids:
-        is_sup = False
-        if nid >= 1000001:
-            is_sup = True
-        else:
-            fix = node_fixities.get(nid, [0, 0, 0, 0, 0, 0])
-            if fix[0] == 1 or fix[1] == 1 or fix[2] == 1:
-                is_sup = True
-        if is_sup:
-            supported_roots.add(uf.find(nid))
-
-    unsupported_count = 0
-    for nid in all_node_ids:
-        root = uf.find(nid)
-        if root not in supported_roots:
-            node_fixities[nid] = [1, 1, 1, 1, 1, 1]
-            unsupported_count += 1
-
-    if unsupported_count > 0:
-        logger.warning(f"Solver stabilized: fully fixed {unsupported_count} unsupported/floating nodes to prevent singular matrix error.")
 
     # Apply DOF Fixities to Kratos Nodes
     for nid, fixs in node_fixities.items():
@@ -1318,6 +1372,242 @@ def _slabs_touch(vertsA: List[Point2D], vertsB: List[Point2D], tol: float = 0.75
 
     return False
 
+
+# ────────────────────────────────────────────────────────────────────────────
+# ETABS-style automatic edge (line) constraints for non-conformal multi-slab
+# joints. Meshes of touching slabs are generated independently, so boundary
+# nodes along a shared edge rarely coincide one-to-one (gmsh Delaunay) or align
+# only partially (structured grids, T-junctions). For every unshared boundary
+# node of slab A lying on slab B's boundary segment, the node is tied by linear
+# interpolation of the two bracketing B-side boundary nodes:
+#     u_slave = (1−t)·u_B1 + t·u_B2
+# Continuous joints tie UZ(W), RX, RY (plate DOFs); discontinuous (hinged)
+# joints tie translations only. Master side = the denser boundary (one
+# direction per interface) to avoid circular slave↔master webs.
+# ────────────────────────────────────────────────────────────────────────────
+
+def _seg_dist(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    dx, dy = bx - ax, by - ay
+    len2 = dx * dx + dy * dy
+    if len2 < 1e-14:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / len2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _find_collinear_overlap(vertsB: List[Point2D], a1: Point2D, a2: Point2D, tol: float):
+    """Overlap of segment (a1,a2) with any collinear edge of polygon B. Returns (p, q) or None."""
+    polyB = [(v.x, v.y) for v in vertsB]
+    nB = len(polyB)
+    dx, dy = a2.x - a1.x, a2.y - a1.y
+    for j in range(nB):
+        p1 = polyB[j]
+        p2 = polyB[(j + 1) % nB]
+        e_dx, e_dy = p2[0] - p1[0], p2[1] - p1[1]
+        e_len2 = e_dx * e_dx + e_dy * e_dy
+        if e_len2 < 1e-12:
+            continue
+        if abs(dx * e_dy - dy * e_dx) > tol:
+            continue
+        # Perpendicular distance to the infinite line (allows partial/T-junction overlaps)
+        line_len = math.sqrt(e_len2)
+        if abs((a1.x - p1[0]) * e_dy - (a1.y - p1[1]) * e_dx) / line_len > tol:
+            continue
+        if abs((a2.x - p1[0]) * e_dy - (a2.y - p1[1]) * e_dx) / line_len > tol:
+            continue
+        t_a = ((a1.x - p1[0]) * e_dx + (a1.y - p1[1]) * e_dy) / e_len2
+        t_b = ((a2.x - p1[0]) * e_dx + (a2.y - p1[1]) * e_dy) / e_len2
+        t_min = max(0.0, min(t_a, t_b))
+        t_max = min(1.0, max(t_a, t_b))
+        if t_max - t_min > 1e-6:
+            return (
+                (p1[0] + t_min * e_dx, p1[1] + t_min * e_dy),
+                (p1[0] + t_max * e_dx, p1[1] + t_max * e_dy),
+            )
+    return None
+
+
+def _detect_interface_constraints(
+    sub_meshes: List[Tuple[Any, FEMMesh]],
+    node_orig_map: List[Tuple[int, int, float, float]],
+    global_id_map: Dict[Tuple[int, int], int],
+    global_nodes: List[FEMNode],
+    merge_tol: float,
+    mesh_size: float,
+    pre_paired: Optional[Set[int]] = None,
+    pre_paired_slave: Optional[Set[int]] = None,
+) -> Tuple[List[MpcConstraint], List[EqualDofConstraint], int]:
+    """Build weighted MPCs + hinge equal-DOF couples for non-conformal slab interfaces.
+
+    Returns (mpc_constraints, hinge_equal_dofs, n_tied_slave_nodes).
+    Node ids refer to the 1-indexed global combined mesh ids.
+    `pre_paired`: global node ids on either side of hinge equal-DOF pairs — they must
+    never become MPC slaves (a DOF can be a slave only once).
+    `pre_paired_slave`: the SLAVE-side ids of those pairs — they must never become MPC
+    masters either (Kratos cannot chain a slave as master; the term is silently dropped,
+    breaking the interpolation). Master brackets expand to the next eligible nodes.
+    """
+    if pre_paired is None:
+        pre_paired = set()
+    if pre_paired_slave is None:
+        pre_paired_slave = set()
+    mpcs: List[MpcConstraint] = []
+    eq_dofs: List[EqualDofConstraint] = []
+    pos_by_gid = {n.id: (n.x, n.y) for n in global_nodes}
+
+    # owners[gid] = set of submesh indices touching this global node
+    owners: Dict[int, Set[int]] = {}
+    local_of: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for (item_idx, old_nid, x, y) in node_orig_map:
+        gid = global_id_map.get((item_idx, old_nid))
+        if gid is None:
+            continue
+        owners.setdefault(gid, set()).add(item_idx)
+
+    def is_discont(item_idx: int, x: float, y: float, tol: float) -> bool:
+        item = sub_meshes[item_idx][0]
+        for seg in (getattr(item, 'discontinuousEdges', None) or []):
+            if _seg_dist(x, y, seg.startPoint.x, seg.startPoint.y, seg.endPoint.x, seg.endPoint.y) < tol:
+                return True
+        return False
+
+    edge_tol = max(merge_tol, mesh_size * 0.45)
+    tied_slaves: Set[int] = set()
+
+    n_items = len(sub_meshes)
+    for ia in range(n_items):
+        itemA, meshA = sub_meshes[ia]
+        vertsA = itemA.geometry.vertices
+        for ib in range(ia + 1, n_items):
+            itemB, meshB = sub_meshes[ib]
+            if not _slabs_touch(vertsA, itemB.geometry.vertices, tol=max(0.75, mesh_size * 1.5)):
+                continue
+            b_gids = {g for g, s in owners.items() if ib in s}
+            a_gids = {g for g, s in owners.items() if ia in s}
+
+            # 1. Interface overlaps between the two polygons (each shared segment once,
+            #    deduplicated — a shared segment appears as an edge of BOTH polygons).
+            overlaps: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+            seen_seg_keys: Set[Tuple] = set()
+            for sverts, dverts in ((vertsA, itemB.geometry.vertices), (itemB.geometry.vertices, vertsA)):
+                for ei in range(len(sverts)):
+                    a1 = sverts[ei]
+                    a2 = sverts[(ei + 1) % len(sverts)]
+                    ov = _find_collinear_overlap(dverts, a1, a2, edge_tol)
+                    if not ov:
+                        continue
+                    (px, py), (qx, qy) = ov
+                    e1 = (round(px, 3), round(py, 3))
+                    e2 = (round(qx, 3), round(qy, 3))
+                    key = (min(e1, e2), max(e1, e2))
+                    if key in seen_seg_keys:
+                        continue
+                    seen_seg_keys.add(key)
+                    overlaps.append(ov)
+            if not overlaps:
+                continue
+
+            # 2. Per-segment node sets for both sides
+            segs = []
+            a_total_cnt = 0
+            b_total_cnt = 0
+            a_free_cnt = 0
+            b_free_cnt = 0
+            for (px, py), (qx, qy) in overlaps:
+                sdx, sdy = qx - px, qy - py
+                slen2 = sdx * sdx + sdy * sdy
+                if slen2 < 1e-12:
+                    continue
+
+                def _mk(sdx=sdx, sdy=sdy, slen2=slen2, px=px, py=py, qx=qx, qy=qy):
+                    def param(x, y):
+                        return ((x - px) * sdx + (y - py) * sdy) / slen2
+                    def on_seg(x, y):
+                        s = param(x, y)
+                        if s < -0.05 or s > 1.05:
+                            return False
+                        return _seg_dist(x, y, px, py, qx, qy) < edge_tol
+                    return param, on_seg
+                param, on_seg = _mk()
+
+                a_on = sorted(
+                    ((param(*pos_by_gid[g]), g) for g in a_gids
+                     if g in pos_by_gid and g not in pre_paired_slave and on_seg(*pos_by_gid[g])),
+                    key=lambda t: t[0])
+                b_on = sorted(
+                    ((param(*pos_by_gid[g]), g) for g in b_gids
+                     if g in pos_by_gid and g not in pre_paired_slave and on_seg(*pos_by_gid[g])),
+                    key=lambda t: t[0])
+                # Slave candidates: unshared (not merged), not yet tied, and not already
+                # translation-tied by an equal-DOF hinge pair (no double slave constraints)
+                a_free = [(s, g) for s, g in a_on
+                          if g not in b_gids and g not in tied_slaves and g not in pre_paired]
+                b_free = [(s, g) for s, g in b_on
+                          if g not in a_gids and g not in tied_slaves and g not in pre_paired]
+                segs.append((param, on_seg, a_on, b_on, a_free, b_free, px, py, qx, qy))
+                a_total_cnt += len(a_on)
+                b_total_cnt += len(b_on)
+                a_free_cnt += len(a_free)
+                b_free_cnt += len(b_free)
+            if not segs:
+                continue
+
+            # 3. ONE direction per interface pair (bipartite tying — slaves on one side,
+            #    masters on the other — so no circular slave<->master constraint webs and
+            #    no DOF is ever a slave twice). The side with FEWER interface nodes slaves
+            #    to the denser side; equal counts break deterministically (lower index).
+            a_slaves_to_b = a_total_cnt <= b_total_cnt
+
+            for (param, on_seg, a_on, b_on, a_free, b_free, px, py, qx, qy) in segs:
+                master_cand = b_on if a_slaves_to_b else a_on
+                slave_pool = a_free if a_slaves_to_b else b_free
+                if len(master_cand) < 2 or not slave_pool:
+                    continue
+                ia_slave = ia if a_slaves_to_b else ib
+                ib_master = ib if a_slaves_to_b else ia
+
+                for sA, g in slave_pool:
+                    x, y = pos_by_gid[g]
+                    lo = None
+                    hi = None
+                    for k, (s, bg) in enumerate(master_cand):
+                        if s <= sA + 1e-9:
+                            lo = k
+                        if hi is None and s >= sA - 1e-9:
+                            hi = k
+                    if lo is None or hi is None:
+                        lo = 0 if sA < master_cand[0][0] else len(master_cand) - 2
+                        hi = lo + 1
+                    if lo == hi:
+                        lo = max(0, lo - 1)
+                        hi = lo + 1
+                    if lo < 0 or hi >= len(master_cand) or master_cand[lo][1] == master_cand[hi][1]:
+                        continue
+                    s1, g1 = master_cand[lo]
+                    s2, g2 = master_cand[hi]
+                    if s2 - s1 < 1e-9:
+                        continue
+                    t = max(0.0, min(1.0, (sA - s1) / (s2 - s1)))
+
+                    # Skip near-coincident pairs (handled by merging / near-pair couples)
+                    if (math.hypot(x - pos_by_gid[g1][0], y - pos_by_gid[g1][1]) < merge_tol or
+                            math.hypot(x - pos_by_gid[g2][0], y - pos_by_gid[g2][1]) < merge_tol):
+                        continue
+
+                    hinge = (is_discont(ia_slave, x, y, edge_tol) or
+                             is_discont(ib_master, x, y, edge_tol))
+                    dofs = [3] if hinge else [3, 4, 5]  # W | W,RX,RY
+                    for d in dofs:
+                        mpcs.append(MpcConstraint(
+                            slaveNodeId=g,
+                            slaveDof=d,
+                            masters=[MpcTerm(nodeId=g1, weight=1.0 - t), MpcTerm(nodeId=g2, weight=t)],
+                        ))
+                    tied_slaves.add(g)
+
+    return mpcs, eq_dofs, len(tied_slaves)
+
+
 def solve_multi_slab_structure(request: MultiSlabAnalysisRequest) -> MultiSlabAnalysisResponse:
     """
     Dual-scenario multi-slab solver:
@@ -1415,6 +1705,7 @@ def solve_multi_slab_structure(request: MultiSlabAnalysisRequest) -> MultiSlabAn
                     nonStructuralWalls=request.nonStructuralWalls,
                     partitionWallSegments=request.partitionWallSegments,
                     equalDofConstraints=getattr(request, 'equalDofConstraints', None) or [],
+                    mpcConstraints=getattr(request, 'mpcConstraints', None) or [],
                     performCrackedAnalysis=getattr(request, 'performCrackedAnalysis', False),
                     adaptiveMeshRefinement=getattr(request, 'adaptiveMeshRefinement', False),
                     maxAdaptivePasses=getattr(request, 'maxAdaptivePasses', 3)
@@ -1474,15 +1765,36 @@ def solve_multi_slab_structure(request: MultiSlabAnalysisRequest) -> MultiSlabAn
                 visited: Set[int] = set()
                 next_global_nid = 1
 
+                # Discontinuous (hinged) interface nodes must stay unmerged (rotations
+                # independent); their translations are coupled after merging so the joint
+                # acts as a hinge instead of full C0+C1 continuity.
+                discont_node_keys: Set[Tuple[int, int]] = set()
+                for _di, (_item, _sm) in enumerate(sub_meshes):
+                    for seg in (getattr(_item, 'discontinuousEdges', None) or []):
+                        for _n in _sm.nodes:
+                            if _seg_dist(_n.x, _n.y, seg.startPoint.x, seg.startPoint.y, seg.endPoint.x, seg.endPoint.y) < merge_tol:
+                                discont_node_keys.add((_di, _n.id))
+
                 for i, (item_idx, old_nid, x, y) in enumerate(node_orig_map):
                     if i in visited:
                         continue
                     cand_neighbors = merge_tree.query_ball_point([x, y], r=merge_tol)
-                    # Filter: keep current node + any node belonging to a DIFFERENT sub-mesh
-                    valid_neighbors = [
-                        idx for idx in cand_neighbors
-                        if idx == i or node_orig_map[idx][0] != item_idx
-                    ]
+                    # Filter: keep current node + any node belonging to a DIFFERENT sub-mesh.
+                    # Hinged (discontinuous) nodes are never MERGED with other nodes, but the
+                    # seed node itself must always stay in its own (singleton) cluster —
+                    # otherwise its cluster is empty and the global node becomes NaN.
+                    i_discont = (item_idx, old_nid) in discont_node_keys
+                    valid_neighbors = []
+                    for idx in cand_neighbors:
+                        if idx == i:
+                            valid_neighbors.append(idx)
+                            continue
+                        it2, o2, _, _ = node_orig_map[idx]
+                        if it2 == item_idx:
+                            continue  # never merge within the same sub-mesh
+                        if i_discont or (it2, o2) in discont_node_keys:
+                            continue  # hinged nodes keep independent rotations
+                        valid_neighbors.append(idx)
                     cluster_pts = raw_coords[valid_neighbors]
                     avg_x = float(np.mean(cluster_pts[:, 0]))
                     avg_y = float(np.mean(cluster_pts[:, 1]))
@@ -1492,6 +1804,49 @@ def solve_multi_slab_structure(request: MultiSlabAnalysisRequest) -> MultiSlabAn
                         it_idx, o_nid, _, _ = node_orig_map[idx]
                         global_id_map[(it_idx, o_nid)] = next_global_nid
                     next_global_nid += 1
+
+                # 2b. Hinge (discontinuous-edge) translation couples + ETABS-style
+                # non-conformal edge constraints across independent sub-meshes
+                hinge_eq: List[EqualDofConstraint] = []
+                if discont_node_keys:
+                    seen_pairs: Set[Tuple[int, int]] = set()
+                    gid_info = []  # (gid, x, y, item_idx)
+                    for (item_idx, old_nid, x, y) in node_orig_map:
+                        gid = global_id_map.get((item_idx, old_nid))
+                        if gid is not None:
+                            gid_info.append((gid, x, y, item_idx))
+                    for (item_idx, old_nid) in discont_node_keys:
+                        gidA = global_id_map.get((item_idx, old_nid))
+                        if gidA is None:
+                            continue
+                        ax, ay = next((x, y) for (g, x, y, it) in gid_info if g == gidA and it == item_idx)
+                        best_g, best_d = None, merge_tol
+                        for (g, x, y, it) in gid_info:
+                            if it == item_idx or g == gidA:
+                                continue
+                            d = math.hypot(ax - x, ay - y)
+                            if d < best_d:
+                                best_d, best_g = d, g
+                        if best_g is not None:
+                            pair = (min(gidA, best_g), max(gidA, best_g))
+                            if pair not in seen_pairs:
+                                seen_pairs.add(pair)
+                                hinge_eq.append(EqualDofConstraint(nodeIdA=pair[0], nodeIdB=pair[1], dofs=[1, 2, 3]))
+
+                hinge_paired_gids: Set[int] = set()
+                hinge_slave_gids: Set[int] = set()
+                for c in hinge_eq:
+                    hinge_paired_gids.add(int(c.nodeIdA))
+                    hinge_paired_gids.add(int(c.nodeIdB))
+                    hinge_slave_gids.add(int(c.nodeIdB))
+                interface_mpc, _, n_tied = _detect_interface_constraints(
+                    sub_meshes, node_orig_map, global_id_map, global_nodes,
+                    merge_tol, request.meshSize or 0.5,
+                    pre_paired=hinge_paired_gids,
+                    pre_paired_slave=hinge_slave_gids
+                )
+                if n_tied > 0:
+                    print(f"[Reslo]   Edge constraints: {n_tied} interface nodes tied ({len(interface_mpc)} MPCs)", file=sys.stderr, flush=True)
 
                 # 3. Build global elements + origin tracking dict for O(1) partition lookup
                 global_elements = []
@@ -1573,7 +1928,8 @@ def solve_multi_slab_structure(request: MultiSlabAnalysisRequest) -> MultiSlabAn
                     dropPanels=request.dropPanels,
                     nonStructuralWalls=request.nonStructuralWalls,
                     partitionWallSegments=request.partitionWallSegments,
-                    equalDofConstraints=getattr(request, 'equalDofConstraints', None) or [],
+                    equalDofConstraints=(getattr(request, 'equalDofConstraints', None) or []) + hinge_eq,
+                    mpcConstraints=(getattr(request, 'mpcConstraints', None) or []) + interface_mpc,
                     performCrackedAnalysis=getattr(request, 'performCrackedAnalysis', False),
                     adaptiveMeshRefinement=getattr(request, 'adaptiveMeshRefinement', False),
                     maxAdaptivePasses=getattr(request, 'maxAdaptivePasses', 3)

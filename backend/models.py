@@ -100,6 +100,17 @@ class EqualDofConstraint(BaseModel):
     nodeIdB: int
     dofs: List[int]
 
+class MpcTerm(BaseModel):
+    nodeId: int          # 1-indexed global node id
+    weight: float        # interpolation weight of this master
+
+class MpcConstraint(BaseModel):
+    # ETABS-style edge (line) constraint for non-conformal multi-slab joints:
+    # u_slave = Σ weight_i · u_master_i   (linear interpolation along the interface)
+    slaveNodeId: int
+    slaveDof: int        # 1..6 → UX, UY, UZ(W), RX, RY, RZ
+    masters: List[MpcTerm]
+
 class AnalysisRequest(BaseModel):
     mesh: FEMMesh
     thickness: float
@@ -137,6 +148,7 @@ class AnalysisRequest(BaseModel):
     dropPanels: List[DropPanelDef] = []
     partitionWallSegments: List[LineLoadSegment] = []  # line loads from partition walls (kN/m)
     equalDofConstraints: List[EqualDofConstraint] = []
+    mpcConstraints: List[MpcConstraint] = []
     performCrackedAnalysis: bool = False
     adaptiveMeshRefinement: bool = False
     maxAdaptivePasses: int = 3
@@ -230,6 +242,10 @@ class AnalysisResponse(BaseModel):
     cracked_deflection_max: Optional[float] = None
     error: Optional[str] = None
 
+class DiscontinuousEdge(BaseModel):
+    startPoint: Point2D
+    endPoint: Point2D
+
 class SingleSlabPayload(BaseModel):
     slabId: str
     geometry: SlabGeometry
@@ -239,6 +255,7 @@ class SingleSlabPayload(BaseModel):
     poissonRatio: float = 0.2
     uniformLoad: float = 5.0
     selfWeight: float = 0.0
+    discontinuousEdges: List[DiscontinuousEdge] = []
 
 class MultiSlabAnalysisRequest(BaseModel):
     slabs: List[SingleSlabPayload]
@@ -249,6 +266,7 @@ class MultiSlabAnalysisRequest(BaseModel):
     nonStructuralWalls: List[LineLoadSegment] = []
     partitionWallSegments: List[LineLoadSegment] = []
     meshSize: float = 0.5
+    mpcConstraints: List[MpcConstraint] = []
 
 class SlabAnalysisResult(BaseModel):
     slabId: str
