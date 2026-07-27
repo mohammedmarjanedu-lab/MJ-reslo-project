@@ -1,4 +1,4 @@
-﻿# Start Reslo Backend + Svelte Frontend + Cloudflare Tunnels + Surge
+# Start Reslo Backend + Svelte Frontend + Cloudflare Tunnels + Surge
 # Universal startup: auto-builds frontend, health-checks backend, logs all errors
 # Usage: .\start_tunnel.ps1
 # Stop:  .\stop_tunnel.ps1
@@ -192,7 +192,7 @@ if (-not (Test-Path $distIndex)) {
 # 9. Start FastAPI backend (redirect stderr to backend.log)
 # Uvicorn logs to stderr, Python crash tracebacks go to stderr too.
 # Use absolute log path so the file is always created in the right place.
-Write-Host "Starting FastAPI backend (Kratos solver)..." -ForegroundColor Cyan
+Write-Host "Starting FastAPI backend (Pure Python DKT Solver)..." -ForegroundColor Cyan
 $logPath = Join-Path $PSScriptRoot "backend.log"
 if (Test-Path $logPath) { Remove-Item $logPath -Force -ErrorAction SilentlyContinue }
 $backendArgs = $pyArgs + @("-u", "backend\main.py")
@@ -222,7 +222,6 @@ if (-not $backendReady) {
     }
     Write-Host "" -ForegroundColor Red
     Write-Host "Common causes:" -ForegroundColor Yellow
-    Write-Host "  - KratosMultiphysics not installed (pip install KratosMultiphysics KratosStructuralMechanicsApplication)" -ForegroundColor Yellow
     Write-Host "  - Missing Python dependencies (pip install fastapi uvicorn scipy numpy gmsh)" -ForegroundColor Yellow
     Write-Host "  - Port 8000 already in use (netstat -ano | findstr :8000)" -ForegroundColor Yellow
     # Continue anyway so frontend still serves (worker fallback works without backend)

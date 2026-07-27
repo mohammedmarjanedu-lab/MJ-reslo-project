@@ -131,7 +131,7 @@
             uiState.setApiUrl(FALLBACK_LIVE_URL);
             uiState.backendConnected = true;
             apiAvailable = true;
-            uiState.setStatusMessage('Python backend connected (Kratos Multiphysics)');
+            uiState.setStatusMessage('Python backend connected (Pure Python DKT Solver)');
           } else {
             uiState.backendConnected = false;
             apiAvailable = false;
@@ -143,7 +143,7 @@
       uiState.backendConnected = ok;
       apiAvailable = ok;
       if (ok) {
-        uiState.setStatusMessage('Python backend connected (Kratos Multiphysics)');
+        uiState.setStatusMessage('Python backend connected (Pure Python DKT Solver)');
       }
     });
   }
@@ -662,9 +662,9 @@
     <div class="calculation-engine-panel p-2.5 border-t border-[#222222] bg-[#0c0c0c] flex flex-col gap-1 shrink-0">
       <div class="text-[10px] font-bold text-[#888888] uppercase tracking-wider px-1">Calculation Engine</div>
       <div class="flex items-center gap-1.5 px-1 py-0.5">
-        <span class="w-1.5 h-1.5 rounded-full {uiState.backendConnected ? 'bg-green-500 shadow-[0_0_6px_#10b981]' : 'bg-yellow-500 shadow-[0_0_6px_#f59e0b]'}"></span>
+        <span class="w-1.5 h-1.5 rounded-full {uiState.solverEngine === 'ts_local' ? 'bg-indigo-500 shadow-[0_0_6px_#6366f1]' : uiState.backendConnected ? 'bg-green-500 shadow-[0_0_6px_#10b981]' : 'bg-yellow-500 shadow-[0_0_6px_#f59e0b]'}"></span>
         <span class="text-[9px] text-slate-300 font-medium">
-          {uiState.backendConnected ? 'Kratos Connected' : 'Local Solver Fallback'}
+          {uiState.solverEngine === 'ts_local' ? 'TypeScript In-Browser WebWorker' : uiState.backendConnected ? 'Python DKT Backend' : 'TypeScript Web Worker'}
         </span>
       </div>
     </div>
