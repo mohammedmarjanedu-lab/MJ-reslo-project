@@ -77,18 +77,18 @@ Licenses of **everything that ships** were inventoried (full dependency walk, fr
 ### 4.1 ✅ Clean for commercial use (permissive)
 - **Frontend**: Svelte (MIT), Vite (MIT), three.js (MIT), Tailwind v4 (MIT), jsPDF (MIT), pdfjs-dist (Apache-2.0 — include its NOTICE), TypeScript (Apache-2.0), DOMPurify (MPL-2.0 OR Apache-2.0), pako (MIT/Zlib), libtess (SGI-B-2.0, permissive).
 - **Backend**: **KratosMultiphysics (BSD-4)** ✅, numpy (BSD), scipy (BSD), FastAPI/uvicorn/pydantic (MIT/BSD).
-- **awatif (MIT)** — vendored in `awatif-main/`, and **not imported by the app** (the bridge is a stub). Safe as long as it stays out of shipped artifacts (see 4.2 for why).
+- **awatif (MIT)** — **vendored copy deleted** (was never imported by the app; the bridge is a stub). If a client-side solver is ever wanted it can be re-added from npm as a clean MIT dependency — but **without** its `triangle-wasm` meshing addon (Triangle 1.6 is commercial-by-arrangement only); the in-repo TS mesher covers that role.
 
 ### 4.2 ⚠️ Items needing a decision before commercial release
 
 | Component | License | Exposure | Recommended action |
 |---|---|---|---|
 | **p5.js** (2D canvas renderer) | **LGPL-2.1** | Shipped in the frontend bundle | Either **(a)** keep it and comply: ship copyright/license notice + make library replaceable (standard corporate practice for LGPL in web apps), or **(b)** replace with an **MIT** renderer: **Konva.js** or **PixiJS** (both MIT, canvas-based), or plain Canvas API — the p5 usage is concentrated in `src/lib/canvas/renderer.ts`, so a swap is feasible but is the largest piece of optional remaining work |
-| **OpenSeesPy** (`backend/opensees_solver.py`) | OpenSees license — **academic/research/non-profit only**; commercial use needs written UC Regents permission | File present but **disabled** (import commented out, **not** in `requirements.txt`) | For a commercial product: **delete the file** or keep permanently disabled. Do not re-enable |
+| **OpenSeesPy** (`backend/opensees_solver.py`) | OpenSees license — **academic/research/non-profit only**; commercial use needs written UC Regents permission | **REMOVED from the repository** (solver + all dependent test/probe files deleted; no live production import ever existed) | Done. Do not re-introduce; Kratos (BSD-4) is the sole backend structural engine, cross-checked by the in-repo scipy DKT solver |
 | **Gmsh** (backend meshing) | **GPL-2.0+** | Running server-side | **SaaS/hosted use: fine** (GPL allows commercial use; obligations trigger on *distribution*, and network use isn't distribution). If you ever ship the backend on-premise/appliance, the backend effectively falls under GPL → then switch meshing to the **existing in-repo TS mesher** (`meshGenerator.ts`, already the runtime fallback), `scipy.spatial.Delaunay` (BSD/Qhull), or mapbox **delaunator** (ISC) |
-| **Triangle 1.6** (inside vendored `awatif-main/…/triangle-mesh`) | Copyright J.R. Shewchuk — **"distribution as part of a commercial system permissible ONLY BY DIRECT ARRANGEMENT WITH THE AUTHOR"** | **Never shipped** (awatif is not imported by the app), but the wasm sits in the repo | If awatif stays unused: **exclude `awatif-main/` from the product/repo** (or at least the `triangle-mesh/assets/` binaries) before commercial distribution |
+| **Triangle 1.6** (inside vendored `awatif-main/…/triangle-mesh`) | Copyright J.R. Shewchuk — **"distribution as part of a commercial system permissible ONLY BY DIRECT ARRANGEMENT WITH THE AUTHOR"** | **REMOVED** — the entire unused `awatif-main/` vendor tree (incl. the `triangle.out.wasm` binary) has been deleted from the repo | Done. The app never imported awatif; nothing to replace |
 
-**Bottom line**: the *running* product is commercially viable today (Kratos BSD solver + MIT frontend, with the LGPL-p5 caveat handled per 4.2-a). Pure "everything permissive" version = swap p5 → Konva/Pixi, delete `opensees_solver.py`, drop `awatif-main/`, keep gmsh server-side only (or use the built-in mesher).
+**Bottom line**: the *running* product is commercially viable today (Kratos BSD solver + MIT frontend, with the LGPL-p5 caveat handled per 4.2-a). ~~delete `opensees_solver.py`, drop `awatif-main/`~~ — **both done**. The only remaining optional item for a "everything permissive" bill of materials is the p5 → Konva/Pixi renderer swap; keep gmsh server-side only (or use the built-in mesher).
 
 ---
 

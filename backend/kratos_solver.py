@@ -5,14 +5,14 @@ RESLO Backend Solver - Kratos Multiphysics Implementation
 This module implements the 3D Finite Element Analysis (FEA) solver using KratosMultiphysics
 (BSD-4 Licensed) for thin-plate slab bending, beam-column frame action, and structural continuity.
 
-Technical Mappings from OpenSeesPy to Kratos Multiphysics:
+Element & Solver Inventory (ETABS-classical equivalents):
 -----------------------------------------------------------
-- Thin Plate/Slab: ShellDKGT -> ShellThinElement3D3N (triangles) & ShellThinElement3D4N (quads)
-- Columns / Beams: elasticBeamColumn -> CrLinearBeamElement3D2N
-- Rigid Links (Capitals): rigidLink('beam', master, slave) -> LinearMasterSlaveConstraint
-- Shear Walls: Line constraints -> DOF Fixity & Master-Slave coupling
-- Sparse Solver: UMFPack -> SkylineLUFactorizationSolver / BlockBuilderAndSolver
-- Base Fixities: fix() -> Node.Fix() on DISPLACEMENT and ROTATION
+- Thin Plate/Slab: ShellThinElement3D3N (triangles) & ShellThinElement3D4N (quads) — DKT-class
+- Columns / Beams: CrLinearBeamElement3D2N — classical Euler-Bernoulli frame elements
+- Rigid Links (Capitals): LinearMasterSlaveConstraint — rigid diaphragm / column-head capital behaviour
+- Shear Walls: DOF fixity (line supports) & master-slave coupling along wall lines
+- Sparse Solver: SkylineLUFactorizationSolver / BlockBuilderAndSolver
+- Base Fixities: Node.Fix() on DISPLACEMENT and ROTATION
 
 Engineering Continuity Constraints:
 -----------------------------------
@@ -682,10 +682,11 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
     uf = UnionFind(all_node_ids)
 
     for tri in elem_nodes:
+        # elem_nodes holds 0-based node indices; UF is built over 1-based node IDs
         for k in range(len(tri) - 1):
-            uf.union(tri[k], tri[k + 1])
+            uf.union(tri[k] + 1, tri[k + 1] + 1)
         if len(tri) > 2:
-            uf.union(tri[0], tri[-1])
+            uf.union(tri[0] + 1, tri[-1] + 1)
 
     for col_idx, nidx in enumerate(col_node_indices):
         master_id = nidx + 1
@@ -719,14 +720,16 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
             supported_roots.add(uf.find(nid))
 
     unsupported_count = 0
+    unsupported_node_ids = []
     for nid in all_node_ids:
         root = uf.find(nid)
         if root not in supported_roots:
             node_fixities[nid] = [1, 1, 1, 1, 1, 1]
             unsupported_count += 1
+            unsupported_node_ids.append(nid)
 
     if unsupported_count > 0:
-        logger.warning(f"Solver stabilized: fully fixed {unsupported_count} unsupported/floating nodes to prevent singular matrix error.")
+        logger.warning(f"Solver stabilized: fully fixed {unsupported_count} unsupported/floating nodes to prevent singular matrix error. Node IDs: {unsupported_node_ids}")
 
     # Equal DOF Constraints (e.g. C0 hinges and multi-slab interface constraints).
     # A slave DOF must never be support-restrained (Kratos forbids fixing a slave):
@@ -814,7 +817,13 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
             prop_shell.SetValue(KM.POISSON_RATIO, nu)
             prop_shell.SetValue(KM.THICKNESS, h_eff)
             prop_shell.SetValue(KM.DENSITY, 2500.0)
-            claw = SMA.LinearElastic3DLaw()
+            # Plate/shell theory requires plane-stress: sigma_zz = 0 through the
+            # thickness. A full 3D law cannot condense sigma_zz and yields
+            # plane-strain stiffness  E(1-nu)/((1+nu)(1-2nu))  instead of the
+            # Kirchhoff plate modulus  E/(1-nu^2)  — for nu=0.2 that is +6.7%
+            # stiffer (measured: Kratos plate converged 7.3% below the exact
+            # Mindlin-Navier deflection; with this law it matches theory).
+            claw = SMA.LinearElasticPlaneStress2DLaw()
             prop_shell.SetValue(KM.CONSTITUTIVE_LAW, claw)
             properties_map[prop_key] = prop_shell
         else:
@@ -948,7 +957,6 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
     for nid, fz in nodal_forces.items():
         if nid in kratos_nodes_map:
             knode = kratos_nodes_map[nid]
-            knode.SetSolutionStepValue(SMA.POINT_LOAD, [0.0, 0.0, -fz])
             cond = model_part.CreateNewCondition("PointLoadCondition3D1N", cond_counter, [nid], dummy_prop)
             cond.SetValue(SMA.POINT_LOAD, [0.0, 0.0, -fz])
             cond_counter += 1
