@@ -17,6 +17,7 @@
   let height = $state(600);
   let animId: number;
   let cursorValue = $state<{ x: number; y: number; text: string } | null>(null);
+  let canvasDragFileOver = $state<boolean>(false);
   let dirty = true;
 
   // ─── Cached expensive computations (only recompute when model changes, not every frame) ───

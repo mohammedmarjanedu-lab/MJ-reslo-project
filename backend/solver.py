@@ -466,7 +466,7 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             else:
                 H = col_heights[ci] if ci < len(col_heights) else 3.0
                 I_col = (wcol * dcol**3) / 12.0
-                kth = 0.005 * E * I_col / H
+                kth = 4.0 * E * I_col / H
             col_spring_map[nidx] = kth
 
     # Beam elements: discretize along mesh nodes and add 12x12 beam stiffness between adjacent node pairs

@@ -3,7 +3,6 @@ import pytest
 from mesher import generate_mesh
 from models import MeshRequest, SlabGeometry, WallSupport, Point2D, AnalysisRequest, ColumnSupport, BeamDef
 from kratos_solver import solve_reslo_structure
-from opensees_solver import analyze_slab_opensees
 
 def test_simply_supported_square_plate_kratos():
     """Test 1: Simply supported 4m x 4m flat slab center deflection comparison between Kratos & OpenSeesPy."""

@@ -1,8 +1,8 @@
 {
   "solver": "python_dkt",
   "success": true,
-  "maxDeflection_mm": 1.8713935,
-  "centerDeflection_mm": 1.8713934621128487,
+  "maxDeflection_mm": 2.0891973999999998,
+  "centerDeflection_mm": 2.089197354616541,
   "minMx": 0,
   "maxMx": 0,
   "minMy": 0,
