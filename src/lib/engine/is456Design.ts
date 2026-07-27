@@ -256,6 +256,7 @@ export function checkDeflection(
   const span = Math.max(w, h) * 1000; // mm
 
   const limitRatio = 250;
+  const longTermLimitRatio = 350;
   const spanRatio = span / Math.max(maxDefl, 1e-6);
 
   const longTermDeflection = maxDefl * longTermFactor;
@@ -270,7 +271,7 @@ export function checkDeflection(
     shortTermStatus: spanRatio >= limitRatio ? 'OK' : spanRatio >= limitRatio * 0.8 ? 'WARNING' : 'FAIL',
     longTermDeflection: Math.round(longTermDeflection * 100) / 100,
     longTermRatio: Math.round(longTermRatio * 10) / 10,
-    longTermStatus: longTermRatio >= limitRatio ? 'OK' : longTermRatio >= limitRatio * 0.8 ? 'WARNING' : 'FAIL',
+    longTermStatus: longTermRatio >= longTermLimitRatio ? 'OK' : longTermRatio >= longTermLimitRatio * 0.8 ? 'WARNING' : 'FAIL',
   };
 }
 

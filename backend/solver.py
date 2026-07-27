@@ -455,6 +455,8 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
     col_stiffnesses = request.columnStiffnesses or []
     col_heights = request.columnHeights or []
 
+    col_bcs = request.columnBoundaryConditions or []
+
     for ci, nid in enumerate(col_node_ids):
         nidx = nid - 1
         if 0 <= nidx < nn:
@@ -462,29 +464,45 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             wcol = col_widths[ci] if ci < len(col_widths) else 0.3
             dcol = col_depths[ci] if ci < len(col_depths) else 0.3
             H = col_heights[ci] if ci < len(col_heights) else 3.0
+            bc = col_bcs[ci] if ci < len(col_bcs) else "fixed-fixed"
             col_dims_map[nidx] = (wcol, dcol)
 
             A_col = wcol * dcol
             Ixx = dcol * wcol**3 / 12.0
             Iyy = wcol * dcol**3 / 12.0
 
+            col_factor = 3.0 if bc in ("pinned", "fixed-pinned") else 4.0
+
             Kz = E * A_col / H
-            kth_x = 4.0 * E * Ixx / H
-            kth_y = 4.0 * E * Iyy / H
+            kth_x = col_factor * E * Ixx / H
+            kth_y = col_factor * E * Iyy / H
 
-            # Vertical axial column spring (W-DOF)
-            rows_list.append(NDOF_PER_NODE * nidx + W)
-            cols_list.append(NDOF_PER_NODE * nidx + W)
-            data_list.append(Kz)
+            r_footprint = max(0.12, 0.45 * max(wcol, dcol))
+            cx, cy = nodes_xy[nidx, 0], nodes_xy[nidx, 1]
+            footprint_nodes = []
+            for check_idx in range(nn):
+                if np.hypot(nodes_xy[check_idx, 0] - cx, nodes_xy[check_idx, 1] - cy) <= r_footprint:
+                    footprint_nodes.append(check_idx)
 
-            # Rotational column springs (RX and RY DOFs)
-            rows_list.append(NDOF_PER_NODE * nidx + RX)
-            cols_list.append(NDOF_PER_NODE * nidx + RX)
-            data_list.append(kth_x)
+            if not footprint_nodes:
+                footprint_nodes = [nidx]
 
-            rows_list.append(NDOF_PER_NODE * nidx + RY)
-            cols_list.append(NDOF_PER_NODE * nidx + RY)
-            data_list.append(kth_y)
+            kz_per_node = Kz / len(footprint_nodes)
+            kth_x_per_node = kth_x / len(footprint_nodes)
+            kth_y_per_node = kth_y / len(footprint_nodes)
+
+            for fp_nidx in footprint_nodes:
+                rows_list.append(NDOF_PER_NODE * fp_nidx + W)
+                cols_list.append(NDOF_PER_NODE * fp_nidx + W)
+                data_list.append(kz_per_node)
+
+                rows_list.append(NDOF_PER_NODE * fp_nidx + RX)
+                cols_list.append(NDOF_PER_NODE * fp_nidx + RX)
+                data_list.append(kth_x_per_node)
+
+                rows_list.append(NDOF_PER_NODE * fp_nidx + RY)
+                cols_list.append(NDOF_PER_NODE * fp_nidx + RY)
+                data_list.append(kth_y_per_node)
 
             col_spring_map[nidx] = Kz
 
