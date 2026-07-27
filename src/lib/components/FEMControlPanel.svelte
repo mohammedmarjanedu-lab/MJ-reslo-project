@@ -95,6 +95,18 @@
   {/if}
 
   <div class="flex flex-col gap-2">
+    <!-- FEM Solver Engine Selection -->
+    <div>
+      <label class="block text-[10px] text-slate-500 mb-0.5">FEM Solver Engine</label>
+      <select
+        bind:value={uiState.solverEngine}
+        class="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1 text-white text-[11px] focus:outline-none focus:border-indigo-500"
+      >
+        <option value="ts_local">⚡ TypeScript In-Browser Solver (Local Web Worker)</option>
+        <option value="python_backend">🐍 Python Direct DKT Solver (Backend)</option>
+      </select>
+    </div>
+
     <!-- API URL Config -->
     <div class="border-b border-slate-700 pb-2 mb-1">
       <div class="flex items-center justify-between mb-1">

@@ -27,6 +27,7 @@ function getSavedApiUrl(): string {
 
 
 class UIState {
+  solverEngine = $state<'ts_local' | 'python_backend'>('ts_local');
   mode = $state<CanvasMode>('select');
   tool = $state<ToolType>('select');
   selectedElementId = $state<string | null>(null);

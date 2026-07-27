@@ -339,38 +339,37 @@
       }
     }
 
-    // ── Primary: Kratos Multiphysics backend (kratos_solver.py default when connected — fast & accurate) ──
+    // ── TypeScript In-Browser Web Worker Solver (Default / Kratos Independent) ──
+    if (uiState.solverEngine === 'ts_local' || !apiAvailable) {
+      try {
+        await runWorkerSolver(validSlabs, columns, allWalls, meshSize, gen, slabIdsAtStart);
+        if (gen !== femGen) return;
+        return;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        femState.setError(`Solver failed: ${msg}`);
+        uiState.setStatusMessage(`Solver error: ${msg}`);
+        return;
+      }
+    }
+
+    // ── Python DKT Backend Solver (Optional) ──
     if (apiAvailable) {
       try {
         await meshAndAnalyzeBackend(validSlabs, allWalls, columns, meshSize, gen, slabIdsAtStart);
         if (gen !== femGen) return;
-        return; // backend result is authoritative
+        return;
       } catch (e) {
-        console.warn(`[Reslo] Initial Kratos attempt failed, retrying backend:`, e);
+        console.warn(`[Reslo] Python backend attempt failed, falling back to Web Worker solver:`, e);
         try {
-          // Automatic retry to handle temporary network/mesh latency
-          await meshAndAnalyzeBackend(validSlabs, allWalls, columns, meshSize, gen, slabIdsAtStart);
+          await runWorkerSolver(validSlabs, columns, allWalls, meshSize, gen, slabIdsAtStart);
           if (gen !== femGen) return;
-          return;
         } catch (e2) {
-          const msg = e2 instanceof PyApiError ? e2.message : String(e2);
-          console.warn(`[Reslo] Kratos Multiphysics backend unavailable (${msg}). Falling back to in-browser Web Worker solver...`);
-          uiState.backendConnected = false;
-          apiAvailable = false;
-          uiState.setStatusMessage('Using in-browser Web Worker solver');
+          const msg = e2 instanceof Error ? e2.message : String(e2);
+          femState.setError(`Solver failed: ${msg}`);
+          uiState.setStatusMessage(`Solver error: ${msg}`);
         }
       }
-    }
-
-    // ── Fallback: in-browser Web Worker solver (no install, instant, lag-free) ──
-    // Runs automatically when the backend is offline so the app still works as a pure website.
-    try {
-      await runWorkerSolver(validSlabs, columns, allWalls, meshSize, gen, slabIdsAtStart);
-      if (gen !== femGen) return;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      femState.setError(`Solver failed: ${msg}`);
-      uiState.setStatusMessage(`Solver error: ${msg}`);
     }
   }
 
