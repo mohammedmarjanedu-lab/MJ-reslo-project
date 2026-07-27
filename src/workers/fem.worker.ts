@@ -40,14 +40,19 @@ self.onmessage = async (event: MessageEvent<FEMWorkerInput>) => {
   try {
     post({ type: 'PROGRESS', progress: 0 });
 
-    const results = analyzeAllSlabs(
+    const { results, warnings } = analyzeAllSlabs(
       input.slabs, input.columns, input.walls, input.polylineWalls,
       input.beams, input.dropPanels,
       input.nonStructuralWalls, input.polylineNonStructuralWalls,
       input.meshSize, input.poissonRatio,
       input.useQ8 ?? false,
-      (pct, slabId) => { post({ type: 'PROGRESS', progress: pct, slabId }); }
+      (pct, slabId) => { post({ type: 'PROGRESS', progress: pct, slabId }); },
+      input.designOptions
     );
+
+    for (const warn of warnings) {
+      console.warn('[FEM Solver]', warn);
+    }
 
     for (const r of results) {
       if (typeof r.minWz !== 'number' || isNaN(r.minWz)) r.minWz = 0;
@@ -60,7 +65,14 @@ self.onmessage = async (event: MessageEvent<FEMWorkerInput>) => {
 
     post({ type: 'RESULT', results });
   } catch (err) {
-    const msg = err instanceof Error ? `${err.message}\n${err.stack || ''}` : String(err);
+    let msg = 'Unknown solver error';
+    if (err instanceof Error) {
+      msg = err.message || err.toString();
+    } else if (typeof err === 'string') {
+      msg = err;
+    } else if (err && typeof err === 'object') {
+      msg = JSON.stringify(err);
+    }
     post({ type: 'ERROR', error: msg });
   }
 };

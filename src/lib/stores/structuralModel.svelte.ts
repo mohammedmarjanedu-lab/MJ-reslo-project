@@ -42,7 +42,7 @@ function newSlab(vertices: Point2D[] = [], grade = 'M25', existingLabels: string
     id: genId('S'),
     label: getNextLabelSuffix('S', existingLabels),
     vertices: vertices.map(v => ({ ...v })), holes: [],
-    thickness: 0.2, uniformLoad: 5, partitionLoad: 0, concreteGrade: grade, ...props, crackingModifier: 0.25,
+    thickness: 0.2, uniformLoad: 5, partitionLoad: 0, concreteGrade: grade, ...props, crackingModifier: 1.0,
   };
 }
 
@@ -297,7 +297,7 @@ class StructuralModel {
     this.slabs = (data.elements.slabs ?? []).map((s: SlabPolygon, i: number) => ({
       ...s,
       label: s.label ?? `S-${String(i + 1).padStart(2, '0')}`,
-      crackingModifier: s.crackingModifier ?? 0.25,
+      crackingModifier: s.crackingModifier ?? 1.0,
     }));
     this.dropPanels = data.elements.dropPanels ?? [];
     this.dimensions = data.elements.dimensions ?? [];
@@ -564,6 +564,9 @@ class StructuralModel {
       this.canvasViewOffsetX = this.canvasWidth / 2;
       this.canvasViewOffsetY = this.canvasHeight / 2;
     }
+    // Also reset 3D view preset and trigger 3D camera reset
+    uiState.viewPreset = 'iso';
+    uiState.resetViewTrigger += 1;
   }
 
   resetModel(): void {

@@ -4,7 +4,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from opensees_solver import analyze_slab_opensees
+from kratos_solver import solve_reslo_structure
 from mesher import generate_mesh
 from models import MeshRequest, SlabGeometry, Point2D, AnalysisRequest
 
@@ -59,10 +59,10 @@ req_dict = {
 }
 
 req = AnalysisRequest(**req_dict)
-res = analyze_slab_opensees(req)
+res = solve_reslo_structure(req)
 res_dict = res.model_dump()
 
-print("\n================ OpenSeesPy Output Results ================")
+print("\n================ Kratos Multiphysics Output Results ================")
 print(f"Success: {res_dict['success']}")
 print(f"Min Wz (deflection): {res_dict['minWz']*1000:.4f} mm")
 print(f"Max Wz (deflection): {res_dict['maxWz']*1000:.4f} mm")
@@ -72,3 +72,4 @@ print(f"Min My: {res_dict['minMy']:.4f} kN·m/m, Max My: {res_dict['maxMy']:.4f}
 print("\n--- Column Punching & Reaction Forces ---")
 for p in res_dict.get('columnPunching', []):
     print(f"Node {p['nodeId']}: Force = {p['force_kN']:.2f} kN, Stress = {p['stress_MPa']:.3f} MPa, Capacity = {p['capacity_MPa']:.3f} MPa, Ratio = {p['ratio']:.3f} ({p['status']})")
+

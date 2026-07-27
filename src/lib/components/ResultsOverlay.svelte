@@ -28,10 +28,8 @@
             <div class="grid grid-cols-2 gap-x-2 gap-y-0.5">
               <span>Nodes: {result.mesh.nodes.length}</span>
               <span>Elements: {result.mesh.elements.length}</span>
-              <span>Max defl: <span class="text-red-400">{Math.max(Math.abs(result.minWz), Math.abs(result.maxWz)) * 1000} mm</span></span>
-              <span>Min defl: <span class="text-blue-400">{Math.min(Math.abs(result.minWz), Math.abs(result.maxWz)) * 1000} mm</span></span>
-              <span>Max Mx: <span class="text-red-400">{result.maxMx.toFixed(1)} kN·m/m</span></span>
-              <span>Max My: <span class="text-red-400">{result.maxMy.toFixed(1)} kN·m/m</span></span>
+              <span>Max defl: <span class="text-red-400">{Math.max(Math.abs(result.minWz), Math.abs(result.maxWz)).toFixed(3)} mm</span></span>
+              <span>Min defl: <span class="text-blue-400">{Math.min(Math.abs(result.minWz), Math.abs(result.maxWz)).toFixed(3)} mm</span></span>
             </div>
             {#if result.columnPunching && result.columnPunching.length > 0}
               <div class="mt-1.5 pt-1.5 border-t border-slate-600">

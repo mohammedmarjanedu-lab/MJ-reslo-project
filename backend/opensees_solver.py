@@ -42,6 +42,7 @@ def _point_in_polygon(x: float, y: float, poly: List[Tuple[float, float]]) -> bo
 def _build_model(request: AnalysisRequest, nodes_xy, nn, elem_nodes, col_node_indices, col_dims_map, col_node_patches, slave_nodes, wall_node_ids_set, elem_thicknesses, G_val, h, E, nu, lateral_cr_mode: bool = False):
     ops.wipe()
     ops.model('basic', '-ndm', 3, '-ndf', 6)
+    ops.constraints('Transformation')
 
     # Collect all nodes that are part of elements or supports to identify isolated nodes
     connected_nodes = set()
@@ -213,27 +214,30 @@ def _build_model(request: AnalysisRequest, nodes_xy, nn, elem_nodes, col_node_in
                     node_fixities[nid][1] = 1
                     node_fixities[nid][2] = 1
 
+    # Equal DOF constraints (e.g., for C0-only hinged slab joints)
+    if hasattr(request, 'equalDofConstraints') and request.equalDofConstraints:
+        for eq_c in request.equalDofConstraints:
+            if eq_c.nodeIdA and eq_c.nodeIdB and eq_c.dofs:
+                ops.equalDOF(int(eq_c.nodeIdA), int(eq_c.nodeIdB), *[int(d) for d in eq_c.dofs])
+
     # 4. Slab Shell elements Setup
-    ops.section('ElasticMembranePlateSection', 1, E, nu, h, 0.0)
-    if request.dropPanels:
-        for dp_idx, dp in enumerate(request.dropPanels):
-            ops.section('ElasticMembranePlateSection', 10 + dp_idx, E, nu, h + dp.drop, 0.0)
+    sections_map = {}
+    sec_counter = 1
 
     for elem_idx, tri_nodes in enumerate(elem_nodes):
         elem_id = elem_idx + 1
-        sec_tag = 1
         h_eff = elem_thicknesses.get(elem_idx, h)
-        if request.dropPanels:
-            n0_c = nodes_xy[tri_nodes[0]]
-            n1_c = nodes_xy[tri_nodes[1]]
-            n2_c = nodes_xy[tri_nodes[2]]
-            xc = (n0_c[0] + n1_c[0] + n2_c[0]) / 3.0
-            yc = (n0_c[1] + n1_c[1] + n2_c[1]) / 3.0
-            for dp_idx, dp in enumerate(request.dropPanels):
-                poly = [(v.x, v.y) for v in dp.vertices]
-                if _point_in_polygon(xc, yc, poly):
-                    sec_tag = 10 + dp_idx
-                    break
+        E_eff = request.elementElasticModuli[elem_idx] if (request.elementElasticModuli and elem_idx < len(request.elementElasticModuli)) else E
+
+        sec_key = (round(h_eff, 4), round(E_eff, -4))
+        if sec_key not in sections_map:
+            sec_tag = sec_counter
+            sec_counter += 1
+            sections_map[sec_key] = sec_tag
+            ops.section('ElasticMembranePlateSection', sec_tag, E_eff, nu, h_eff, 0.0)
+        else:
+            sec_tag = sections_map[sec_key]
+
         ops.element('ShellDKGT', elem_id, tri_nodes[0] + 1, tri_nodes[1] + 1, tri_nodes[2] + 1, sec_tag)
 
     # 5. Beam elements Setup
@@ -373,13 +377,19 @@ def _build_model(request: AnalysisRequest, nodes_xy, nn, elem_nodes, col_node_in
                 Lw = np.hypot(dx, dy)
                 if Lw < 1e-6 or w_H < 1e-6:
                     continue
-                wall_seg_nodes = find_nodes_near_segment(nodes_xy, (w_start.x, w_start.y), (w_end.x, w_end.y), tol=0.05)
+                wall_seg_nodes = find_nodes_near_segment(nodes_xy, (w_start.x, w_start.y), (w_end.x, w_end.y), tol=0.25)
                 if len(wall_seg_nodes) > 0:
                     wall_master_id = 5000000 + w_idx
                     wall_base_id = 6000000 + w_idx
                     uf.union(wall_master_id, wall_base_id)
                     for nid in wall_seg_nodes:
                         uf.union(wall_master_id, nid)
+
+    # 5. Union equalDOF constraints (e.g. C0 hinges and multi-slab interface constraints)
+    if hasattr(request, 'equalDofConstraints') and request.equalDofConstraints:
+        for eq_c in request.equalDofConstraints:
+            if eq_c.nodeIdA and eq_c.nodeIdB:
+                uf.union(int(eq_c.nodeIdA), int(eq_c.nodeIdB))
 
     # Collect roots of components that have at least one supported node
     supported_roots = set()
@@ -558,31 +568,38 @@ def _calculate_cr_analytical(request: AnalysisRequest) -> Tuple[float, float]:
             w_end = request.wallEndPoints[w_idx]
             w_t = request.wallThicknesses[w_idx]
             w_H = request.wallHeights[w_idx]
-            
+
+            # Use wall-specific E if provided, otherwise fall back to slab E
+            wall_E = E
+            if (hasattr(request, 'wallElasticModuli') and request.wallElasticModuli
+                    and w_idx < len(request.wallElasticModuli) and request.wallElasticModuli[w_idx] > 0):
+                wall_E = request.wallElasticModuli[w_idx]
+            G_wall = wall_E / (2.0 * (1.0 + nu))
+
             dx = w_end.x - w_start.x
             dy = w_end.y - w_start.y
             Lw = np.hypot(dx, dy)
             if Lw < 1e-6 or w_H < 1e-6:
                 continue
-                
+
             cos_a = dx / Lw
             sin_a = dy / Lw
             alpha = np.arctan2(dy, dx)
-            
+
             xc = (w_start.x + w_end.x) / 2.0
             yc = (w_start.y + w_end.y) / 2.0
-            
+
             bc = request.wallBoundaryConditions[w_idx] if (request.wallBoundaryConditions and w_idx < len(request.wallBoundaryConditions)) else "fixed-free"
             wall_fixity = 12.0 if bc == "fixed-fixed" else 3.0
-            
+
             I_in = w_t * Lw**3 / 12.0
             A_w = w_t * Lw
-            
-            delta_flex_in = w_H**3 / (wall_fixity * E * I_in)
-            delta_shear_in = 1.2 * w_H / (G * A_w)
+
+            delta_flex_in = w_H**3 / (wall_fixity * wall_E * I_in)
+            delta_shear_in = 1.2 * w_H / (G_wall * A_w)
             k_in = 1.0 / (delta_flex_in + delta_shear_in)
-            
-            D_plate = (E * w_t**3) / (12.0 * (1.0 - nu**2))
+
+            D_plate = (wall_E * w_t**3) / (12.0 * (1.0 - nu**2))
             k_out = (wall_fixity * D_plate * Lw) / w_H**3
             
             cosA2 = np.cos(alpha)**2
@@ -891,18 +908,17 @@ def analyze_slab_opensees(request: AnalysisRequest) -> AnalysisResponse:
 
     elem_thicknesses = {}
     for elem_idx, tri_nodes in enumerate(elem_nodes):
-        n0_c = nodes_xy[tri_nodes[0]]
-        n1_c = nodes_xy[tri_nodes[1]]
-        n2_c = nodes_xy[tri_nodes[2]]
-        xc = (n0_c[0] + n1_c[0] + n2_c[0]) / 3.0
-        yc = (n0_c[1] + n1_c[1] + n2_c[1]) / 3.0
-        sec_tag = 1
-        h_eff = h
+        h_eff = request.elementThicknesses[elem_idx] if (request.elementThicknesses and elem_idx < len(request.elementThicknesses)) else h
         if request.dropPanels:
+            n0_c = nodes_xy[tri_nodes[0]]
+            n1_c = nodes_xy[tri_nodes[1]]
+            n2_c = nodes_xy[tri_nodes[2]]
+            xc = (n0_c[0] + n1_c[0] + n2_c[0]) / 3.0
+            yc = (n0_c[1] + n1_c[1] + n2_c[1]) / 3.0
             for dp_idx, dp in enumerate(request.dropPanels):
                 poly = [(v.x, v.y) for v in dp.vertices]
                 if _point_in_polygon(xc, yc, poly):
-                    h_eff = h + dp.drop
+                    h_eff = h_eff + dp.drop
                     break
         elem_thicknesses[elem_idx] = h_eff
 
@@ -912,9 +928,10 @@ def analyze_slab_opensees(request: AnalysisRequest) -> AnalysisResponse:
     beam_forces = _build_model(request, nodes_xy, nn, elem_nodes, col_node_indices, col_dims_map, col_node_patches, slave_nodes, wall_node_ids_set, elem_thicknesses, G_val, h, E, nu)
 
     # 6. Apply Nodal Loads from uniform pressure and beam self-weights
-    q = (request.uniformLoad + request.selfWeight) * 1000  # kN/m² -> N/m²
     nodal_forces = {}
-    for tri in mesh.elements:
+    for elem_idx, tri in enumerate(mesh.elements):
+        q_val = request.elementLoads[elem_idx] if (request.elementLoads and elem_idx < len(request.elementLoads)) else (request.uniformLoad + request.selfWeight)
+        q = q_val * 1000.0  # kN/m² -> N/m²
         n1 = mesh.nodes[tri.nodeIds[0] - 1]
         n2 = mesh.nodes[tri.nodeIds[1] - 1]
         n3 = mesh.nodes[tri.nodeIds[2] - 1]
@@ -1025,7 +1042,7 @@ def analyze_slab_opensees(request: AnalysisRequest) -> AnalysisResponse:
             nodeId=node.id,
             u=disp[0],
             v=disp[1],
-            wz=disp[2],
+            wz=-disp[2],
             rx=disp[3],
             ry=disp[4],
             rz=disp[5]
@@ -1046,16 +1063,29 @@ def analyze_slab_opensees(request: AnalysisRequest) -> AnalysisResponse:
 
     for elem_idx, elem in enumerate(mesh.elements):
         elem_tag = elem_idx + 1
+        h_elem = elem_thicknesses.get(elem_idx, h)
         forces = ops.eleResponse(elem_tag, 'forces')
         stresses = ops.eleResponse(elem_tag, 'stresses')
-        
-        # Determine effective thickness of this specific element (accounting for drop panels)
-        h_elem = elem_thicknesses.get(elem_idx, h)
-        
-        if stresses and len(stresses) >= 32 and any(abs(s) > 1e-12 for s in stresses[:32]):
+        sec_forces = None
+        try:
+            sec_forces = ops.eleResponse(elem_tag, 'section', 'forces')
+            if not sec_forces:
+                sec_forces = ops.eleResponse(elem_tag, 'section', '1', 'forces')
+        except Exception:
+            sec_forces = None
+
+        if sec_forces and len(sec_forces) >= 6:
+            nx = sec_forces[0] / 1000.0
+            ny = sec_forces[1] / 1000.0
+            nxy = sec_forces[2] / 1000.0 if len(sec_forces) > 2 else 0.0
+            mx = sec_forces[3] / 1000.0 if len(sec_forces) > 3 else 0.0
+            my = sec_forces[4] / 1000.0 if len(sec_forces) > 4 else 0.0
+            mxy = sec_forces[5] / 1000.0 if len(sec_forces) > 5 else 0.0
+            vx = sec_forces[6] / 1000.0 if len(sec_forces) > 6 else 0.0
+            vy = sec_forces[7] / 1000.0 if len(sec_forces) > 7 else 0.0
+        elif stresses and len(stresses) >= 32 and any(abs(s) > 1e-12 for s in stresses[:32]):
             arr = np.array(stresses[:32]).reshape(4, 8)
             nx, ny, nxy, mx, my, mxy, vx, vy = arr.mean(axis=0)
-            # Scale N*m/m -> kNm/m and N/m -> kN/m (positive = sagging moment / bottom tension)
             mx = mx / 1000.0
             my = my / 1000.0
             mxy = mxy / 1000.0
@@ -1064,17 +1094,25 @@ def analyze_slab_opensees(request: AnalysisRequest) -> AnalysisResponse:
             nxy = nxy / 1000.0
             vx = vx / 1000.0
             vy = vy / 1000.0
-        elif forces and len(forces) >= 18:
-            # ShellDKGT 18-element nodal force vector [Nx, Ny, Fz, Mx, My, Mz] per node
-            # Scale N*m/m -> kNm/m and N/m -> kN/m
-            nx = (forces[0] + forces[6] + forces[12]) / 3.0 / 1000.0
-            ny = (forces[1] + forces[7] + forces[13]) / 3.0 / 1000.0
+        elif forces and len(forces) >= 15:
+            # 15-DOF vector for 3-node ShellDKGT [Nx1, Ny1, Vz1, Mx1, My1, Nx2, ...]
+            nx = (forces[0] + forces[5] + forces[10]) / 3.0 / 1000.0
+            ny = (forces[1] + forces[6] + forces[11]) / 3.0 / 1000.0
             nxy = 0.0
-            mx = (forces[3] + forces[9] + forces[15]) / 3.0 / 1000.0
-            my = (forces[4] + forces[10] + forces[16]) / 3.0 / 1000.0
-            mxy = (forces[5] + forces[11] + forces[17]) / 3.0 / 1000.0
-            vx = (forces[2] + forces[8] + forces[14]) / 3.0 / 1000.0
+            vx = (forces[2] + forces[7] + forces[12]) / 3.0 / 1000.0
             vy = 0.0
+            mx = (forces[3] + forces[8] + forces[13]) / 3.0 / 1000.0
+            my = (forces[4] + forces[9] + forces[14]) / 3.0 / 1000.0
+            mxy = 0.0
+        elif forces and len(forces) >= 12:
+            nx = (forces[0] + forces[4] + forces[8]) / 3.0 / 1000.0
+            ny = (forces[1] + forces[5] + forces[9]) / 3.0 / 1000.0
+            nxy = 0.0
+            vx = 0.0
+            vy = 0.0
+            mx = (forces[2] + forces[6] + forces[10]) / 3.0 / 1000.0
+            my = (forces[3] + forces[7] + forces[11]) / 3.0 / 1000.0
+            mxy = 0.0
         else:
             nx = ny = nxy = mx = my = mxy = vx = vy = 0.0
 

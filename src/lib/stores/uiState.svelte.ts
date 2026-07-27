@@ -13,16 +13,18 @@ function getSavedApiUrl(): string {
     }
   }
 
-  const envUrl = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) || 'http://localhost:8000';
+  const envUrl = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) || 'http://127.0.0.1:8000';
   try {
     const saved = localStorage.getItem('reslo_api_url');
-    if (!saved || saved.includes('ngrok-free.dev') || saved.includes('undesired-bloating')) {
-      return envUrl;
+    // Reject stale ephemeral Cloudflare/ngrok tunnels stored in localStorage unless explicitly passed via ?api=...
+    if (saved && saved.startsWith('http') && !saved.includes('trycloudflare.com') && !saved.includes('ngrok') && !saved.includes('glass-worm-supervision-mercury')) {
+      return saved;
     }
-    return saved;
+    return envUrl;
   }
   catch { return envUrl; }
 }
+
 
 class UIState {
   mode = $state<CanvasMode>('select');
@@ -48,6 +50,8 @@ class UIState {
   femAutoCompute = $state(false);
   femMeshSize = $state(0.5);
   femUseQ8 = $state(false); // Q8 deferred — needs MITC formulation
+  deflectionType = $state<'cracked' | 'uncracked'>('uncracked');
+  crackedModifierValue = $state(0.25);
   calibrationPoint1 = $state<{ x: number; y: number } | null>(null);
   showCalibrationDialog = $state(false);
   calibrationPendingData = $state<{ p1Screen: { x: number; y: number }; p2Screen: { x: number; y: number } } | null>(null);
@@ -61,11 +65,22 @@ class UIState {
   theme = $state<'dark' | 'light'>(
     (typeof window !== 'undefined' && (localStorage.getItem('reslo_theme') as 'dark' | 'light')) || 'dark'
   );
-  show3DPlanOverlay = $state(false);
 
   // Backend API URL (persisted in localStorage)
   apiUrl = $state<string>(getSavedApiUrl());
   backendConnected = $state(false);
+
+  // New 3D / result visualization state
+  colorRamp = $state<'jet' | 'viridis' | 'diverging' | 'thermal' | 'cool_warm'>('jet');
+  show3DPlanOverlay = $state(false);
+  showColorLegend = $state(true);
+  femAnimationEnabled = $state(false);
+  femAnimationScale = $state(1);
+  viewPreset = $state<'top' | 'front' | 'side' | 'iso' | 'perspective'>('iso');
+  resetViewTrigger = $state(0);
+  showSectionCut = $state(false);
+  sectionCutPosition = $state(0);
+  resultUnitOverride: { [key: string]: string } = {};
 
   setApiUrl(url: string): void {
     this.apiUrl = url;

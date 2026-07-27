@@ -81,6 +81,17 @@
 </script>
 
 <div class="sidebar-panel flex flex-col gap-0.5 rounded-lg bg-[#1a1a1a] p-1.5 shadow-lg border border-[#333333]">
+  <!-- Parametric Study Button -->
+  <button
+    class="w-full flex items-center gap-1.5 rounded-md px-2 py-1 text-xs transition-colors text-[#ffffff] bg-[#333333]/50 hover:bg-[#D62430] hover:text-white cursor-pointer select-none mb-1 border border-[#444444]/30"
+    onclick={() => uiState.setStatusMessage('Parametric Study mode selected (Not implemented)')}
+    title="Parametric Study"
+  >
+    <span class="w-5 text-center text-base">📊</span>
+    <span class="flex-1 text-left text-xs font-medium">Parametric Study</span>
+    <span class="text-[8px] bg-slate-700 text-slate-300 px-1 py-0.2 rounded uppercase font-bold tracking-wider">PRO</span>
+  </button>
+
   {#each tools as t}
     <div class="flex flex-col">
       <button
@@ -245,126 +256,141 @@
 
   <div class="border-t border-[#333333]"></div>
 
-  <label class="flex items-center gap-1.5 px-1.5 py-0.5 text-[10px] text-[#ffffff] cursor-pointer">
-    <input type="checkbox" checked={uiState.showGrid}
-      onchange={(e) => {
-        const on = (e.currentTarget as HTMLInputElement).checked;
-        uiState.showGrid = on;
-        if (!on) uiState.snapToGrid = false;
-      }}
-      class="accent-[#D62430]" />
-    Grid
-  </label>
-  {#if uiState.showGrid}
-    <div class="flex items-center gap-1 px-1.5 pb-0.5">
-      <input type="number" min="0.1" step="any" bind:value={uiState.gridSize}
-        class="w-12 rounded bg-[#333333] px-1 py-0.5 text-white text-[9px] border border-[#444444]" />
-      <span class="text-[9px] text-[#ffffff]">m</span>
-      <label class="flex items-center gap-0.5 ml-0.5 text-[9px] text-[#ffffff] cursor-pointer">
-        <input type="checkbox" bind:checked={uiState.snapToGrid} class="accent-[#D62430]" />
-        Snap
-      </label>
-    </div>
-  {/if}
-
-  <label class="flex items-center gap-1.5 px-1.5 py-0.5 text-[10px] text-[#ffffff] cursor-pointer">
-    <input type="checkbox" bind:checked={uiState.edgeNodeInsertionEnabled} class="accent-[#D62430]" />
-    Edge Node
-  </label>
+  <div class="flex items-center justify-between gap-1 px-1.5 py-0.5 text-[9px] text-[#ffffff]">
+    <label class="flex items-center gap-1 cursor-pointer">
+      <input type="checkbox" checked={uiState.showGrid}
+        onchange={(e) => {
+          const on = (e.currentTarget as HTMLInputElement).checked;
+          uiState.showGrid = on;
+          if (!on) uiState.snapToGrid = false;
+        }}
+        class="accent-[#D62430]" />
+      Grid
+    </label>
+    {#if uiState.showGrid}
+      <div class="flex items-center gap-0.5">
+        <input type="number" min="0.1" step="any" bind:value={uiState.gridSize}
+          class="w-9 rounded bg-[#333333] px-1 py-0.5 text-white text-[9px] border border-[#444444] text-center" />
+        <label class="flex items-center gap-0.5 cursor-pointer">
+          <input type="checkbox" bind:checked={uiState.snapToGrid} class="accent-[#D62430]" />
+          Snap
+        </label>
+      </div>
+    {/if}
+    <label class="flex items-center gap-0.5 cursor-pointer">
+      <input type="checkbox" bind:checked={uiState.edgeNodeInsertionEnabled} class="accent-[#D62430]" />
+      Edge
+    </label>
+  </div>
 
   <div class="border-t border-[#333333]"></div>
 
-  <button
-    class="flex items-center justify-center gap-1.5 rounded bg-[#333333] hover:bg-[#D62430] text-[#ffffff] mx-1.5 py-1.5 text-[10px] font-semibold transition-colors text-center cursor-pointer select-none"
-    onclick={() => { model.autoNumberElements(); uiState.setStatusMessage('Auto numbered elements'); }}
-    title="Sequentially renumber all columns, walls, beams, slabs, and drop panels (top-left to bottom-right order)"
-  >
-    <span class="text-xs">🔢</span> Auto Numbering
-  </button>
+  <div class="grid grid-cols-2 gap-1 mx-1.5">
+    <button
+      class="flex items-center justify-center gap-1 rounded bg-[#333333] hover:bg-[#D62430] text-[#ffffff] py-1 text-[9px] font-semibold transition-colors text-center cursor-pointer select-none"
+      onclick={() => { model.autoNumberElements(); uiState.setStatusMessage('Auto numbered elements'); }}
+      title="Auto number elements"
+    >
+      <span>🔢</span> Auto Num
+    </button>
 
-  <button
-    class="flex items-center justify-center gap-1.5 rounded mx-1.5 py-1.5 text-[10px] font-semibold transition-colors text-center cursor-pointer select-none {uiState.showLabels ? 'bg-[#D62430] text-[#ffffff]' : 'bg-[#333333] text-[#ffffff] hover:bg-[#D62430]'}"
-    onclick={() => { uiState.showLabels = !uiState.showLabels; uiState.setStatusMessage(uiState.showLabels ? 'Labels shown' : 'Labels hidden'); }}
-    title="Toggle element labels on/off in 2D and 3D views"
-  >
-    <span class="text-xs">🏷️</span> Labels {uiState.showLabels ? 'ON' : 'OFF'}
-  </button>
+    <button
+      class="flex items-center justify-center gap-1 rounded py-1 text-[9px] font-semibold transition-colors text-center cursor-pointer select-none {uiState.showLabels ? 'bg-[#D62430] text-[#ffffff]' : 'bg-[#333333] text-[#ffffff] hover:bg-[#D62430]'}"
+      onclick={() => { uiState.showLabels = !uiState.showLabels; uiState.setStatusMessage(uiState.showLabels ? 'Labels shown' : 'Labels hidden'); }}
+      title="Toggle element labels"
+    >
+      <span>🏷️</span> Labels {uiState.showLabels ? 'ON' : 'OFF'}
+    </button>
+  </div>
 
   <div class="border-t border-[#333333]"></div>
 
   <div class="text-[9px] font-bold text-[#ffffff] uppercase tracking-wider px-1.5">Visibility / Lock</div>
 
-  <div class="flex items-center gap-1 px-1.5 py-0">
-    <input type="checkbox" bind:checked={uiState.showSlabs} class="accent-[#D62430]" />
-    <span class="flex-1 text-[10px] text-[#ffffff]">Slabs</span>
-    <button
-      onclick={toggleSlabLock}
-      class="lock-btn text-[10px] p-0.5 rounded transition-all duration-200 cursor-pointer"
-      class:text-[#f59e0b]={allSlabsLocked}
-      class:text-[#666666]={!allSlabsLocked}
-      class:lock-animate={lockAnim === 'slabs'}
-      title={allSlabsLocked ? 'Unlock all slabs' : 'Lock all slabs'}
-    >{allSlabsLocked ? '🔒' : '🔓'}</button>
-  </div>
-  <div class="flex items-center gap-1 px-1.5 py-0">
-    <input type="checkbox" bind:checked={uiState.showColumns} class="accent-[#D62430]" />
-    <span class="flex-1 text-[10px] text-[#ffffff]">Columns</span>
-    <button
-      onclick={toggleColLock}
-      class="lock-btn text-[10px] p-0.5 rounded transition-all duration-200 cursor-pointer"
-      class:text-[#f59e0b]={allColsLocked}
-      class:text-[#666666]={!allColsLocked}
-      class:lock-animate={lockAnim === 'cols'}
-      title={allColsLocked ? 'Unlock all columns' : 'Lock all columns'}
-    >{allColsLocked ? '🔒' : '🔓'}</button>
-  </div>
-  <div class="flex items-center gap-1 px-1.5 py-0">
-    <input type="checkbox" bind:checked={uiState.showWalls} class="accent-[#D62430]" />
-    <span class="flex-1 text-[10px] text-[#ffffff]">Walls</span>
-    <button
-      onclick={toggleWallLock}
-      class="lock-btn text-[10px] p-0.5 rounded transition-all duration-200 cursor-pointer"
-      class:text-[#f59e0b]={allWallsLocked}
-      class:text-[#666666]={!allWallsLocked}
-      class:lock-animate={lockAnim === 'walls'}
-      title={allWallsLocked ? 'Unlock all walls' : 'Lock all walls'}
-    >{allWallsLocked ? '🔒' : '🔓'}</button>
-  </div>
-  <div class="flex items-center gap-1 px-1.5 py-0">
-    <input type="checkbox" bind:checked={uiState.showNonStructuralWalls} class="accent-[#D62430]" />
-    <span class="flex-1 text-[10px] text-[#ffffff]">Partitions</span>
-    <button
-      onclick={togglePartLock}
-      class="lock-btn text-[10px] p-0.5 rounded transition-all duration-200 cursor-pointer"
-      class:text-[#f59e0b]={allPartsLocked}
-      class:text-[#666666]={!allPartsLocked}
-      class:lock-animate={lockAnim === 'parts'}
-      title={allPartsLocked ? 'Unlock all partitions' : 'Lock all partitions'}
-    >{allPartsLocked ? '🔒' : '🔓'}</button>
-  </div>
-  <div class="flex items-center gap-1 px-1.5 py-0">
-    <input type="checkbox" bind:checked={uiState.showBeams} class="accent-[#D62430]" />
-    <span class="flex-1 text-[10px] text-[#ffffff]">Beams</span>
-    <button
-      onclick={toggleBeamLock}
-      class="lock-btn text-[10px] p-0.5 rounded transition-all duration-200 cursor-pointer"
-      class:text-[#f59e0b]={allBeamsLocked}
-      class:text-[#666666]={!allBeamsLocked}
-      class:lock-animate={lockAnim === 'beams'}
-      title={allBeamsLocked ? 'Unlock all beams' : 'Lock all beams'}
-    >{allBeamsLocked ? '🔒' : '🔓'}</button>
-  </div>
-  <div class="flex items-center gap-1 px-1.5 py-0">
-    <input type="checkbox" bind:checked={uiState.showDropPanels} class="accent-[#D62430]" />
-    <span class="flex-1 text-[10px] text-[#ffffff]">Drop Panels</span>
-    <button
-      onclick={toggleDpLock}
-      class="lock-btn text-[10px] p-0.5 rounded transition-all duration-200 cursor-pointer"
-      class:text-[#f59e0b]={allDpLocked}
-      class:text-[#666666]={!allDpLocked}
-      class:lock-animate={lockAnim === 'dp'}
-      title={allDpLocked ? 'Unlock all drop panels' : 'Lock all drop panels'}
-    >{allDpLocked ? '🔒' : '🔓'}</button>
+  <div class="grid grid-cols-2 gap-x-2 gap-y-0.5 px-1.5 text-[9px]">
+    <!-- Slabs -->
+    <div class="flex items-center gap-1">
+      <input type="checkbox" bind:checked={uiState.showSlabs} class="accent-[#D62430]" />
+      <span class="flex-1 text-[#ffffff] truncate">Slabs</span>
+      <button
+        onclick={toggleSlabLock}
+        class="lock-btn text-[9px] p-0.5 rounded transition-all duration-200 cursor-pointer"
+        class:text-[#f59e0b]={allSlabsLocked}
+        class:text-[#666666]={!allSlabsLocked}
+        class:lock-animate={lockAnim === 'slabs'}
+        title={allSlabsLocked ? 'Unlock all slabs' : 'Lock all slabs'}
+      >{allSlabsLocked ? '🔒' : '🔓'}</button>
+    </div>
+
+    <!-- Columns -->
+    <div class="flex items-center gap-1">
+      <input type="checkbox" bind:checked={uiState.showColumns} class="accent-[#D62430]" />
+      <span class="flex-1 text-[#ffffff] truncate">Cols</span>
+      <button
+        onclick={toggleColLock}
+        class="lock-btn text-[9px] p-0.5 rounded transition-all duration-200 cursor-pointer"
+        class:text-[#f59e0b]={allColsLocked}
+        class:text-[#666666]={!allColsLocked}
+        class:lock-animate={lockAnim === 'cols'}
+        title={allColsLocked ? 'Unlock all columns' : 'Lock all columns'}
+      >{allColsLocked ? '🔒' : '🔓'}</button>
+    </div>
+
+    <!-- Walls -->
+    <div class="flex items-center gap-1">
+      <input type="checkbox" bind:checked={uiState.showWalls} class="accent-[#D62430]" />
+      <span class="flex-1 text-[#ffffff] truncate">Walls</span>
+      <button
+        onclick={toggleWallLock}
+        class="lock-btn text-[9px] p-0.5 rounded transition-all duration-200 cursor-pointer"
+        class:text-[#f59e0b]={allWallsLocked}
+        class:text-[#666666]={!allWallsLocked}
+        class:lock-animate={lockAnim === 'walls'}
+        title={allWallsLocked ? 'Unlock all walls' : 'Lock all walls'}
+      >{allWallsLocked ? '🔒' : '🔓'}</button>
+    </div>
+
+    <!-- Partitions -->
+    <div class="flex items-center gap-1">
+      <input type="checkbox" bind:checked={uiState.showNonStructuralWalls} class="accent-[#D62430]" />
+      <span class="flex-1 text-[#ffffff] truncate">Parts</span>
+      <button
+        onclick={togglePartLock}
+        class="lock-btn text-[9px] p-0.5 rounded transition-all duration-200 cursor-pointer"
+        class:text-[#f59e0b]={allPartsLocked}
+        class:text-[#666666]={!allPartsLocked}
+        class:lock-animate={lockAnim === 'parts'}
+        title={allPartsLocked ? 'Unlock all partitions' : 'Lock all partitions'}
+      >{allPartsLocked ? '🔒' : '🔓'}</button>
+    </div>
+
+    <!-- Beams -->
+    <div class="flex items-center gap-1">
+      <input type="checkbox" bind:checked={uiState.showBeams} class="accent-[#D62430]" />
+      <span class="flex-1 text-[#ffffff] truncate">Beams</span>
+      <button
+        onclick={toggleBeamLock}
+        class="lock-btn text-[9px] p-0.5 rounded transition-all duration-200 cursor-pointer"
+        class:text-[#f59e0b]={allBeamsLocked}
+        class:text-[#666666]={!allBeamsLocked}
+        class:lock-animate={lockAnim === 'beams'}
+        title={allBeamsLocked ? 'Unlock all beams' : 'Lock all beams'}
+      >{allBeamsLocked ? '🔒' : '🔓'}</button>
+    </div>
+
+    <!-- Drop Panels -->
+    <div class="flex items-center gap-1">
+      <input type="checkbox" bind:checked={uiState.showDropPanels} class="accent-[#D62430]" />
+      <span class="flex-1 text-[#ffffff] truncate">Drops</span>
+      <button
+        onclick={toggleDpLock}
+        class="lock-btn text-[9px] p-0.5 rounded transition-all duration-200 cursor-pointer"
+        class:text-[#f59e0b]={allDpLocked}
+        class:text-[#666666]={!allDpLocked}
+        class:lock-animate={lockAnim === 'dp'}
+        title={allDpLocked ? 'Unlock all drop panels' : 'Lock all drop panels'}
+      >{allDpLocked ? '🔒' : '🔓'}</button>
+    </div>
   </div>
 
   {#if model.hiddenElementIds.length > 0}

@@ -1,4 +1,35 @@
-let API_BASE = (typeof window !== 'undefined' && (window as any).__RESLO_API__) || (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) || 'http://localhost:8000';
+import { generateSlabMesh } from './meshGenerator';
+import { pointInPolygon } from './mathEngine';
+
+function getInitialApiBase(): string {
+  if (typeof window !== 'undefined') {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const apiParam = params.get('api');
+      if (apiParam) return apiParam.replace(/\/$/, '');
+      if ((window as any).__RESLO_API__) return (window as any).__RESLO_API__;
+    } catch (_) {}
+  }
+  if (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) {
+    return import.meta.env.VITE_API_URL.replace(/\/$/, '');
+  }
+  return 'http://127.0.0.1:8000';
+}
+
+let API_BASE = getInitialApiBase();
+
+function tsMeshToPyMesh(tsMesh: import('./types').FEMMesh): PyMesh {
+  return {
+    nodeCount: tsMesh.nodes.length,
+    elementCount: tsMesh.elements.length,
+    nodes: tsMesh.nodes.map(n => ({ id: n.id, x: n.x, y: n.y })),
+    elements: tsMesh.elements.map(e => ({ id: e.id, nodeIds: e.nodeIds, area: e.area })),
+    minAngle: 30,
+    maxAspectRatio: 1.5,
+    meshQuality: 'good',
+    unconnectedNodeIds: tsMesh.unconnectedNodeIds
+  };
+}
 
 export function setApiBase(url: string) { API_BASE = url; }
 export function getApiBase() { return API_BASE; }
@@ -8,7 +39,41 @@ function isNgrokUrl(url: string) { return url.includes('ngrok'); }
 async function fetchApi(url: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers);
   if (isNgrokUrl(API_BASE)) headers.set('ngrok-skip-browser-warning', 'true');
-  return fetch(url, { ...init, headers });
+
+  let lastErr: any = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), 25000);
+      const res = await fetch(url, { ...init, headers, signal: controller.signal });
+      clearTimeout(id);
+      if (res.ok) return res;
+      if (res.status >= 500 && attempt < 2) {
+        await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+        continue;
+      }
+      return res;
+    } catch (err: any) {
+      lastErr = err;
+      if (typeof window !== 'undefined' && (url.includes('.trycloudflare.com') || url.includes('.ngrok')) && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')) {
+        const localUrl = url.replace(/https:\/\/[^/]+/, 'http://localhost:8000');
+        try {
+          const resLocal = await fetch(localUrl, { ...init, headers });
+          if (resLocal.ok) return resLocal;
+        } catch { /* ignore fallback error */ }
+      }
+      if (attempt < 2) {
+        await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+      }
+    }
+  }
+  if (lastErr?.name === 'TypeError' || lastErr?.message?.includes('fetch') || lastErr?.name === 'AbortError') {
+    throw new PyApiError(
+      `Unable to reach FEA Backend API at ${API_BASE}. ` +
+      `Please ensure the backend server is running and accessible.`
+    );
+  }
+  throw lastErr;
 }
 
 interface PyNode { id: number; x: number; y: number }
@@ -16,12 +81,19 @@ interface PyElement { id: number; nodeIds: number[]; area: number }
 interface PyMesh { nodeCount: number; elementCount: number; nodes: PyNode[]; elements: PyElement[]; minAngle: number; maxAspectRatio: number; meshQuality: string; unconnectedNodeIds?: number[] }
 
 interface PyNodeDeflection { nodeId: number; wz: number; rx: number; ry: number }
-interface PyElementMoment { elementId: number; mx: number; my: number; mxy: number; m1: number; m2: number; angle: number }
+interface PyElementMoment {
+  elementId: number; mx: number; my: number; mxy: number; m1: number; m2: number; angle: number;
+  mxd_pos?: number; myd_pos?: number; mxd_neg?: number; myd_neg?: number;
+  spr_mx?: number; spr_my?: number; spr_mxy?: number;
+  ast_x_bot?: number; ast_y_bot?: number; ast_x_top?: number; ast_y_top?: number;
+}
 interface PyElementStress { elementId: number; s1: number; s2: number; vm: number; mx: number; my: number; mxy: number }
 
 interface PyPunchingStress {
   nodeId: number; force_kN: number; stress_MPa: number;
   capacity_MPa: number; ratio: number; status: string;
+  gamma_v?: number; Jc?: number; M_unbalanced?: number;
+  v_u_direct?: number; v_u_eccentric?: number;
 }
 
 interface PyElementShear {
@@ -41,12 +113,26 @@ interface PyAnalysisResult {
   minVx?: number; maxVx?: number; minVy?: number; maxVy?: number;
   minNx?: number; maxNx?: number; minNy?: number; maxNy?: number; minNxy?: number; maxNxy?: number;
   crX?: number; crY?: number;
+  zz_error_eta?: number; adaptive_iterations?: number; cracked_deflection_max?: number;
   error?: string;
 }
 
 export async function healthCheck(): Promise<boolean> {
-  try { const r = await fetchApi(`${API_BASE}/api/health`); return r.ok; }
-  catch { return false; }
+  try {
+    const r = await fetchApi(`${API_BASE}/api/health`);
+    if (r.ok) return true;
+  } catch (_) {}
+
+  if (typeof window !== 'undefined' && API_BASE !== 'http://127.0.0.1:8000' && API_BASE !== 'http://localhost:8000') {
+    try {
+      const rLocal = await fetch('http://127.0.0.1:8000/api/health');
+      if (rLocal.ok) {
+        API_BASE = 'http://127.0.0.1:8000';
+        return true;
+      }
+    } catch (_) {}
+  }
+  return false;
 }
 
 export class PyApiError extends Error {
@@ -76,8 +162,8 @@ function computePartitionWallSegments(
 }
 
 export async function meshAndAnalyze(
-  slabPolygon: { vertices: { x: number; y: number }[]; thickness: number; uniformLoad: number; partitionLoad: number; elasticModulus: number },
-  walls: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; thickness?: number; height?: number; boundaryCondition?: string }[],
+  slabPolygon: { vertices: { x: number; y: number }[]; thickness: number; uniformLoad: number; partitionLoad: number; elasticModulus: number; crackingModifier?: number },
+  walls: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; elasticModulus?: number; thickness?: number; height?: number; boundaryCondition?: string }[],
   columns: { position: { x: number; y: number }; width: number; depth: number; height: number; elasticModulus: number; shape?: 'rectangular' | 'circular'; diameter?: number; boundaryCondition?: string }[],
   meshSize: number, poissonRatio: number,
   beams?: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; width: number; depth: number; elasticModulus: number }[],
@@ -88,33 +174,53 @@ export async function meshAndAnalyze(
   const geometry: any = {
     vertices: slabPolygon.vertices,
     walls: walls.map(w => ({ startPoint: w.startPoint, endPoint: w.endPoint })),
-    beams: (beams || []).map(b => ({ startPoint: b.startPoint, endPoint: b.endPoint }))
+    beams: (beams || []).map(b => ({ startPoint: b.startPoint, endPoint: b.endPoint })),
+    columns: columns.map(c => ({ position: c.position, width: c.width || 0.3, depth: c.depth || 0.3, height: c.height || 3.0 }))
   };
 
-  const meshReq = { geometry, meshSize };
-  const mr = await fetchApi(`${API_BASE}/api/mesh`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(meshReq)
-  });
-  if (!mr.ok) throw new PyApiError(`Mesh API ${mr.status}`);
-  const meshData = await mr.json();
-  if (!meshData.success || !meshData.mesh) throw new PyApiError(`Mesh failed: ${meshData.error}`);
+  let mesh: PyMesh | null = null;
+  try {
+    const meshReq = { geometry, meshSize };
+    const mr = await fetchApi(`${API_BASE}/api/mesh`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(meshReq)
+    });
+    if (mr.ok) {
+      const meshData = await mr.json();
+      if (meshData.success && meshData.mesh && meshData.mesh.elementCount > 0) {
+        mesh = meshData.mesh;
+      }
+    }
+  } catch (err) {
+    console.warn(`[PyAPI] Backend mesh request failed, using TS mesher fallback:`, err);
+  }
 
-  const mesh: PyMesh = meshData.mesh;
-  const tol = 0.05;
+  if (!mesh) {
+    const tsMesh = generateSlabMesh(slabPolygon as any, meshSize, false);
+    mesh = tsMeshToPyMesh(tsMesh);
+  }
   const wallNodeIds: number[] = [];
   const wallNodesCount = new Array(walls.length).fill(0);
+  
+  // Pre-calculate wall segment vectors to avoid redundant math in inner loops
+  const wallPrecalc = walls.map(w => {
+    const dx = w.endPoint.x - w.startPoint.x;
+    const dy = w.endPoint.y - w.startPoint.y;
+    const len2 = dx * dx + dy * dy;
+    return { w, dx, dy, len2 };
+  });
+
   for (const n of mesh.nodes) {
-    for (let wi = 0; wi < walls.length; wi++) {
-      const w = walls[wi];
-      const dx = w.endPoint.x - w.startPoint.x, dy = w.endPoint.y - w.startPoint.y;
-      const len2 = dx * dx + dy * dy;
+    for (let wi = 0; wi < wallPrecalc.length; wi++) {
+      const { w, dx, dy, len2 } = wallPrecalc[wi];
       if (len2 < 1e-12) continue;
       const t = ((n.x - w.startPoint.x) * dx + (n.y - w.startPoint.y) * dy) / len2;
       if (t >= -0.01 && t <= 1.01) {
-        const px = w.startPoint.x + Math.max(0, Math.min(1, t)) * dx;
-        const py = w.startPoint.y + Math.max(0, Math.min(1, t)) * dy;
-        if (Math.hypot(n.x - px, n.y - py) < tol) {
+        const clampT = t < 0 ? 0 : (t > 1 ? 1 : t);
+        const px = w.startPoint.x + clampT * dx;
+        const py = w.startPoint.y + clampT * dy;
+        const wallTolSq = Math.max(0.0625, (meshSize * 0.5) * (meshSize * 0.5)); // 0.25m tolerance squared for robust boundary capture
+        if (dist2 <= wallTolSq) {
           wallNodeIds.push(n.id);
           wallNodesCount[wi]++;
         }
@@ -130,43 +236,50 @@ export async function meshAndAnalyze(
   const colShapes: string[] = [];
   const colDiameters: number[] = [];
   const colGrades: string[] = [];
-  const COL_SNAP_TOL = 0.5;
+  const COL_SNAP_TOL = Math.max(0.85, meshSize * 1.25);
+  const COL_SNAP_TOL_SQ = COL_SNAP_TOL * COL_SNAP_TOL;
   const skippedColumns: number[] = [];
   const skippedColumnIds: string[] = [];
+
   for (let ci = 0; ci < columns.length; ci++) {
     const c = columns[ci] as any;
-    let best = mesh.nodes[0], bestD = Infinity;
+    const isInside = pointInPolygon(c.position, slabPolygon.vertices);
+    let best = mesh.nodes[0], bestD2 = Infinity;
     for (const n of mesh.nodes) {
-      const d = Math.hypot(n.x - c.position.x, n.y - c.position.y);
-      if (d < bestD) { bestD = d; best = n; }
+      const d2 = (n.x - c.position.x) * (n.x - c.position.x) + (n.y - c.position.y) * (n.y - c.position.y);
+      if (d2 < bestD2) { bestD2 = d2; best = n; }
     }
-    if (bestD > COL_SNAP_TOL) {
+    // Allow snapping if node is within snap tolerance even if pointInPolygon boundary check returns false
+    if (!isInside && bestD2 > COL_SNAP_TOL_SQ) {
       skippedColumns.push(ci + 1);
       skippedColumnIds.push(c.id || `Column ${ci + 1}`);
       continue;
     }
-    colNodeIds.push(best.id);
-    colHeights.push(c.height || 3);
-    const w = c.width || 0.3;
-    const dp = c.depth || 0.3;
-    colWidths.push(w);
-    colDepths.push(dp);
-    const Ix = dp * w**3 / 12;
-    const Iy = w * dp**3 / 12;
-    const I = (Ix + Iy) / 2;
-    const E_col = (c.elasticModulus || 25e6) * 1000; // kPa → Pa
-    const H = c.height || 3.0;
-    colStiffnesses.push(4 * E_col * I / H);
-    colShapes.push(c.shape || 'rectangular');
-    colDiameters.push((c.diameter || 500) / 1000);
-    colGrades.push(c.concreteGrade || 'M25');
+
+    if (best) {
+      colNodeIds.push(best.id);
+      colHeights.push(c.height || 3);
+      const w = c.width || 0.3;
+      const dp = c.depth || 0.3;
+      colWidths.push(w);
+      colDepths.push(dp);
+      const Ix = dp * w**3 / 12;
+      const Iy = w * dp**3 / 12;
+      const I = (Ix + Iy) / 2;
+      const E_col = (c.elasticModulus || 25e6) * 1000; // kPa → Pa
+      const H = c.height || 3.0;
+      colStiffnesses.push(4 * E_col * I / H);
+      colShapes.push(c.shape || 'rectangular');
+      colDiameters.push((c.diameter || 500) / 1000);
+      colGrades.push(c.concreteGrade || 'M25');
+    }
   }
 
   const concreteDensity = 25; // kN/m³
   const slabThickness = slabPolygon.thickness || 0.2;
   const selfWeight = concreteDensity * slabThickness;
 
-  // Beam data: snap endpoints to mesh nodes
+  // Beam data: snap all intermediate mesh nodes along beam line segment
   const beamNodeIdA: number[] = [];
   const beamNodeIdB: number[] = [];
   const beamWidths: number[] = [];
@@ -174,17 +287,40 @@ export async function meshAndAnalyze(
   const beamElasticModuli: number[] = [];
   if (beams) {
     for (const b of beams) {
-      let bestA = mesh.nodes[0], bestDA = Infinity;
-      let bestB = mesh.nodes[0], bestDB = Infinity;
+      const sx = b.startPoint.x, sy = b.startPoint.y;
+      const ex = b.endPoint.x, ey = b.endPoint.y;
+      const dx = ex - sx, dy = ey - sy;
+      const L2 = dx * dx + dy * dy;
+      if (L2 < 1e-12) continue;
+
+      const beamTol = Math.max(0.15, meshSize * 0.5);
+      const nearNodes: { id: number; t: number }[] = [];
+
       for (const n of mesh.nodes) {
-        const dA = Math.hypot(n.x - b.startPoint.x, n.y - b.startPoint.y);
-        const dB = Math.hypot(n.x - b.endPoint.x, n.y - b.endPoint.y);
-        if (dA < bestDA) { bestDA = dA; bestA = n; }
-        if (dB < bestDB) { bestDB = dB; bestB = n; }
+        const t = ((n.x - sx) * dx + (n.y - sy) * dy) / L2;
+        if (t >= -0.01 && t <= 1.01) {
+          const clampT = Math.max(0, Math.min(1, t));
+          const px = sx + clampT * dx;
+          const py = sy + clampT * dy;
+          if (Math.hypot(n.x - px, n.y - py) <= beamTol) {
+            nearNodes.push({ id: n.id, t: clampT });
+          }
+        }
       }
-      if (bestA.id !== bestB.id) {
-        beamNodeIdA.push(bestA.id);
-        beamNodeIdB.push(bestB.id);
+
+      nearNodes.sort((a, b) => a.t - b.t);
+
+      // Filter out duplicate or extremely close nodes
+      const filtered: typeof nearNodes = [];
+      for (const item of nearNodes) {
+        if (!filtered.length || Math.abs(item.t - filtered[filtered.length - 1].t) * Math.sqrt(L2) > 0.05) {
+          filtered.push(item);
+        }
+      }
+
+      for (let i = 0; i < filtered.length - 1; i++) {
+        beamNodeIdA.push(filtered[i].id);
+        beamNodeIdB.push(filtered[i + 1].id);
         beamWidths.push(b.width || 0.3);
         beamDepths.push(b.depth || 0.45);
         beamElasticModuli.push((b.elasticModulus || 25e6) * 1000);
@@ -192,15 +328,17 @@ export async function meshAndAnalyze(
     }
   }
 
+  const slabE = (slabPolygon.elasticModulus ? slabPolygon.elasticModulus * 1000 : 25e9) * (slabPolygon.crackingModifier ?? 1.0);
   const arBody: any = {
     mesh, thickness: slabThickness,
-    elasticModulus: (slabPolygon.elasticModulus ? slabPolygon.elasticModulus * 1000 : 25e9) * (slabPolygon.crackingModifier ?? 0.25), poissonRatio,
+    elasticModulus: slabE, poissonRatio,
     uniformLoad: (slabPolygon.uniformLoad || 5.0) + (slabPolygon.partitionLoad ?? 0), selfWeight,
     wallNodeIds: [...new Set(wallNodeIds)],
     wallStartPoints: walls.map(w => w.startPoint),
     wallEndPoints: walls.map(w => w.endPoint),
     wallThicknesses: walls.map(w => w.thickness ?? 0.25),
     wallHeights: walls.map(w => w.height ?? 3.0),
+    wallElasticModuli: walls.map(w => w.elasticModulus ?? slabE),
     columnNodeIds: colNodeIds,
     columnHeights: colHeights, columnStiffnesses: colStiffnesses,
     columnWidths: colWidths, columnDepths: colDepths,
@@ -260,28 +398,26 @@ export async function meshAndAnalyze(
 }
 
 function toFrontendResult(slabId: string, mesh: any, result: any): any {
-  const nodeDeflections = result.nodeDeflections.map((d: any) => ({ nodeId: d.nodeId, wz: d.wz }));
-  const momentMx = result.elementMoments.map((m: any) => ({ elementId: m.elementId, value: m.mx }));
-  const momentMy = result.elementMoments.map((m: any) => ({ elementId: m.elementId, value: m.my }));
-  const momentMxy = result.elementMoments.map((m: any) => ({ elementId: m.elementId, value: m.mxy }));
-  const stresses = (result.elementStresses || []).map((s: any) => ({
-    elementId: s.elementId, s1: s.s1, s2: s.s2, angle: s.angle, vm: s.vm
+  // Convert deflection wz from meters to millimeters (mm)
+  const nodeDeflections = result.nodeDeflections.map((d: any) => ({
+    nodeId: d.nodeId, wz: d.wz * 1000,
+    rx: d.rx ?? 0, ry: d.ry ?? 0
   }));
-  const shears = (result.elementShears || []).map((s: any) => ({
-    elementId: s.elementId, vx: s.vx, vy: s.vy, v1: s.v1, angle: s.angle
-  }));
-  const membraneForces = (result.elementMembraneForces || []).map((m: any) => ({
-    elementId: m.elementId, nx: m.nx, ny: m.ny, nxy: m.nxy, n1: m.n1, n2: m.n2, angle: m.angle
-  }));
-  const columnPunching = (result.columnPunching || []).map((p: any) => ({
-    nodeId: p.nodeId, force_kN: p.force_kN, stress_MPa: p.stress_MPa,
-    capacity_MPa: p.capacity_MPa, ratio: p.ratio, status: p.status
-  }));
-  const vxVals = shears.map((s: any) => s.vx);
-  const vyVals = shears.map((s: any) => s.vy);
-  const nxVals = membraneForces.map((m: any) => m.nx);
-  const nyVals = membraneForces.map((m: any) => m.ny);
-  const nxyVals = membraneForces.map((m: any) => m.nxy);
+  // Moments, stresses, shears, membrane forces, and punching are stripped from solver output.
+  // Provide empty arrays so the SlabFEMResult shape is satisfied.
+  const momentMx: { elementId: number; value: number }[] = [];
+  const momentMy: { elementId: number; value: number }[] = [];
+  const momentMxy: { elementId: number; value: number }[] = [];
+  const stresses: any[] = [];
+  const shears: any[] = [];
+  const membraneForces: any[] = [];
+  const columnPunching: any[] = [];
+
+  // Prefer server-provided global min/max (correct for unified multi-slab groups).
+  // Fall back to local recalculation only when server doesn't supply the value. (all in mm)
+  const localMinWz = nodeDeflections.length ? Math.min(...nodeDeflections.map((d: any) => d.wz)) : 0;
+  const localMaxWz = nodeDeflections.length ? Math.max(...nodeDeflections.map((d: any) => Math.abs(d.wz))) : 0;
+
   return {
     slabId,
     mesh: {
@@ -291,29 +427,31 @@ function toFrontendResult(slabId: string, mesh: any, result: any): any {
       unconnectedNodeIds: mesh.unconnectedNodeIds || [],
     },
     nodeDeflections, momentMx, momentMy, momentMxy, stresses, shears, membraneForces, columnPunching,
-    minWz: nodeDeflections.length ? Math.min(...nodeDeflections.map((d: any) => d.wz)) : 0,
-    maxWz: nodeDeflections.length ? Math.max(...nodeDeflections.map((d: any) => d.wz)) : 0,
-    minMx: result.minMx ?? Math.min(...momentMx.map((m: any) => m.value)),
-    maxMx: result.maxMx ?? Math.max(...momentMx.map((m: any) => m.value)),
-    minMy: result.minMy ?? Math.min(...momentMy.map((m: any) => m.value)),
-    maxMy: result.maxMy ?? Math.max(...momentMy.map((m: any) => m.value)),
-    minVx: result.minVx ?? (vxVals.length ? Math.min(...vxVals) : 0),
-    maxVx: result.maxVx ?? (vxVals.length ? Math.max(...vxVals) : 0),
-    minVy: result.minVy ?? (vyVals.length ? Math.min(...vyVals) : 0),
-    maxVy: result.maxVy ?? (vyVals.length ? Math.max(...vyVals) : 0),
-    minNx: result.minNx ?? (nxVals.length ? Math.min(...nxVals) : 0),
-    maxNx: result.maxNx ?? (nxVals.length ? Math.max(...nxVals) : 0),
-    minNy: result.minNy ?? (nyVals.length ? Math.min(...nyVals) : 0),
-    maxNy: result.maxNy ?? (nyVals.length ? Math.max(...nyVals) : 0),
-    minNxy: result.minNxy ?? (nxyVals.length ? Math.min(...nxyVals) : 0),
-    maxNxy: result.maxNxy ?? (nxyVals.length ? Math.max(...nxyVals) : 0),
+    // Use server min/max (global for unified slabs) converted to mm when provided; fall back to local (mm)
+    minWz: result.minWz !== undefined ? result.minWz * 1000 : localMinWz,
+    maxWz: result.maxWz !== undefined ? result.maxWz * 1000 : localMaxWz,
+    minMx: 0,
+    maxMx: 0,
+    minMy: 0,
+    maxMy: 0,
+    minVx: 0,
+    maxVx: 0,
+    minVy: 0,
+    maxVy: 0,
+    minNx: 0,
+    maxNx: 0,
+    minNy: 0,
+    maxNy: 0,
+    minNxy: 0,
+    maxNxy: 0,
     crX: result.crX,
     crY: result.crY,
   };
 }
 
+
 export async function analyzeSlabViaApi(
-  slab: { id?: string; vertices: { x: number; y: number }[]; thickness: number; uniformLoad: number; partitionLoad: number; elasticModulus: number },
+  slab: { id?: string; vertices: { x: number; y: number }[]; thickness: number; uniformLoad: number; partitionLoad: number; elasticModulus: number; crackingModifier?: number },
   columns: { position: { x: number; y: number }; width: number; depth: number; height: number; elasticModulus: number; shape?: 'rectangular' | 'circular'; diameter?: number; boundaryCondition?: string }[],
   walls: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; elasticModulus: number; thickness?: number; height?: number; boundaryCondition?: string }[],
   polylineWalls: { vertices: { x: number; y: number }[]; thickness: number; height: number; elasticModulus: number; shearModulus?: number; concreteDensity?: number; boundaryCondition?: string }[],
@@ -373,32 +511,97 @@ export async function meshAndAnalyzeAllSlabs(
 ): Promise<{ results: any[]; warnings: string[]; disconnectedIds: string[] }> {
   if (slabs.length === 0) return { results: [], warnings: [], disconnectedIds: [] };
 
-  // 1. Mesh all slabs in parallel via the backend mesh API (prevents network blocking lag)
+  // Attempt single-payload batch backend execution first (< 40ms single round-trip)
+  try {
+    const multiPayload = {
+      slabs: slabs.map(slab => ({
+        slabId: slab.id || 'slab_0',
+        geometry: {
+          vertices: slab.vertices,
+          openings: (slab.openings || []).map((op: any) => ({ vertices: op.vertices })),
+          walls: walls.map(w => ({ startPoint: w.startPoint, endPoint: w.endPoint })),
+          beams: (beams || []).map(b => ({ startPoint: b.startPoint, endPoint: b.endPoint })),
+          columns: columns.map(c => ({ position: c.position, width: c.width || 0.3, depth: c.depth || 0.3, height: c.height || 3.0 }))
+        },
+        meshSize,
+        thickness: slab.thickness || 0.2,
+        elasticModulus: (slab.elasticModulus ? slab.elasticModulus * 1000 : 25e9) * (slab.crackingModifier ?? 1.0),
+        poissonRatio,
+        uniformLoad: (slab.uniformLoad || 5.0) + (slab.partitionLoad ?? 0),
+        selfWeight: 25 * (slab.thickness || 0.2)
+      })),
+      walls: walls.map(w => ({ startPoint: w.startPoint, endPoint: w.endPoint, thickness: w.thickness ?? 0.25, height: w.height ?? 3.0, elasticModulus: w.elasticModulus || 25e9 })),
+      columns: columns.map(c => ({ position: c.position, width: c.width || 0.3, depth: c.depth || 0.3, height: c.height || 3.0, elasticModulus: (c.elasticModulus || 25e6) * 1000, shape: c.shape || 'rectangular', diameter: (c.diameter || 500) / 1000, concreteGrade: c.concreteGrade || 'M25' })),
+      beams: (beams || []).map(b => ({ startPoint: b.startPoint, endPoint: b.endPoint, width: b.width || 0.3, depth: b.depth || 0.45, elasticModulus: (b.elasticModulus || 25e6) * 1000 })),
+      dropPanels: dropPanels.map(dp => ({ vertices: dp.vertices, drop: dp.drop })),
+      partitionWallSegments: computePartitionWallSegments(nonStructuralWalls, polylineNonStructuralWalls),
+      meshSize
+    };
+
+    const mr = await fetchApi(`${API_BASE}/api/analyze_multi`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(multiPayload)
+    });
+
+    if (mr.ok) {
+      const data = await mr.json();
+      if (data.success && data.results && data.results.length > 0) {
+        const results = data.results.map((r: any) => toFrontendResult(r.slabId, r.mesh, r.result));
+        return { results, warnings: data.warnings || [], disconnectedIds: data.disconnectedIds || [] };
+      }
+    }
+  } catch (err) {
+    console.warn('[PyAPI] Single-payload multi-slab API attempt failed, falling back to sequential batching:', err);
+  }
+
+  // 1. Mesh all slabs sequentially (Fallback)
   interface SlabMeshData {
     slab: any;
     mesh: PyMesh;
   }
-  const meshPromises = slabs.map(async (slab) => {
+  const slabMeshes: SlabMeshData[] = [];
+  for (const slab of slabs) {
     const geometry = {
       vertices: slab.vertices,
       walls: walls.map(w => ({ startPoint: w.startPoint, endPoint: w.endPoint })),
-      beams: beams.map(b => ({ startPoint: b.startPoint, endPoint: b.endPoint }))
+      beams: beams.map(b => ({ startPoint: b.startPoint, endPoint: b.endPoint })),
+      columns: columns.map(c => ({ position: c.position, width: c.width || 0.3, depth: c.depth || 0.3, height: c.height || 3.0 }))
     };
     const meshReq = { geometry, meshSize };
-    const mr = await fetchApi(`${API_BASE}/api/mesh`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(meshReq)
-    });
-    if (!mr.ok) throw new PyApiError(`Mesh API failed for slab ${slab.label || slab.id}: ${mr.status}`);
-    const meshData = await mr.json();
-    if (meshData.success && meshData.mesh) {
-      return { slab, mesh: meshData.mesh };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000); // 25s timeout for Gmsh Delaunay triangular meshing
+    let meshAcquired = false;
+    try {
+      const mr = await fetchApi(`${API_BASE}/api/mesh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(meshReq),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (mr.ok) {
+        const meshData = await mr.json();
+        if (meshData.success && meshData.mesh && meshData.mesh.elementCount > 0) {
+          slabMeshes.push({ slab, mesh: meshData.mesh });
+          meshAcquired = true;
+        }
+      }
+    } catch (e: any) {
+      clearTimeout(timeout);
+      console.warn(`[PyAPI] Backend meshing timed out/failed for slab ${slab.label || slab.id}, falling back to TS mesher:`, e);
     }
-    throw new PyApiError(`Mesh failed for slab ${slab.label || slab.id}: ${meshData.error}`);
-  });
 
-  const slabMeshes: SlabMeshData[] = await Promise.all(meshPromises);
+    if (!meshAcquired) {
+      // Instant local fallback using TS Delaunay/Ear-Clipping mesher
+      try {
+        const fallbackMesh = generateSlabMesh(slab, meshSize, false);
+        slabMeshes.push({ slab, mesh: tsMeshToPyMesh(fallbackMesh) });
+      } catch (fbErr) {
+        console.error(`[PyAPI] Local mesh fallback failed for slab ${slab.label || slab.id}:`, fbErr);
+      }
+    }
+  }
 
   if (slabMeshes.length === 0) {
     return { results: [], warnings: ['No slabs could be meshed.'], disconnectedIds: [] };
@@ -421,39 +624,127 @@ export async function meshAndAnalyzeAllSlabs(
 
   allNodes.sort((a, b) => a.x - b.x);
 
-  const mergeTol = meshSize * 0.1;
-  const uniqueNodes: PyNode[] = [];
+  const mergeTol = Math.max(0.12, meshSize * 0.35);
+  interface UniquePyNodeRef extends PyNode {
+    slabId: string;
+    localId: number;
+  }
+  const uniqueNodes: UniquePyNodeRef[] = [];
 
-  for (const node of allNodes) {
-    let foundIdx = -1;
-    for (let u = uniqueNodes.length - 1; u >= 0; u--) {
-      const un = uniqueNodes[u];
-      if (node.x - un.x > mergeTol) break;
-      if (Math.abs(node.y - un.y) < mergeTol) {
-        foundIdx = u;
-        break;
+  function pointToSegmentDist(p: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }): number {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    if (len2 < 1e-12) return Math.hypot(p.x - a.x, p.y - a.y);
+    const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2));
+    const projX = a.x + t * dx;
+    const projY = a.y + t * dy;
+    return Math.hypot(p.x - projX, p.y - projY);
+  }
+
+  // Identify nodes that fall on a discontinuous edge for each slab
+  const discontNodeKeys = new Set<string>();
+  const tolDiscont = meshSize * 0.35;
+  for (const sm of slabMeshes) {
+    if (sm.slab.discontinuousEdges && sm.slab.discontinuousEdges.length > 0) {
+      for (const n of sm.mesh.nodes) {
+        for (const seg of sm.slab.discontinuousEdges) {
+          if (pointToSegmentDist({ x: n.x, y: n.y }, seg.startPoint, seg.endPoint) < tolDiscont) {
+            discontNodeKeys.add(sm.slab.id + '_' + n.id);
+            break;
+          }
+        }
       }
-    }
-    if (foundIdx >= 0) {
-      node.globalIdx = foundIdx;
-    } else {
-      const newIdx = uniqueNodes.length;
-      uniqueNodes.push({ id: newIdx + 1, x: node.x, y: node.y }); // 1-indexed for backend
-      node.globalIdx = newIdx;
     }
   }
 
-  // Re-map slab elements to the global node IDs
+  const equalDofConstraints: { nodeIdA: number; nodeIdB: number; dofs: number[] }[] = [];
+
+  for (const node of allNodes) {
+    const isNodeDiscont = discontNodeKeys.has(node.slabId + '_' + node.localId);
+    let foundIdx = -1;
+
+    if (!isNodeDiscont) {
+      for (let u = uniqueNodes.length - 1; u >= 0; u--) {
+        const un = uniqueNodes[u];
+        const isUnDiscont = discontNodeKeys.has(un.slabId + '_' + un.localId);
+        // Merge coincident boundary nodes across adjacent slabs into a single node
+        if (!isUnDiscont && Math.hypot(node.x - un.x, node.y - un.y) < mergeTol) {
+          foundIdx = u;
+          break;
+        }
+      }
+    }
+
+    if (foundIdx >= 0) {
+      node.globalIdx = foundIdx;
+    } else {
+      // Find coincident node to link via equalDOF constraint if one is on a discontinuous edge
+      let pairIdx = -1;
+      for (let u = uniqueNodes.length - 1; u >= 0; u--) {
+        const un = uniqueNodes[u];
+        if (Math.hypot(node.x - un.x, node.y - un.y) < mergeTol) {
+          pairIdx = u;
+          break;
+        }
+      }
+
+      const newIdx = uniqueNodes.length;
+      uniqueNodes.push({ id: newIdx + 1, x: node.x, y: node.y, slabId: node.slabId, localId: node.localId }); // 1-indexed for backend
+      node.globalIdx = newIdx;
+
+      if (pairIdx >= 0 && uniqueNodes[pairIdx].id !== newIdx + 1) {
+        // Constrain translations (Ux, Uy, Uz) and bending rotations (Rx, Ry, Rz) for continuous multi-slab joint (C0 & C1)
+        const dofsToCouple = isNodeDiscont ? [1, 2, 3, 6] : [1, 2, 3, 4, 5, 6];
+        equalDofConstraints.push({
+          nodeIdA: uniqueNodes[pairIdx].id,
+          nodeIdB: newIdx + 1,
+          dofs: dofsToCouple
+        });
+      }
+
+
+    }
+  }
+
+
+  // Non-conformal multi-slab boundary segment coupling (C0 & C1 continuity for non-coincident boundary nodes)
+  for (let i = 0; i < uniqueNodes.length; i++) {
+    const nA = uniqueNodes[i];
+    for (let j = i + 1; j < uniqueNodes.length; j++) {
+      const nB = uniqueNodes[j];
+      if (nA.slabId !== nB.slabId) {
+        const d = Math.hypot(nA.x - nB.x, nA.y - nB.y);
+        if (d <= mergeTol && nA.id !== nB.id) {
+          const discontA = discontNodeKeys.has(nA.slabId + '_' + nA.localId);
+          const discontB = discontNodeKeys.has(nB.slabId + '_' + nB.localId);
+          const isHinge = discontA || discontB;
+          const dofsToCouple = isHinge ? [1, 2, 3, 6] : [1, 2, 3, 4, 5, 6];
+          equalDofConstraints.push({
+            nodeIdA: nA.id,
+            nodeIdB: nB.id,
+            dofs: dofsToCouple
+          });
+        }
+      }
+    }
+  }
+
+  // Re-map slab elements to the global node IDs and collect per-element properties
   const globalElements: PyElement[] = [];
+  const elementLoads: number[] = [];
+  const elementThicknesses: number[] = [];
+  const elementElasticModuli: number[] = [];
   let globalElemCounter = 1;
-  const elementMap = new Map<string, Map<number, number>>(); // slabId -> localElemId -> globalElemId
 
   for (const sm of slabMeshes) {
-    const localToGlobalElemMap = new Map<number, number>();
     const nodeMapForSlab = new Map<number, number>();
     for (const node of allNodes.filter(n => n.slabId === sm.slab.id)) {
       nodeMapForSlab.set(node.localId, node.globalIdx! + 1); // 1-indexed
     }
+
+    const t_s = sm.slab.thickness || 0.2;
+    const e_s = (sm.slab.elasticModulus ? sm.slab.elasticModulus * 1000 : 25e9) * (sm.slab.crackingModifier ?? 1.0);
+    const q_s = (sm.slab.uniformLoad || 5.0) + (sm.slab.partitionLoad ?? 0) + 25 * t_s;
 
     for (const elem of sm.mesh.elements) {
       const globalNodeIds = elem.nodeIds.map(nid => nodeMapForSlab.get(nid)!);
@@ -463,9 +754,11 @@ export async function meshAndAnalyzeAllSlabs(
         nodeIds: globalNodeIds,
         area: elem.area || 0
       });
-      localToGlobalElemMap.set(elem.id, globalElemId);
+
+      elementThicknesses.push(t_s);
+      elementElasticModuli.push(e_s);
+      elementLoads.push(q_s);
     }
-    elementMap.set(sm.slab.id, localToGlobalElemMap);
   }
 
   const globalMesh = {
@@ -478,8 +771,8 @@ export async function meshAndAnalyzeAllSlabs(
     meshQuality: 'High'
   };
 
-  // 3. Support mapping on the global mesh
-  const tol = 0.05;
+  // 3. Support mapping on the global mesh (multi-slab node coupling)
+  const wallTol = Math.max(0.12, meshSize * 0.35);
   const wallNodeIds: number[] = [];
   const wallNodesCount = new Array(walls.length).fill(0);
   for (const n of uniqueNodes) {
@@ -492,7 +785,7 @@ export async function meshAndAnalyzeAllSlabs(
       if (t >= -0.01 && t <= 1.01) {
         const px = w.startPoint.x + Math.max(0, Math.min(1, t)) * dx;
         const py = w.startPoint.y + Math.max(0, Math.min(1, t)) * dy;
-        if (Math.hypot(n.x - px, n.y - py) < tol) {
+        if (Math.hypot(n.x - px, n.y - py) < wallTol) {
           wallNodeIds.push(n.id);
           wallNodesCount[wi]++;
         }
@@ -513,32 +806,52 @@ export async function meshAndAnalyzeAllSlabs(
   const skippedColumnIds: string[] = [];
   for (let ci = 0; ci < columns.length; ci++) {
     const c = columns[ci] as any;
+    const w = c.width || 0.3;
+    const dp = c.depth || 0.3;
+    const isInside = slabs.some(s => s.vertices && s.vertices.length >= 3 && pointInPolygon(c.position, s.vertices));
     let best = uniqueNodes[0], bestD = Infinity;
     for (const n of uniqueNodes) {
       const d = Math.hypot(n.x - c.position.x, n.y - c.position.y);
       if (d < bestD) { bestD = d; best = n; }
     }
-    if (bestD > COL_SNAP_TOL) {
+    // Only skip column if it is outside all slab polygons AND further than COL_SNAP_TOL
+    if (!isInside && bestD > COL_SNAP_TOL) {
       skippedColumns.push(ci + 1);
       skippedColumnIds.push(c.id || `Column ${ci + 1}`);
       continue;
     }
-    colNodeIds.push(best.id);
-    colHeights.push(c.height || 3);
-    const w = c.width || 0.3;
-    const dp = c.depth || 0.3;
-    colWidths.push(w);
-    colDepths.push(dp);
+
     const Ix = dp * w**3 / 12;
     const Iy = w * dp**3 / 12;
     const I = (Ix + Iy) / 2;
-    const E_col = (c.elasticModulus || 25e6) * 1000; // kPa -> Pa
+    const E_col = (c.elasticModulus || 25e6) * 1000; // kPa → Pa
     const H = c.height || 3.0;
-    colStiffnesses.push(4 * E_col * I / H);
-    colShapes.push(c.shape || 'rectangular');
-    colDiameters.push((c.diameter || 500) / 1000);
-    colGrades.push(c.concreteGrade || 'M25');
+
+    if (best) {
+      colNodeIds.push(best.id);
+      colHeights.push(c.height || 3);
+      colWidths.push(w);
+      colDepths.push(dp);
+      colStiffnesses.push(4 * E_col * I / H);
+      colShapes.push(c.shape || 'rectangular');
+      colDiameters.push((c.diameter || 500) / 1000);
+      colGrades.push(c.concreteGrade || 'M25');
+
+      // Tie all nodes within column capital footprint across all slabs to master column node
+      const colSnapRadius = Math.max(0.35, Math.hypot(w, dp) * 0.7, meshSize * 0.5);
+      const matchingNodes = uniqueNodes.filter(n => Math.hypot(n.x - c.position.x, n.y - c.position.y) <= colSnapRadius);
+      for (const mNode of matchingNodes) {
+        if (mNode.id !== best.id) {
+          equalDofConstraints.push({
+            nodeIdA: best.id,
+            nodeIdB: mNode.id,
+            dofs: [1, 2, 3, 4, 5, 6]
+          });
+        }
+      }
+    }
   }
+
 
   const primarySlab = slabs[0];
   const slabThickness = primarySlab.thickness || 0.2;
@@ -578,18 +891,23 @@ export async function meshAndAnalyzeAllSlabs(
     });
   }
 
+  const primarySlabE = (primarySlab.elasticModulus ? primarySlab.elasticModulus * 1000 : 25e9) * (primarySlab.crackingModifier ?? 1.0);
   const arBody: any = {
     mesh: globalMesh,
     thickness: slabThickness,
-    elasticModulus: (primarySlab.elasticModulus ? primarySlab.elasticModulus * 1000 : 25e9) * (primarySlab.crackingModifier ?? 0.25),
+    elasticModulus: primarySlabE,
     poissonRatio,
     uniformLoad: (primarySlab.uniformLoad || 5.0) + (primarySlab.partitionLoad ?? 0),
-    selfWeight,
+    selfWeight: 0,
+    elementThicknesses,
+    elementElasticModuli,
+    elementLoads,
     wallNodeIds: [...new Set(wallNodeIds)],
     wallStartPoints: walls.map(w => w.startPoint),
     wallEndPoints: walls.map(w => w.endPoint),
     wallThicknesses: walls.map(w => w.thickness ?? 0.25),
     wallHeights: walls.map(w => w.height ?? 3.0),
+    wallElasticModuli: walls.map(w => w.elasticModulus ?? primarySlabE),
     columnNodeIds: colNodeIds,
     columnHeights: colHeights,
     columnStiffnesses: colStiffnesses,
@@ -606,7 +924,8 @@ export async function meshAndAnalyzeAllSlabs(
     beamDepths,
     beamElasticModuli,
     dropPanels: activeDropPanels,
-    partitionWallSegments: computePartitionWallSegments(nonStructuralWalls, polylineNonStructuralWalls)
+    partitionWallSegments: computePartitionWallSegments(nonStructuralWalls, polylineNonStructuralWalls),
+    equalDofConstraints
   };
 
   const warnings: string[] = [];
@@ -614,14 +933,25 @@ export async function meshAndAnalyzeAllSlabs(
     warnings.push(`Column${skippedColumns.length > 1 ? 's' : ''} ${skippedColumns.join(', ')} outside the slab mesh.`);
   }
 
-  const ar = await fetchApi(`${API_BASE}/api/analyze`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(arBody)
-  });
-  if (!ar.ok) throw new PyApiError(`Analyze API failed: ${ar.status}`);
-  const result: PyAnalysisResult = await ar.json();
-  if (!result.success) throw new PyApiError(`Analysis failed: ${result.error}`);
+  const analyzeController = new AbortController();
+  const analyzeTimeout = setTimeout(() => analyzeController.abort(), 60000); // 60s timeout
+  let result: PyAnalysisResult;
+  try {
+    const ar = await fetchApi(`${API_BASE}/api/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(arBody),
+      signal: analyzeController.signal
+    });
+    clearTimeout(analyzeTimeout);
+    if (!ar.ok) throw new PyApiError(`Analyze API failed: ${ar.status}`);
+    result = await ar.json();
+    if (!result.success) throw new PyApiError(`Analysis failed: ${result.error}`);
+  } catch (e: any) {
+    clearTimeout(analyzeTimeout);
+    if (e.name === 'AbortError') throw new PyApiError('Analysis request timed out (60s). Try a coarser mesh size.');
+    throw e;
+  }
 
   // 4. Map global results back to individual SlabFEMResult outputs per slab
   const results: any[] = [];
@@ -631,56 +961,30 @@ export async function meshAndAnalyzeAllSlabs(
       localNodeMap.set(node.localId, node.globalIdx! + 1); // 1-indexed
     }
 
-    const localToGlobalElemMap = elementMap.get(sm.slab.id)!;
+    const defMap = new Map<number, { wz: number; rx: number; ry: number }>();
+    for (const d of (result.nodeDeflections || [])) {
+      defMap.set(d.nodeId, { wz: d.wz, rx: d.rx ?? 0, ry: d.ry ?? 0 });
+    }
 
     const nodeDeflections = sm.mesh.nodes.map(n => {
       const gNodeId = localNodeMap.get(n.id)!;
-      const gDef = result.nodeDeflections.find(d => d.nodeId === gNodeId);
-      return { nodeId: n.id, wz: gDef ? gDef.wz : 0 };
+      const defData = defMap.get(gNodeId);
+      return {
+        nodeId: n.id,
+        wz: defData?.wz ?? 0,
+        rx: defData?.rx ?? 0,
+        ry: defData?.ry ?? 0
+      };
     });
 
-    const momentMx = sm.mesh.elements.map(e => {
-      const gElemId = localToGlobalElemMap.get(e.id)!;
-      const gMom = result.elementMoments.find(m => m.elementId === gElemId);
-      return { elementId: e.id, value: gMom ? gMom.mx : 0 };
-    });
-
-    const momentMy = sm.mesh.elements.map(e => {
-      const gElemId = localToGlobalElemMap.get(e.id)!;
-      const gMom = result.elementMoments.find(m => m.elementId === gElemId);
-      return { elementId: e.id, value: gMom ? gMom.my : 0 };
-    });
-
-    const momentMxy = sm.mesh.elements.map(e => {
-      const gElemId = localToGlobalElemMap.get(e.id)!;
-      const gMom = result.elementMoments.find(m => m.elementId === gElemId);
-      return { elementId: e.id, value: gMom ? gMom.mxy : 0 };
-    });
-
-    const stresses = (result.elementStresses || []).filter(s => {
-      const gElemId = localToGlobalElemMap.get(sm.mesh.elements[0]?.id); // check range
-      return localToGlobalElemMap.has(sm.mesh.elements.find(e => localToGlobalElemMap.get(e.id) === s.elementId)?.id || -1);
-    }).map(s => {
-      const localElemId = sm.mesh.elements.find(e => localToGlobalElemMap.get(e.id) === s.elementId)!.id;
-      return { elementId: localElemId, s1: s.s1, s2: s.s2, angle: s.angle, vm: s.vm };
-    });
-
-    const shears = (result.elementShears || []).filter(s => {
-      return localToGlobalElemMap.has(sm.mesh.elements.find(e => localToGlobalElemMap.get(e.id) === s.elementId)?.id || -1);
-    }).map(s => {
-      const localElemId = sm.mesh.elements.find(e => localToGlobalElemMap.get(e.id) === s.elementId)!.id;
-      return { elementId: localElemId, vx: s.vx, vy: s.vy, v1: s.v1, angle: s.angle };
-    });
-
-    const columnPunching = (result.columnPunching || []).filter(p => {
-      return localNodeMap.has(sm.mesh.nodes.find(n => localNodeMap.get(n.id) === p.nodeId)?.id || -1);
-    }).map(p => {
-      const localNodeId = sm.mesh.nodes.find(n => localNodeMap.get(n.id) === p.nodeId)!.id;
-      return { nodeId: localNodeId, force_kN: p.force_kN, stress_MPa: p.stress_MPa, capacity_MPa: p.capacity_MPa, ratio: p.ratio, status: p.status };
-    });
-
-    const vxVals = shears.map(s => s.vx);
-    const vyVals = shears.map(s => s.vy);
+    // Moments, stresses, shears, membrane forces, and punching are stripped from solver output.
+    // Provide empty arrays so the SlabFEMResult shape is satisfied.
+    const momentMx: { elementId: number; value: number }[] = [];
+    const momentMy: { elementId: number; value: number }[] = [];
+    const momentMxy: { elementId: number; value: number }[] = [];
+    const stresses: any[] = [];
+    const shears: any[] = [];
+    const columnPunching: any[] = [];
 
     results.push({
       slabId: sm.slab.id,
@@ -699,14 +1003,14 @@ export async function meshAndAnalyzeAllSlabs(
       columnPunching,
       minWz: nodeDeflections.length ? Math.min(...nodeDeflections.map(d => d.wz)) : 0,
       maxWz: nodeDeflections.length ? Math.max(...nodeDeflections.map(d => d.wz)) : 0,
-      minMx: Math.min(...momentMx.map(m => m.value)),
-      maxMx: Math.max(...momentMx.map(m => m.value)),
-      minMy: Math.min(...momentMy.map(m => m.value)),
-      maxMy: Math.max(...momentMy.map(m => m.value)),
-      minVx: vxVals.length ? Math.min(...vxVals) : 0,
-      maxVx: vxVals.length ? Math.max(...vxVals) : 0,
-      minVy: vyVals.length ? Math.min(...vyVals) : 0,
-      maxVy: vyVals.length ? Math.max(...vyVals) : 0,
+      minMx: 0,
+      maxMx: 0,
+      minMy: 0,
+      maxMy: 0,
+      minVx: 0,
+      maxVx: 0,
+      minVy: 0,
+      maxVy: 0,
       crX: result.crX,
       crY: result.crY
     });

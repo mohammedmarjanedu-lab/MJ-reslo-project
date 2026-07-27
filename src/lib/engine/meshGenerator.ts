@@ -290,5 +290,25 @@ export function generateSlabMesh(slab: SlabPolygon, meshSize: number, useQ8 = fa
     }
   }
 
-  return { nodes, elements, meshSize };
+  // Filter out unused nodes (nodes not connected to any 2D element)
+  const usedNodeIds = new Set<number>();
+  for (const elem of elements) {
+    for (const nid of elem.nodeIds) usedNodeIds.add(nid);
+  }
+
+  const finalNodes: FEMNode[] = [];
+  const oldToNewMap = new Map<number, number>();
+  for (const n of nodes) {
+    if (usedNodeIds.has(n.id)) {
+      const newId = finalNodes.length;
+      oldToNewMap.set(n.id, newId);
+      finalNodes.push({ id: newId, x: n.x, y: n.y });
+    }
+  }
+
+  for (const elem of elements) {
+    elem.nodeIds = elem.nodeIds.map(id => oldToNewMap.get(id)!);
+  }
+
+  return { nodes: finalNodes, elements, meshSize };
 }

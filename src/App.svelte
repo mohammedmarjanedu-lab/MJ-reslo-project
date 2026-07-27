@@ -12,6 +12,8 @@
   import ExportDialog from './lib/components/ExportDialog.svelte';
   import FEMControlPanel from './lib/components/FEMControlPanel.svelte';
   import ThreeViewport from './lib/components/ThreeViewport.svelte';
+  import ColorLegend from './lib/components/ColorLegend.svelte';
+  import ResultsTable from './lib/components/ResultsTable.svelte';
   import InsightPanel from './lib/ai/insightPanel.svelte';
   import { loopEngine } from './lib/ai/loopEngine.svelte';
   import { memoryStore } from './lib/ai/memoryStore.svelte';
@@ -67,7 +69,43 @@
     window.removeEventListener('mouseup', handleDisplayMouseUp);
   }
 
-// Phase 3g: Wire OBSERVE - start perf probe; the AI loop starts from its own UI
+  // Draggable Deflection Settings Panel State
+  let deflectionPosX = $state<number | null>(null);
+  let deflectionPosY = $state<number | null>(null);
+  let isDraggingDeflection = false;
+  let deflectionDragOffset = { x: 0, y: 0 };
+
+  function handleDeflectionDragStart(e: MouseEvent) {
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'BUTTON' || target.tagName === 'INPUT' || target.closest('button, input, select')) return;
+    
+    e.preventDefault();
+    const panel = target.closest('.deflection-settings-panel') as HTMLElement;
+    if (!panel) return;
+    
+    const rect = panel.getBoundingClientRect();
+    deflectionDragOffset = {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
+    
+    isDraggingDeflection = true;
+    window.addEventListener('mousemove', handleDeflectionMouseMove);
+    window.addEventListener('mouseup', handleDeflectionMouseUp);
+  }
+
+  function handleDeflectionMouseMove(e: MouseEvent) {
+    if (!isDraggingDeflection) return;
+    deflectionPosX = e.clientX - deflectionDragOffset.x;
+    deflectionPosY = e.clientY - deflectionDragOffset.y;
+  }
+
+  function handleDeflectionMouseUp() {
+    isDraggingDeflection = false;
+    window.removeEventListener('mousemove', handleDeflectionMouseMove);
+    window.removeEventListener('mouseup', handleDeflectionMouseUp);
+  }
+
   $effect(() => {
     startPerfProbe((fps, frameTime) => {
       if (typeof window !== 'undefined') {
@@ -77,24 +115,46 @@
     return () => { perfProbeStop(); };
   });
 
-  function checkBackend() {
-    setApiBase(uiState.apiUrl);
+  const FALLBACK_LIVE_URL = 'http://127.0.0.1:8000';
+  let isCheckingBackend = false;
+
+  function checkBackend(url: string) {
+    if (isCheckingBackend) return;
+    isCheckingBackend = true;
+    setApiBase(url);
     healthCheck().then(ok => {
-      const changed = uiState.backendConnected !== ok;
+      if (!ok && url !== FALLBACK_LIVE_URL) {
+        setApiBase(FALLBACK_LIVE_URL);
+        healthCheck().then(fallbackOk => {
+          isCheckingBackend = false;
+          if (fallbackOk) {
+            uiState.setApiUrl(FALLBACK_LIVE_URL);
+            uiState.backendConnected = true;
+            apiAvailable = true;
+            uiState.setStatusMessage('Python backend connected (Kratos Multiphysics)');
+          } else {
+            uiState.backendConnected = false;
+            apiAvailable = false;
+          }
+        });
+        return;
+      }
+      isCheckingBackend = false;
       uiState.backendConnected = ok;
       apiAvailable = ok;
-      if (changed) {
-        uiState.setStatusMessage(ok ? 'Python backend connected (OpenSeesPy)' : 'Backend offline — check tunnel');
+      if (ok) {
+        uiState.setStatusMessage('Python backend connected (Kratos Multiphysics)');
       }
     });
   }
 
+
   $effect(() => {
-    uiState.apiUrl;
-    checkBackend();
+    const url = uiState.apiUrl;
+    const t = setTimeout(() => checkBackend(url), 10);
     if (healthInterval) clearInterval(healthInterval);
-    healthInterval = setInterval(checkBackend, 15000);
-    return () => { if (healthInterval) clearInterval(healthInterval); };
+    healthInterval = setInterval(() => checkBackend(uiState.apiUrl), 15000);
+    return () => { clearTimeout(t); if (healthInterval) clearInterval(healthInterval); };
   });
 
   let graphRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -113,13 +173,29 @@
     model.scheduleAutoSave();
   });
 
+  // Apply deflectionType and crackedModifierValue to all slabs
+  $effect(() => {
+    const type = uiState.deflectionType;
+    const val = uiState.crackedModifierValue;
+    const targetVal = type === 'cracked' ? val : 1.0;
+    const needsUpdate = model.slabs.some(s => s.crackingModifier !== targetVal);
+    if (needsUpdate) {
+      model.beginAction();
+      for (const slab of model.slabs) {
+        if (slab.crackingModifier !== targetVal) {
+          model.updateSlab(slab.id, { crackingModifier: targetVal });
+        }
+      }
+    }
+  });
+
   $effect(() => {
     // Monitor deep properties to trigger debounced analysis on drags and edits
     model.columns.forEach(c => { c.position.x; c.position.y; c.width; c.depth; c.height; c.rotation; });
     model.walls.forEach(w => { w.startPoint.x; w.startPoint.y; w.endPoint.x; w.endPoint.y; w.thickness; w.height; });
     model.polylineWalls.forEach(pw => { pw.vertices.forEach(v => { v.x; v.y; }); pw.thickness; pw.height; });
     model.beams.forEach(b => { b.startPoint.x; b.startPoint.y; b.endPoint.x; b.endPoint.y; b.width; b.depth; b.height; });
-    model.slabs.forEach(s => { s.vertices.forEach(v => { v.x; v.y; }); s.holes.forEach(h => h.forEach(v => { v.x; v.y; })); s.thickness; s.uniformLoad; });
+    model.slabs.forEach(s => { s.vertices.forEach(v => { v.x; v.y; }); s.holes.forEach(h => h.forEach(v => { v.x; v.y; })); s.thickness; s.uniformLoad; s.crackingModifier; });
     model.dropPanels.forEach(dp => { dp.vertices.forEach(v => { v.x; v.y; }); dp.width; dp.depth; dp.drop; dp.rotation; });
     model.nonStructuralWalls.forEach(w => { w.startPoint.x; w.startPoint.y; w.endPoint.x; w.endPoint.y; w.thickness; w.height; w.partitionUnitWeight; });
     model.polylineNonStructuralWalls.forEach(pw => { pw.vertices.forEach(v => { v.x; v.y; }); pw.thickness; pw.height; pw.partitionUnitWeight; });
@@ -141,7 +217,10 @@
   }
 
   function toFrontendResult(slabId: string, mesh: any, result: any, meshSize: number): SlabFEMResult {
-    const nodeDeflections = result.nodeDeflections.map((d: any) => ({ nodeId: d.nodeId, wz: d.wz }));
+    const nodeDeflections = result.nodeDeflections.map((d: any) => ({
+      nodeId: d.nodeId, wz: d.wz,
+      rx: d.rx ?? 0, ry: d.ry ?? 0
+    }));
     const momentMx = result.elementMoments.map((m: any) => ({ elementId: m.elementId, value: m.mx }));
     const momentMy = result.elementMoments.map((m: any) => ({ elementId: m.elementId, value: m.my }));
     const momentMxy = result.elementMoments.map((m: any) => ({ elementId: m.elementId, value: m.mxy }));
@@ -260,18 +339,26 @@
       }
     }
 
-    // ── Primary: OpenSeesPy backend (default when connected — fast & accurate) ──
+    // ── Primary: Kratos Multiphysics backend (kratos_solver.py default when connected — fast & accurate) ──
     if (apiAvailable) {
       try {
         await meshAndAnalyzeBackend(validSlabs, allWalls, columns, meshSize, gen, slabIdsAtStart);
         if (gen !== femGen) return;
         return; // backend result is authoritative
       } catch (e) {
-        const msg = e instanceof PyApiError ? e.message : String(e);
-        console.warn(`[Reslo] OpenSeesPy failed: ${msg}`);
-        femState.setError(`OpenSeesPy Solver Failed: ${msg}`);
-        uiState.setStatusMessage(`OpenSeesPy failed: ${msg}`);
-        return; // Do not fall back to in-browser solver if OpenSeesPy is connected
+        console.warn(`[Reslo] Initial Kratos attempt failed, retrying backend:`, e);
+        try {
+          // Automatic retry to handle temporary network/mesh latency
+          await meshAndAnalyzeBackend(validSlabs, allWalls, columns, meshSize, gen, slabIdsAtStart);
+          if (gen !== femGen) return;
+          return;
+        } catch (e2) {
+          const msg = e2 instanceof PyApiError ? e2.message : String(e2);
+          console.warn(`[Reslo] Kratos Multiphysics backend unavailable (${msg}). Falling back to in-browser Web Worker solver...`);
+          uiState.backendConnected = false;
+          apiAvailable = false;
+          uiState.setStatusMessage('Using in-browser Web Worker solver');
+        }
       }
     }
 
@@ -287,7 +374,7 @@
     }
   }
 
-  // Non-blocking backend upgrade: refines results with OpenSeesPy when available/fast.
+  // Non-blocking backend upgrade: refines results with Kratos Multiphysics (kratos_solver.py) when available/fast.
   async function meshAndAnalyzeBackend(
     validSlabs: SlabPolygon[], allWalls: ShearWallElement[], columns: ColumnElement[],
     meshSize: number, gen: number, slabIdsAtStart: Set<string>
@@ -302,15 +389,20 @@
     );
     femState.setProgress(1);
     if (gen !== femGen) return; // a newer analysis superseded this one
-    const stillValid = res.results.filter(r => slabIdsAtStart.has(r.slabId) && model.slabs.some(s => s.id === r.slabId));
+    const slabLabelsAtStart = new Set(model.slabs.filter(s => s.vertices.length >= 3).map(s => s.label));
+    const stillValid = res.results.filter(r =>
+      (slabIdsAtStart.has(r.slabId) || slabLabelsAtStart.has(r.slabId)) &&
+      model.slabs.some(s => s.id === r.slabId || s.label === r.slabId)
+    );
     if (stillValid.length === 0) return;
     femState.setResults(stillValid);
     femState.warnings = res.warnings;
     femState.disconnectedIds = new Set(res.disconnectedIds);
     const elemCount = stillValid.reduce((s, r) => s + r.mesh.elements.length, 0);
-    uiState.setStatusMessage(`FEM (OpenSeesPy): ${stillValid.length} slab(s), ${elemCount} elements`);
-    memoryStore.pushSolve({ solver: 'openseespy', slabCount: stillValid.length, elementCount: elemCount, durationMs: 0, success: true, warnings: res.warnings });
+    uiState.setStatusMessage(`FEM (Kratos): ${stillValid.length} slab(s), ${elemCount} elements`);
+    memoryStore.pushSolve({ solver: 'kratos', slabCount: stillValid.length, elementCount: elemCount, durationMs: 0, success: true, warnings: res.warnings });
   }
+
 
   function runWorkerSolver(validSlabs: SlabPolygon[], columns: ColumnElement[], walls: ShearWallElement[], meshSize: number, gen: number, slabIdsAtStart: Set<string>): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -320,7 +412,8 @@
         }
         worker.onerror = (err) => {
           worker = null;
-          reject(new Error(`Worker error: ${err.message}`));
+          const errMsg = err?.message || 'Web Worker script execution failed';
+          reject(new Error(`Worker error: ${errMsg}`));
         };
         worker.onmessage = (event: MessageEvent<FEMWorkerOutput>) => {
           const data = event.data;
@@ -328,7 +421,7 @@
             femState.setProgress(data.progress ?? 0);
           } else if (data.type === 'RESULT') {
             if (gen !== femGen) { resolve(); return; }
-            const results = (data.results ?? []).filter(r => slabIdsAtStart.has(r.slabId) && model.slabs.some(s => s.id === r.slabId));
+            const results = (data.results ?? []).filter(r => slabIdsAtStart.has(r.slabId) && model.slabs.some(s => s.id === r.slabId || s.label === r.slabId));
             if (results.length === 0) {
               femState.clear();
               uiState.setStatusMessage('Analysis cleared - slab deleted');
@@ -351,7 +444,15 @@
           type: 'ANALYZE', slabs: validSlabs, columns, walls,
           polylineWalls: model.polylineWalls, beams: model.beams, dropPanels: model.dropPanels,
           nonStructuralWalls: model.nonStructuralWalls, polylineNonStructuralWalls: model.polylineNonStructuralWalls,
-          meshSize, poissonRatio, useQ8: false
+          meshSize, poissonRatio, useQ8: false,
+          designOptions: {
+            concreteGrade: validSlabs[0]?.concreteGrade || 'M30',
+            steelGrade: 'Fe 500',
+            cover: 0.025,
+            barDia: 12,
+            exposureLimit: 0.3,
+            longTermFactor: 2.0
+          }
         }));
         worker.postMessage(input);
       } catch (e) { reject(e); }
@@ -564,7 +665,7 @@
       <div class="flex items-center gap-1.5 px-1 py-0.5">
         <span class="w-1.5 h-1.5 rounded-full {uiState.backendConnected ? 'bg-green-500 shadow-[0_0_6px_#10b981]' : 'bg-yellow-500 shadow-[0_0_6px_#f59e0b]'}"></span>
         <span class="text-[9px] text-slate-300 font-medium">
-          {uiState.backendConnected ? 'OpenSeesPy Connected' : 'Local Solver Fallback'}
+          {uiState.backendConnected ? 'Kratos Connected' : 'Local Solver Fallback'}
         </span>
       </div>
     </div>
@@ -572,15 +673,41 @@
 
   {#if uiState.viewMode === '3d'}
     <div class="flex flex-1 flex-col min-w-0">
-      <div class="flex-1 min-h-0 overflow-hidden rounded bg-[#1a1a1a]">
+      <div class="relative flex-1 min-h-0 overflow-hidden rounded bg-[#1a1a1a]">
         <ThreeViewport />
+        <!-- 3D View Controls Overlay -->
+        <div class="absolute top-3 left-3 z-20 flex flex-col gap-2">
+          <div class="flex gap-1 p-1.5 rounded-lg border border-[#333333] bg-[#141414]/90 backdrop-blur-md">
+            {#each [['top','Top'],['iso','Iso'],['front','Front'],['side','Side']] as [preset,label]}
+              <button class="px-2 py-1 text-[10px] rounded {uiState.viewPreset === preset ? 'bg-[#D62430] text-white' : 'bg-[#2b2b2b] text-[#ccc] hover:bg-[#3a3a3a]'}" onclick={() => uiState.viewPreset = preset as any}>{label}</button>
+            {/each}
+          </div>
+          <div class="flex flex-col gap-1 p-1.5 rounded-lg border border-[#333333] bg-[#141414]/90 backdrop-blur-md text-[10px] text-[#ccc]">
+            <label class="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" bind:checked={uiState.femAnimationEnabled} class="accent-[#D62430]" /> Animate
+            </label>
+          </div>
+          <div class="flex items-center gap-1.5 p-1.5 rounded-lg border border-[#333333] bg-[#141414]/90 backdrop-blur-md text-[10px] text-[#ccc]">
+            <span>Def. scale</span>
+            <input type="range" min="5" max="300" bind:value={femState.deformedScale} class="w-20 accent-[#D62430]" />
+            <span class="font-mono text-[#fff]">{femState.deformedScale}×</span>
+          </div>
+        </div>
+        {#if femState.showFEMContour}
+          <ColorLegend
+            resultType={femState.resultType}
+            min={femState.contourCache.globalMin}
+            max={femState.contourCache.globalMax}
+            ramp={uiState.colorRamp}
+          />
+        {/if}
       </div>
       <div class="flex items-center justify-between px-4 py-1.5 bg-[#1a1a1a] border-t border-[#333333] text-[11px] text-[#ffffff]">
         <span>{uiState.statusMessage}</span>
         <span class="flex items-center gap-3 font-mono">
           <span class="text-[#D62430]">3D View</span>
           {#if femState.hasResults}
-            <span>Max defl: <span class="text-[#D62430]">{(femState.globalMinWz * 1000).toFixed(2)} mm</span></span>
+            <span>Max defl: <span class="text-[#D62430]">{Math.max(Math.abs(femState.globalMinWz), Math.abs(femState.globalMaxWz)).toFixed(2)} mm</span></span>
           {/if}
         </span>
       </div>
@@ -589,6 +716,77 @@
     <div class="flex flex-1 flex-col relative">
       <WorkspaceCanvas />
 
+      <!-- Deflection Settings POP-UP overlay next to the top left of the grid (when Live is ON) -->
+      {#if uiState.femAutoCompute && uiState.viewMode === '2d'}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="deflection-settings-panel absolute left-[236px] top-3 pointer-events-auto z-10 rounded-lg bg-slate-800/95 p-3 border border-slate-700 text-xs font-mono w-[220px] shadow-lg flex flex-col gap-2.5 cursor-move select-none"
+          style={deflectionPosX !== null && deflectionPosY !== null ? `left: ${deflectionPosX}px; top: ${deflectionPosY}px; position: fixed; transform: none;` : ''}
+          onmousedown={handleDeflectionDragStart}
+        >
+          <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Deflection Settings</div>
+          
+          <div class="flex flex-col gap-2">
+            <label class="flex items-center gap-2 text-slate-200 cursor-pointer select-none">
+              <input
+                type="radio"
+                name="deflectionType"
+                value="uncracked"
+                checked={uiState.deflectionType === 'uncracked'}
+                onchange={() => { uiState.deflectionType = 'uncracked'; }}
+                class="accent-[#D62430]"
+              />
+              <span>Uncracked Deflection</span>
+            </label>
+            
+            <label class="flex items-center gap-2 text-slate-200 cursor-pointer select-none">
+              <input
+                type="radio"
+                name="deflectionType"
+                value="cracked"
+                checked={uiState.deflectionType === 'cracked'}
+                onchange={() => { uiState.deflectionType = 'cracked'; }}
+                class="accent-[#D62430]"
+              />
+              <span>Cracked Deflection</span>
+            </label>
+          </div>
+
+          {#if uiState.deflectionType === 'cracked'}
+            <div class="flex flex-col gap-1.5 border-t border-slate-700/50 pt-2">
+              <div class="flex items-center justify-between text-[10px] text-slate-400">
+                <span>Crack Modifier:</span>
+                <span class="font-bold text-indigo-400 font-mono">{uiState.crackedModifierValue.toFixed(2)}</span>
+              </div>
+              <div class="flex gap-1">
+                <button
+                  class="flex-1 py-0.5 rounded text-[9px] font-semibold transition-colors border cursor-pointer text-center {uiState.crackedModifierValue === 0.25 ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700'}"
+                  onclick={() => { uiState.crackedModifierValue = 0.25; }}
+                >0.25</button>
+                <button
+                  class="flex-1 py-0.5 rounded text-[9px] font-semibold transition-colors border cursor-pointer text-center {uiState.crackedModifierValue === 0.50 ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700'}"
+                  onclick={() => { uiState.crackedModifierValue = 0.50; }}
+                >0.50</button>
+              </div>
+              <div class="flex items-center gap-1.5 mt-0.5">
+                <input
+                  type="range"
+                  min="0.10"
+                  max="0.90"
+                  step="0.05"
+                  bind:value={uiState.crackedModifierValue}
+                  class="w-full accent-indigo-500 cursor-pointer h-1 bg-slate-700 rounded-lg appearance-none"
+                />
+              </div>
+            </div>
+          {:else}
+            <div class="text-[9px] text-slate-500 border-t border-slate-700/50 pt-2">
+              Effective inertia is uncracked (I = Ig, modifier = 1.0).
+            </div>
+          {/if}
+        </div>
+      {/if}
+
       {#if femState.hasResults}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
@@ -596,26 +794,18 @@
           style={displayPosX !== null && displayPosY !== null ? `left: ${displayPosX}px; top: ${displayPosY}px; bottom: auto; transform: none; position: fixed;` : ''}
           onmousedown={handleDisplayDragStart}
         >
-          {#each ['deflection', 'mx', 'my', 'mxy', 'punching'] as type}
-            {#if type !== 'punching' || (femState.activeResult?.columnPunching?.length ?? 0) > 0}
-              <button
-                class="px-3 py-1.5 rounded text-[10px] uppercase font-bold tracking-wider transition-all duration-200 cursor-pointer text-center border border-transparent
-                  {femState.showFEMContour && femState.resultType === type
-                    ? 'bg-[#D62430] text-white shadow-[0_0_8px_rgba(214,36,48,0.4)] border-[#D62430]'
-                    : 'bg-[#1e1e1e]/85 text-[#b3b3b3] border-[#2b2b2b] hover:bg-[#333333] hover:text-white'}"
-                onclick={() => {
-                  if (femState.showFEMContour && femState.resultType === type) {
-                    femState.showFEMContour = false;
-                  } else {
-                    femState.resultType = type as any;
-                    femState.showFEMContour = true;
-                  }
-                }}
-              >
-                {type === 'deflection' ? 'Deflection' : type === 'mx' ? 'Moment Mx' : type === 'my' ? 'Moment My' : type === 'mxy' ? 'Moment Mxy' : 'Punching'}
-              </button>
-            {/if}
-          {/each}
+          <button
+            class="px-3 py-1.5 rounded text-[10px] uppercase font-bold tracking-wider transition-all duration-200 cursor-pointer text-center border border-transparent
+              {femState.showFEMContour
+                ? 'bg-[#D62430] text-white shadow-[0_0_8px_rgba(214,36,48,0.4)] border-[#D62430]'
+                : 'bg-[#1e1e1e]/85 text-[#b3b3b3] border-[#2b2b2b] hover:bg-[#333333] hover:text-white'}"
+            onclick={() => {
+              femState.resultType = 'deflection';
+              femState.showFEMContour = !femState.showFEMContour;
+            }}
+          >
+            Deflection (mm)
+          </button>
         </div>
       {/if}
 
@@ -648,6 +838,11 @@
 
   <div class="absolute right-3 top-3 flex flex-col gap-3 pointer-events-none z-10">
     <div class="pointer-events-auto"><MetricsHUD /></div>
+    {#if femState.hasResults && uiState.viewMode === '2d'}
+      <div class="pointer-events-auto w-80 max-h-[60vh] overflow-hidden rounded-lg border border-[#333333] bg-[#141414]/95 backdrop-blur-md shadow-xl">
+        <ResultsTable />
+      </div>
+    {/if}
   </div>
 
   <div class="absolute right-3 bottom-3 pointer-events-auto z-10">

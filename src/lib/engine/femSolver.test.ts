@@ -96,14 +96,15 @@ describe('FEM Solver — Timoshenko Validation', () => {
     const result = analyzeAllSlabs(
       [slab], [], walls, [], [], [], [], [],
       meshSize, 0.2, useQ8
-    )[0];
-    const E = slab.elasticModulus;
+    ).results[0];
+    const E = slab.elasticModulus * 1.0; // default crackingModifier = 1.0
     const t = slab.thickness;
     const q = slab.uniformLoad + slab.concreteDensity * t;
     const exact = timoshenkoExpectations(side, t, E, 0.2, q);
-    const errorW = Math.abs(result.maxWz - exact.wMax) / exact.wMax;
+    const wMax = Math.abs(result.minWz);
+    const errorW = Math.abs(wMax - exact.wMax) / exact.wMax;
     const errorM = Math.abs(result.maxMx - exact.mMax) / exact.mMax;
-    console.log(`${label}: w_max=${result.maxWz.toExponential(4)} error=${(errorW*100).toFixed(1)}% Mx_max=${result.maxMx.toExponential(4)} error=${(errorM*100).toFixed(1)}% nodes=${result.mesh.nodes.length} elements=${result.mesh.elements.length}`);
+    console.log(`${label}: w_max=${wMax.toExponential(4)} error=${(errorW*100).toFixed(1)}% Mx_max=${result.maxMx.toExponential(4)} error=${(errorM*100).toFixed(1)}% nodes=${result.mesh.nodes.length} elements=${result.mesh.elements.length}`);
     return { result, errorW, exact };
   }
 

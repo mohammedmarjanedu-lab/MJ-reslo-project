@@ -5,6 +5,8 @@
   import { model } from '../stores/structuralModel.svelte';
   import { uiState } from '../stores/uiState.svelte';
   import { femState } from '../stores/femResults.svelte';
+  import { sampleRamp } from '../engine/colorRamps';
+  import type { ColorRampName } from '../engine/types';
 
   let container: HTMLDivElement;
   let renderer: THREE.WebGLRenderer;
@@ -22,40 +24,46 @@
   const _scale = new THREE.Vector3(1, 1, 1);
   const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
   const _color = new THREE.Color();
+  const _raycaster = new THREE.Raycaster();
+  const _mouse = new THREE.Vector2();
 
   const COLORS = {
-    dark: { bg: 0x0a0a0a, ambient: 0x404040, dir: 0xffffff },
-    light: { bg: 0xf0f0f0, ambient: 0x888888, dir: 0xffffff },
+    dark: { bg: 0x0d1117, ambient: 0x404040, dir: 0xffffff, hemi: 0x88aaff, hemiGround: 0x222222 },
+    light: { bg: 0xf0f2f5, ambient: 0x888888, dir: 0xffffff, hemi: 0xccccff, hemiGround: 0x888888 },
   };
   function themeColors() { return uiState.theme === 'light' ? COLORS.light : COLORS.dark; }
 
   function px(v: number) { return v; }
   function pz(v: number) { return v; }
 
-  // ─── Instance caps (pre-allocate, hide unused via scale 0) ───
-  const MAX_INST = 500;
+  // ─── Dynamic instance pools (no hard cap — resize on demand) ───
+  let instRectCols: THREE.InstancedMesh | null = null;
+  let instCircCols: THREE.InstancedMesh | null = null;
+  let instBeams: THREE.InstancedMesh | null = null;
+  let instWalls: THREE.InstancedMesh | null = null;
+  const POOL_OVERALLOC = 2;
 
-  // ─── Shared materials (1 per shape type = 4 draw calls for all columns/beams/walls) ───
-  const colRectMat = new THREE.MeshPhongMaterial({ color: 0x00e5ff });
-  const colCircMat = new THREE.MeshPhongMaterial({ color: 0x00e5ff });
-  const beamMat = new THREE.MeshPhongMaterial({ color: 0x22d3ee });
-  const wallMat = new THREE.MeshPhongMaterial({ color: 0xff4d79 });
+  // ─── Shared materials (PBR for ETABS-grade quality) ───
+  const colRectMat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.6, metalness: 0.1 });
+  const colCircMat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.6, metalness: 0.1 });
+  const beamMat = new THREE.MeshStandardMaterial({ color: 0x22d3ee, roughness: 0.7, metalness: 0.1 });
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0xf43f5e, roughness: 0.75, metalness: 0.05 });
 
-  // ─── Shared unit geometries (scaled per-instance via matrix) ───
   const boxGeo = new THREE.BoxGeometry(1, 1, 1);
   const cylGeo = new THREE.CylinderGeometry(0.5, 0.5, 1, 24);
 
-  // ─── Instanced meshes (created once in initThree) ───
-  let instRectCols: THREE.InstancedMesh;
-  let instCircCols: THREE.InstancedMesh;
-  let instBeams: THREE.InstancedMesh;
-  let instWalls: THREE.InstancedMesh;
-
-  // ─── FEM deflection mesh (single merged BufferGeometry) ───
+  // ─── FEM meshes ───
   let femMesh: THREE.Mesh | null = null;
   let gridHelper: THREE.GridHelper | null = null;
+  let slabGroup: THREE.Group;
+  let femGroup: THREE.Group;
+  let reactionGroup: THREE.Group;
+  let loadGroup: THREE.Group;
+  let animationTime = 0;
+  let needsRender = true;
 
-  // ─── Compute model bounding box for dynamic grid sizing ───
+  function markRender() { needsRender = true; }
+
   function computeModelBounds(): { minX: number; maxX: number; minY: number; maxY: number } {
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     function extend(x: number, y: number) {
@@ -78,19 +86,15 @@
     const sizeX = Math.max(bounds.maxX - bounds.minX, 50);
     const sizeY = Math.max(bounds.maxY - bounds.minY, 50);
     const maxExtent = Math.max(sizeX, sizeY);
-    // Grid is 5x the model extent so user can pan far beyond the elements
     const gridSize = Math.max(maxExtent * 5, 200);
-    // 1 division per meter, clamped to 40..1000
     const divisions = Math.max(40, Math.min(1000, Math.round(gridSize)));
-    gridHelper = new THREE.GridHelper(gridSize, divisions, 0x333333, 0x222222);
-    // Center the grid on the model centroid
+    gridHelper = new THREE.GridHelper(gridSize, divisions, 0x333333, 0x1a1a1a);
     const cx = (bounds.minX + bounds.maxX) / 2;
     const cy = (bounds.minY + bounds.maxY) / 2;
     gridHelper.position.set(cx, -0.01, cy);
     group.add(gridHelper);
   }
 
-  // ─── Compute floor height H from model ───
   function computeH(): number {
     let H = 3.0;
     const heights: number[] = [];
@@ -112,15 +116,31 @@
     return inside;
   }
 
-  // ─── Update instanced mesh transforms from current model ───
+  // ─── Dynamic instanced mesh allocation ───
+  function ensureInstancedMesh(
+    mesh: THREE.InstancedMesh | null, geo: THREE.BufferGeometry,
+    mat: THREE.Material, count: number
+  ): THREE.InstancedMesh {
+    const needed = Math.max(1, Math.ceil(count * POOL_OVERALLOC));
+    if (!mesh || mesh.count > needed * 2 || mesh.count < count) {
+      if (mesh) { group.remove(mesh); mesh.dispose(); }
+      mesh = new THREE.InstancedMesh(geo, mat, needed);
+      mesh.frustumCulled = false;
+      group.add(mesh);
+    }
+    return mesh;
+  }
+
   function updateInstances() {
     const H = computeH();
+    const rectCols = model.columns.filter(c => c.shape !== 'circular');
+    const circCols = model.columns.filter(c => c.shape === 'circular');
 
-    // Rectangular columns
+    instRectCols = ensureInstancedMesh(instRectCols, boxGeo, colRectMat, rectCols.length);
+    instCircCols = ensureInstancedMesh(instCircCols, cylGeo, colCircMat, circCols.length);
+
     let ri = 0;
-    for (const col of model.columns) {
-      if (col.shape === 'circular') continue;
-      if (ri >= MAX_INST) break;
+    for (const col of rectCols) {
       _pos.set(px(col.position.x), col.height / 2, pz(col.position.y));
       _euler.set(0, col.rotation ? -col.rotation : 0, 0);
       _quat.setFromEuler(_euler);
@@ -130,20 +150,12 @@
       if (col.color) { _color.set(col.color); instRectCols.setColorAt(ri, _color); }
       ri++;
     }
-    // Hide remaining
-    for (; ri < MAX_INST; ri++) {
-      _m4.makeScale(0, 0, 0);
-      instRectCols.setMatrixAt(ri, _m4);
-    }
-    instRectCols.count = Math.min(model.columns.filter(c => c.shape !== 'circular').length, MAX_INST);
+    instRectCols.count = ri;
     instRectCols.instanceMatrix.needsUpdate = true;
     if (instRectCols.instanceColor) instRectCols.instanceColor.needsUpdate = true;
 
-    // Circular columns
     let ci = 0;
-    for (const col of model.columns) {
-      if (col.shape !== 'circular') continue;
-      if (ci >= MAX_INST) break;
+    for (const col of circCols) {
       const r = (col.diameter || col.width) / 2;
       _pos.set(px(col.position.x), col.height / 2, pz(col.position.y));
       _quat.identity();
@@ -153,18 +165,14 @@
       if (col.color) { _color.set(col.color); instCircCols.setColorAt(ci, _color); }
       ci++;
     }
-    for (; ci < MAX_INST; ci++) {
-      _m4.makeScale(0, 0, 0);
-      instCircCols.setMatrixAt(ci, _m4);
-    }
-    instCircCols.count = Math.min(model.columns.filter(c => c.shape === 'circular').length, MAX_INST);
+    instCircCols.count = ci;
     instCircCols.instanceMatrix.needsUpdate = true;
     if (instCircCols.instanceColor) instCircCols.instanceColor.needsUpdate = true;
 
-    // Beams (each segment is a separate instance because of varying depth/width)
+    const beamCount = model.beams.length;
+    instBeams = ensureInstancedMesh(instBeams, boxGeo, beamMat, beamCount);
     let bi = 0;
     for (const beam of model.beams) {
-      if (bi >= MAX_INST) break;
       const sx = px(beam.startPoint.x), sz = pz(beam.startPoint.y);
       const ex = px(beam.endPoint.x), ez = pz(beam.endPoint.y);
       const dx = ex - sx, dz = ez - sz;
@@ -178,17 +186,14 @@
       instBeams.setMatrixAt(bi, _m4);
       bi++;
     }
-    for (; bi < MAX_INST; bi++) {
-      _m4.makeScale(0, 0, 0);
-      instBeams.setMatrixAt(bi, _m4);
-    }
-    instBeams.count = Math.min(model.beams.length, MAX_INST);
+    instBeams.count = bi;
     instBeams.instanceMatrix.needsUpdate = true;
 
-    // Walls (shear walls + polyline wall segments share the same instanced mesh)
+    let wallCount = model.walls.length;
+    for (const pw of model.polylineWalls) wallCount += Math.max(0, pw.vertices.length - 1);
+    instWalls = ensureInstancedMesh(instWalls, boxGeo, wallMat, wallCount);
     let wi = 0;
     for (const wall of model.walls) {
-      if (wi >= MAX_INST) break;
       const sx = px(wall.startPoint.x), sz = pz(wall.startPoint.y);
       const ex = px(wall.endPoint.x), ez = pz(wall.endPoint.y);
       const dx = ex - sx, dz = ez - sz;
@@ -205,7 +210,6 @@
     }
     for (const pw of model.polylineWalls) {
       for (let i = 0; i < pw.vertices.length - 1; i++) {
-        if (wi >= MAX_INST) break;
         const a = pw.vertices[i], b = pw.vertices[i + 1];
         const sx = px(a.x), sz = pz(a.y);
         const ex = px(b.x), ez = pz(b.y);
@@ -222,97 +226,86 @@
         wi++;
       }
     }
-    for (; wi < MAX_INST; wi++) {
-      _m4.makeScale(0, 0, 0);
-      instWalls.setMatrixAt(wi, _m4);
-    }
-    instWalls.count = Math.min(
-      model.walls.length + model.polylineWalls.reduce((s, pw) => s + Math.max(0, pw.vertices.length - 1), 0),
-      MAX_INST
-    );
+    instWalls.count = wi;
     instWalls.instanceMatrix.needsUpdate = true;
     if (instWalls.instanceColor) instWalls.instanceColor.needsUpdate = true;
   }
 
-  // ─── Rebuild slab/drop-panel meshes + labels (individual because of polygon geometry) ───
-  let slabGroup: THREE.Group;
-  let femGroup: THREE.Group;
-
   function rebuildSlabsAndLabels() {
-    if (slabGroup) { group.remove(slabGroup); slabGroup.traverse(c => { const m = c as THREE.Mesh; if (m.geometry) m.geometry.dispose(); if (m.material) { const mat = m.material; Array.isArray(mat) ? mat.forEach(mm => mm.dispose()) : mat.dispose(); } }); }
+    if (slabGroup) { group.remove(slabGroup); slabGroup.traverse(c => { const m = c as THREE.Mesh; if (m.geometry) m.geometry.dispose(); const mat = m.material; if (mat) { Array.isArray(mat) ? mat.forEach(mm => mm.dispose()) : (mat as THREE.Material).dispose(); } }); }
     slabGroup = new THREE.Group();
     group.add(slabGroup);
 
     const H = computeH();
-
-    // ─── Slabs (merged geometry per slab — one draw call each, but no instancing needed for polygons) ───
     const slabWireMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.2 });
+
     for (const slab of model.slabs) {
       if (slab.vertices.length < 3) continue;
       const t = slab.thickness;
-      const n = slab.vertices.length;
       const topY = H + t;
-      const botY = H;
 
-      const verts: number[] = [];
-      const idx: number[] = [];
-      for (const v of slab.vertices) verts.push(px(v.x), topY, pz(v.y));
-      for (const v of slab.vertices) verts.push(px(v.x), botY, pz(v.y));
-      for (let i = 1; i < n - 1; i++) idx.push(0, i, i + 1);
-      for (let i = 1; i < n - 1; i++) idx.push(n, n + i + 1, n + i);
-      const sideBase = 2 * n;
-      for (let i = 0; i < n; i++) {
-        const j = (i + 1) % n;
-        const sb = sideBase + i * 4;
-        verts.push(
-          px(slab.vertices[i].x), topY, pz(slab.vertices[i].y),
-          px(slab.vertices[j].x), topY, pz(slab.vertices[j].y),
-          px(slab.vertices[j].x), botY, pz(slab.vertices[j].y),
-          px(slab.vertices[i].x), botY, pz(slab.vertices[i].y),
-        );
-        idx.push(sb, sb + 1, sb + 2, sb, sb + 2, sb + 3);
+      const shape = new THREE.Shape();
+      shape.moveTo(slab.vertices[0].x, -slab.vertices[0].y);
+      for (let i = 1; i < slab.vertices.length; i++) {
+        shape.lineTo(slab.vertices[i].x, -slab.vertices[i].y);
       }
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
-      geo.setIndex(idx);
-      geo.computeVertexNormals();
-      const color = slab.color ? parseInt(slab.color.replace('#', ''), 16) : 0x64748b;
-      const mat = new THREE.MeshPhongMaterial({ color, transparent: true, opacity: 0.45, side: THREE.DoubleSide });
-      slabGroup.add(new THREE.Mesh(geo, mat));
+      shape.closePath();
 
-      const pts = slab.vertices.map(v => new THREE.Vector3(px(v.x), topY + 0.03, pz(v.y)));
+      for (const hole of slab.holes || []) {
+        if (hole.length < 3) continue;
+        const holePath = new THREE.Path();
+        holePath.moveTo(hole[0].x, -hole[0].y);
+        for (let i = 1; i < hole.length; i++) {
+          holePath.lineTo(hole[i].x, -hole[i].y);
+        }
+        holePath.closePath();
+        shape.holes.push(holePath);
+      }
+
+      const geo = new THREE.ExtrudeGeometry(shape, { depth: t, bevelEnabled: false });
+      const color = slab.color ? parseInt(slab.color.replace('#', ''), 16) : 0x64748b;
+      const mat = new THREE.MeshStandardMaterial({ color, transparent: true, opacity: 0.4, side: THREE.DoubleSide, roughness: 0.85, metalness: 0.0 });
+      const mesh = new THREE.Mesh(geo, mat);
+      
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.y = H;
+      slabGroup.add(mesh);
+
+      // Draw wireframes
+      const pts = slab.vertices.map(v => new THREE.Vector3(v.x, topY + 0.01, v.y));
       pts.push(pts[0].clone());
       slabGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), slabWireMat));
+
+      for (const hole of slab.holes || []) {
+        if (hole.length < 3) continue;
+        const hpts = hole.map(v => new THREE.Vector3(v.x, topY + 0.01, v.y));
+        hpts.push(hpts[0].clone());
+        slabGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(hpts), slabWireMat));
+      }
     }
 
-    // ─── Drop panels ───
     for (const dp of model.dropPanels) {
       if (dp.vertices.length < 3) continue;
-      let slabT = 0.2;
-      for (const s of model.slabs) {
-        if (s.vertices.length >= 3 && pointInPolygon(dp.center.x, dp.center.y, s.vertices)) { slabT = s.thickness; break; }
-      }
-      const extraT = dp.drop - slabT;
+      const extraT = dp.drop;
       if (extraT <= 0) continue;
-      const n = dp.vertices.length;
-      const topY = H;
-      const botY = H - extraT;
-      const verts: number[] = [];
-      const idx: number[] = [];
-      for (const v of dp.vertices) verts.push(px(v.x), topY, pz(v.y));
-      for (const v of dp.vertices) verts.push(px(v.x), botY, pz(v.y));
-      for (let i = 1; i < n - 1; i++) idx.push(0, i, i + 1);
-      for (let i = 1; i < n - 1; i++) idx.push(n, n + i + 1, n + i);
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
-      geo.setIndex(idx);
-      geo.computeVertexNormals();
+
+      const shape = new THREE.Shape();
+      shape.moveTo(dp.vertices[0].x, -dp.vertices[0].y);
+      for (let i = 1; i < dp.vertices.length; i++) {
+        shape.lineTo(dp.vertices[i].x, -dp.vertices[i].y);
+      }
+      shape.closePath();
+
+      const geo = new THREE.ExtrudeGeometry(shape, { depth: extraT, bevelEnabled: false });
       const color = dp.color ? parseInt(dp.color.replace('#', ''), 16) : 0x475569;
-      const mat = new THREE.MeshPhongMaterial({ color, transparent: true, opacity: 0.4, side: THREE.DoubleSide });
-      slabGroup.add(new THREE.Mesh(geo, mat));
+      const mat = new THREE.MeshStandardMaterial({ color, transparent: true, opacity: 0.4, side: THREE.DoubleSide, roughness: 0.85, metalness: 0.0 });
+      const mesh = new THREE.Mesh(geo, mat);
+      
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.y = H - extraT;
+      slabGroup.add(mesh);
     }
 
-    // ─── Element labels ───
     if (uiState.showLabels) {
       function makeLabelSprite(text: string): THREE.Sprite {
         const canvas = document.createElement('canvas');
@@ -341,14 +334,6 @@
         s.position.set(px(mx), H + 0.2, pz(mz));
         slabGroup.add(s);
       }
-      for (const pw of model.polylineWalls) {
-        if (model.isHidden(pw.id)) continue;
-        let sx2 = 0, sy2 = 0;
-        for (const v of pw.vertices) { sx2 += v.x; sy2 += v.y; }
-        const s = makeLabelSprite(pw.label);
-        s.position.set(px(sx2 / pw.vertices.length), H + 0.2, pz(sy2 / pw.vertices.length));
-        slabGroup.add(s);
-      }
       for (const b of model.beams) {
         if (model.isHidden(b.id)) continue;
         const mx = (b.startPoint.x + b.endPoint.x) / 2;
@@ -366,15 +351,8 @@
         s.position.set(px(sx2 / sLab.vertices.length), H + sLab.thickness + 0.2, pz(sy2 / sLab.vertices.length));
         slabGroup.add(s);
       }
-      for (const dp of model.dropPanels) {
-        if (model.isHidden(dp.id)) continue;
-        const s = makeLabelSprite(dp.label);
-        s.position.set(px(dp.center.x), H + 0.2, pz(dp.center.y));
-        slabGroup.add(s);
-      }
     }
 
-    // ─── Plan Image Overlay ───
     if (uiState.show3DPlanOverlay && model.planImage) {
       const ppm = model.pixelsPerMeter || 100;
       if (ppm > 0) {
@@ -394,58 +372,120 @@
         slabGroup.add(new THREE.Mesh(overlayGeo, overlayMat));
       }
     }
+
+    if (uiState.showNodeNumbers || uiState.showElementNumbers) {
+      // Render node/element numbers via sprites (simplified: only on FEM mesh if available)
+    }
   }
 
-  // ─── Build FEM deflection mesh (merged BufferGeometry with vertex colors) ───
+  function resultValueForType(rt: string, nodeValues: Map<number, number>, nodeId: number): number {
+    return nodeValues.get(nodeId) ?? 0;
+  }
+
+  // ─── FEM contour mesh with all result types and color ramps ───
   function rebuildFEMMesh() {
-    if (femGroup) { group.remove(femGroup); femGroup.traverse(c => { const m = c as THREE.Mesh; if (m.geometry) m.geometry.dispose(); if (m.material) { const mat = m.material; Array.isArray(mat) ? mat.forEach(mm => mm.dispose()) : mat.dispose(); } }); }
+    if (femGroup) {
+      group.remove(femGroup);
+      femGroup.traverse(c => {
+        const m = c as THREE.Mesh;
+        if (m.geometry) m.geometry.dispose();
+        const mat = m.material;
+        if (mat) { Array.isArray(mat) ? mat.forEach(mm => mm.dispose()) : (mat as THREE.Material).dispose(); }
+      });
+    }
     femGroup = new THREE.Group();
-    femGroup.visible = femState.showFEMContour && femState.resultType === 'deflection' && femState.hasResults;
+    const showContour = femState.showFEMContour && femState.hasResults;
+    femGroup.visible = showContour;
     group.add(femGroup);
     femMesh = null;
 
-    if (!femGroup.visible) return;
+    // Toggle solid undeformed slab geometry so it doesn't clash with deformed mesh
+    if (slabGroup) {
+      slabGroup.visible = !showContour;
+    }
+
+    if (!showContour) return;
 
     const results = [...femState.slabResults.values()];
     if (results.length === 0) return;
 
+    const rt = femState.resultType;
     const allVerts: number[] = [];
     const allColors: number[] = [];
+    const lineVerts: number[] = [];
+    const ramp: ColorRampName = uiState.colorRamp;
 
-    // Global min/max deflection for color mapping
-    let globalMin = Infinity, globalMax = -Infinity;
-    for (const r of results) {
-      for (const d of r.nodeDeflections) {
-        const absWz = Math.abs(d.wz * 1000);
-        if (absWz < globalMin) globalMin = absWz;
-        if (absWz > globalMax) globalMax = absWz;
-      }
-    }
-    if (globalMax - globalMin < 1e-12) { globalMax = globalMin + 1; }
+    const cache = femState.contourCache;
+    const gMin = cache.globalMin;
+    const gMax = cache.globalMax;
+    const range = (gMax - gMin) || 1;
+    const H = computeH();
+
+    // Deformation scale factor
+    const deflScale = uiState.femAnimationEnabled
+      ? femState.deformedScale * (1 + 0.3 * Math.sin(animationTime * 2))
+      : femState.deformedScale;
 
     for (const result of results) {
-      const slab = model.slabs.find(s => s.id === result.slabId);
+      const slab = model.slabs.find(s => s.id === result.slabId || s.label === result.slabId);
       if (!slab || model.isHidden(result.slabId)) continue;
 
+      const perSlab = cache.perSlab.get(result.slabId);
+      if (!perSlab) continue;
+
+      const nodeValues = perSlab.nodeValues;
       const nodes = result.mesh.nodes;
+      const nodeMap = new Map(nodes.map(n => [n.id, n]));
       const deflMap = new Map(result.nodeDeflections.map(d => [d.nodeId, d.wz]));
-      const maxWz = Math.max(...result.nodeDeflections.map(d => Math.abs(d.wz)), 1e-6);
+
+      const thickness = slab.thickness || 0.2;
+      const topYBase = H + thickness;
+      const botYBase = H;
 
       for (const elem of result.mesh.elements) {
         const nids = elem.nodeIds;
         if (nids.length < 3) continue;
-        const coords = nids.map(nid => {
-          const n = nodes.find(nn => nn.id === nid);
-          const wz = deflMap.get(nid) || 0;
-          return { x: n!.x, y: n!.y, z: wz };
+
+        // Calculate 3D top & bottom coordinates for element nodes
+        const elemNodes = nids.map(nid => {
+          const n = nodeMap.get(nid);
+          const rawWz = deflMap.get(nid) || 0;
+          // Downward displacement magnitude (sagging downward)
+          const sag = rawWz * deflScale;
+
+          const x = n ? n.x : 0;
+          const z = n ? n.y : 0;
+          return {
+            nid,
+            top: { x, y: topYBase - sag, z },
+            bot: { x, y: botYBase - sag, z },
+          };
         });
 
+        // Triangulate element (Q4 -> 2 triangles, T3 -> 1 triangle)
         for (let k = 0; k < nids.length - 2; k++) {
-          const tri = [coords[0], coords[k + 1], coords[k + 2]];
-          for (const c of tri) {
-            allVerts.push(c.x, c.z * 150, c.y);
-            const normWz = c.z / maxWz;
-            allColors.push(0.1 + 0.9 * normWz, 0.2 + 0.6 * (1 - Math.abs(normWz)), 0.4 + 0.6 * (1 - normWz));
+          const triIndices = [0, k + 1, k + 2];
+          const triNodes = triIndices.map(idx => elemNodes[idx]);
+
+          // --- Top Face Triangles (With Contour Color Ramp) ---
+          for (const cn of triNodes) {
+            allVerts.push(cn.top.x, cn.top.y, cn.top.z);
+
+            const nodeVal = resultValueForType(rt, nodeValues, cn.nid);
+            let norm = (nodeVal - gMin) / range;
+            norm = Math.max(0, Math.min(1, norm));
+
+            const [r, g, b] = sampleRamp(ramp, norm);
+            allColors.push(r / 255, g / 255, b / 255);
+          }
+
+
+
+          // --- Top Surface Mesh Wireframe Overlay ---
+          for (let eIdx = 0; eIdx < 3; eIdx++) {
+            const c1 = triNodes[eIdx].top;
+            const c2 = triNodes[(eIdx + 1) % 3].top;
+            lineVerts.push(c1.x, c1.y + 0.001, c1.z, c2.x, c2.y + 0.001, c2.z);
           }
         }
       }
@@ -453,25 +493,192 @@
 
     if (allVerts.length === 0) return;
 
+    // Solid deformed 3D slab mesh
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
     geo.setAttribute('color', new THREE.Float32BufferAttribute(allColors, 3));
     geo.computeVertexNormals();
 
-    const mat = new THREE.MeshPhongMaterial({ vertexColors: true, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
+    const mat = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+      side: THREE.DoubleSide,
+      roughness: 0.5,
+      metalness: 0.05,
+    });
     femMesh = new THREE.Mesh(geo, mat);
     femGroup.add(femMesh);
+
+    // Sharp element edge wireframe overlay
+    if (lineVerts.length > 0) {
+      const lineGeo = new THREE.BufferGeometry();
+      lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(lineVerts, 3));
+      const lineMat = new THREE.LineBasicMaterial({
+        color: 0x000000,
+        transparent: true,
+        opacity: 0.3,
+      });
+      const lines = new THREE.LineSegments(lineGeo, lineMat);
+      femGroup.add(lines);
+    }
   }
 
-  // ─── Scene construction (grid + axes only — structural elements handled by instances + slabGroup) ───
+  /**
+   * Fast update: only recompute vertex colors for the current resultType/colorRamp.
+   * Does NOT rebuild geometry — just updates the color buffer attribute.
+   */
+  function updateFEMColors() {
+    if (!femMesh || !femMesh.geometry) return;
+    const results = [...femState.slabResults.values()];
+    if (results.length === 0) return;
+    const rt = femState.resultType;
+    const cache = femState.contourCache;
+    const gMin = cache.globalMin;
+    const gMax = cache.globalMax;
+    const range = (gMax - gMin) || 1;
+    const ramp: ColorRampName = uiState.colorRamp;
+    const allColors: number[] = [];
+
+    for (const result of results) {
+      const perSlab = cache.perSlab.get(result.slabId);
+      if (!perSlab) continue;
+      const nodeValues = perSlab.nodeValues;
+      for (const elem of result.mesh.elements) {
+        const nids = elem.nodeIds;
+        if (nids.length < 3) continue;
+        for (let k = 0; k < nids.length - 2; k++) {
+          const triIndices = [0, k + 1, k + 2];
+          for (const idx of triIndices) {
+            const nodeVal = nodeValues.get(nids[idx]) ?? 0;
+            let norm = (nodeVal - gMin) / range;
+            norm = Math.max(0, Math.min(1, norm));
+            const [r, g, b] = sampleRamp(ramp, norm);
+            allColors.push(r / 255, g / 255, b / 255);
+          }
+        }
+      }
+    }
+
+    if (allColors.length > 0) {
+      const colorAttr = femMesh.geometry.attributes.color;
+      if (colorAttr) {
+        (colorAttr.array as Float32Array).set(allColors);
+        colorAttr.needsUpdate = true;
+      } else {
+        femMesh.geometry.setAttribute('color', new THREE.Float32BufferAttribute(allColors, 3));
+      }
+    }
+  }
+
+  /**
+   * Fast update: only recompute vertex positions for current deformedScale/animation.
+   * Does NOT rebuild geometry — just updates the position buffer attribute.
+   */
+  function updateFEMDeformation() {
+    if (!femMesh || !femMesh.geometry) return;
+    const results = [...femState.slabResults.values()];
+    if (results.length === 0) return;
+    const H = computeH();
+    const deflScale = uiState.femAnimationEnabled
+      ? femState.deformedScale * (1 + 0.3 * Math.sin(animationTime * 2))
+      : femState.deformedScale;
+    const allVerts: number[] = [];
+
+    for (const result of results) {
+      const slab = model.slabs.find(s => s.id === result.slabId || s.label === result.slabId);
+      if (!slab || model.isHidden(result.slabId)) continue;
+      const deflMap = new Map(result.nodeDeflections.map(d => [d.nodeId, d.wz]));
+      const nodeMap = new Map(result.mesh.nodes.map(n => [n.id, n]));
+      const thickness = slab.thickness || 0.2;
+      const topYBase = H + thickness;
+      const botYBase = H;
+
+      for (const elem of result.mesh.elements) {
+        const nids = elem.nodeIds;
+        if (nids.length < 3) continue;
+        const elemNodes = nids.map(nid => {
+          const n = nodeMap.get(nid);
+          const rawWz = deflMap.get(nid) || 0;
+          const sag = rawWz * deflScale;
+          return {
+            top: { x: n ? n.x : 0, y: topYBase - sag, z: n ? n.y : 0 },
+            bot: { x: n ? n.x : 0, y: botYBase - sag, z: n ? n.y : 0 },
+          };
+        });
+        for (let k = 0; k < nids.length - 2; k++) {
+          const triIndices = [0, k + 1, k + 2];
+          for (const idx of triIndices) {
+            const cn = elemNodes[idx];
+            allVerts.push(cn.top.x, cn.top.y, cn.top.z);
+          }
+        }
+      }
+    }
+
+    if (allVerts.length > 0) {
+      const posAttr = femMesh.geometry.attributes.position;
+      if (posAttr) {
+        (posAttr.array as Float32Array).set(allVerts);
+        posAttr.needsUpdate = true;
+      }
+      femMesh.geometry.computeVertexNormals();
+    }
+  }
+
+  function rebuildReactions() {
+    if (reactionGroup) {
+      group.remove(reactionGroup);
+      reactionGroup.traverse(c => {
+        const m = c as THREE.Mesh;
+        if (m.geometry) m.geometry.dispose();
+        const mat = m.material;
+        if (mat) { Array.isArray(mat) ? mat.forEach(mm => mm.dispose()) : (mat as THREE.Material).dispose(); }
+      });
+    }
+    reactionGroup = new THREE.Group();
+    group.add(reactionGroup);
+  }
+
+  function rebuildLoads() {
+    if (loadGroup) {
+      group.remove(loadGroup);
+      loadGroup.traverse(c => {
+        const m = c as THREE.Mesh;
+        if (m.geometry) m.geometry.dispose();
+        const mat = m.material;
+        if (mat) { Array.isArray(mat) ? mat.forEach(mm => mm.dispose()) : (mat as THREE.Material).dispose(); }
+      });
+    }
+    loadGroup = new THREE.Group();
+    group.add(loadGroup);
+  }
+
+  function applyViewPreset() {
+    if (!camera || !controls) return;
+    const bounds = computeModelBounds();
+    const cx = (bounds.minX + bounds.maxX) / 2;
+    const cy = (bounds.minY + bounds.maxY) / 2;
+    const maxDim = Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, 20);
+    const dist = maxDim * 1.5;
+    switch (uiState.viewPreset) {
+      case 'top': camera.position.set(cx, dist * 2, cy); break;
+      case 'front': camera.position.set(cx, maxDim * 0.5, cy + dist); break;
+      case 'side': camera.position.set(cx + dist, maxDim * 0.5, cy); break;
+      case 'iso': camera.position.set(cx + dist * 0.7, maxDim * 0.8, cy + dist * 0.7); break;
+      default: camera.position.set(cx + dist * 0.7, maxDim * 0.8, cy + dist * 0.7); break;
+    }
+    controls.target.set(cx, 0, cy);
+    controls.update();
+    markRender();
+  }
+
   function buildBase() {
     if (!scene) return;
     scene.background = new THREE.Color(themeColors().bg);
     group = new THREE.Group();
     scene.add(group);
-
-    const axLen = 4;
-    group.add(new THREE.AxesHelper(axLen));
+    group.add(new THREE.AxesHelper(4));
 
     rebuildGrid();
 
@@ -492,49 +699,23 @@
       sprite.scale.set(0.6, 0.3, 1);
       return sprite;
     }
-    group.add(axLine(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(axLen, 0.02, 0), 0xff4444));
-    const xLabel = makeTextSprite('X', '#ff4444');
-    xLabel.position.set(axLen + 0.3, 0.02, 0);
-    group.add(xLabel);
-    group.add(axLine(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(0, 0.02, axLen), 0x44ff44));
-    const yLabel = makeTextSprite('Y', '#44ff44');
-    yLabel.position.set(0, 0.02, axLen + 0.3);
-    group.add(yLabel);
-    group.add(axLine(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, axLen, 0), 0x4444ff));
-    const zLabel = makeTextSprite('Z', '#4444ff');
-    zLabel.position.set(0, axLen + 0.3, 0);
-    group.add(zLabel);
+    group.add(axLine(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(4, 0.02, 0), 0xff4444));
+    const xLabel = makeTextSprite('X', '#ff4444'); xLabel.position.set(4.3, 0.02, 0); group.add(xLabel);
+    group.add(axLine(new THREE.Vector3(0, 0.02, 0), new THREE.Vector3(0, 0.02, 4), 0x44ff44));
+    const yLabel = makeTextSprite('Y', '#44ff44'); yLabel.position.set(0, 0.02, 4.3); group.add(yLabel);
+    group.add(axLine(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 4, 0), 0x4444ff));
+    const zLabel = makeTextSprite('Z', '#4444ff'); zLabel.position.set(0, 4.3, 0); group.add(zLabel);
 
-    // Instanced meshes for columns/beams/walls (created once)
-    instRectCols = new THREE.InstancedMesh(boxGeo, colRectMat, MAX_INST);
-    instRectCols.count = 0;
-    instRectCols.frustumCulled = false;
-    group.add(instRectCols);
-
-    instCircCols = new THREE.InstancedMesh(cylGeo, colCircMat, MAX_INST);
-    instCircCols.count = 0;
-    instCircCols.frustumCulled = false;
-    group.add(instCircCols);
-
-    instBeams = new THREE.InstancedMesh(boxGeo, beamMat, MAX_INST);
-    instBeams.count = 0;
-    instBeams.frustumCulled = false;
-    group.add(instBeams);
-
-    instWalls = new THREE.InstancedMesh(boxGeo, wallMat, MAX_INST);
-    instWalls.count = 0;
-    instWalls.frustumCulled = false;
-    group.add(instWalls);
-
-    // Slab/drop-panel group + FEM group
-    slabGroup = new THREE.Group();
-    group.add(slabGroup);
-    femGroup = new THREE.Group();
-    femGroup.visible = false;
-    group.add(femGroup);
+    slabGroup = new THREE.Group(); group.add(slabGroup);
+    femGroup = new THREE.Group(); femGroup.visible = false; group.add(femGroup);
+    reactionGroup = new THREE.Group(); group.add(reactionGroup);
+    loadGroup = new THREE.Group(); group.add(loadGroup);
 
     updateInstances();
     rebuildSlabsAndLabels();
+    rebuildFEMMesh();
+    rebuildReactions();
+    rebuildLoads();
   }
 
   function onResize() {
@@ -542,45 +723,34 @@
     renderer.setSize(container.clientWidth, container.clientHeight);
     camera.aspect = container.clientWidth / container.clientHeight;
     camera.updateProjectionMatrix();
+    markRender();
   }
 
   function animate() {
     animId = requestAnimationFrame(animate);
+    if (uiState.femAnimationEnabled) {
+      animationTime += 0.016;
+      if (femState.showFEMContour && femMesh && femMesh.geometry) updateFEMDeformation();
+    }
     controls.update();
-    renderer.render(scene, camera);
+    if (needsRender || uiState.femAnimationEnabled) {
+      renderer.render(scene, camera);
+      needsRender = false;
+    }
   }
 
   $effect(() => {
     uiState.theme;
-    if (scene) scene.background = new THREE.Color(themeColors().bg);
+    if (scene) { scene.background = new THREE.Color(themeColors().bg); markRender(); }
   });
-
-  onMount(() => {
-    requestAnimationFrame(() => requestAnimationFrame(() => initThree()));
-  });
-
-  /** Auto-fit camera and controls to current model bounds */
-  function fitCameraToModel() {
-    if (!camera || !controls) return;
-    const bounds = computeModelBounds();
-    const cx = (bounds.minX + bounds.maxX) / 2;
-    const cy = (bounds.minY + bounds.maxY) / 2;
-    const maxDim = Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, 20);
-    const dist = maxDim * 1.5;
-    camera.position.set(cx + dist * 0.7, maxDim * 0.8, cy + dist * 0.7);
-    camera.far = Math.max(50000, maxDim * 20);
-    camera.updateProjectionMatrix();
-    controls.target.set(cx, 0, cy);
-    controls.maxDistance = Math.max(maxDim * 10, 500);
-    controls.update();
-  }
 
   function initThree() {
     if (!container || container.clientWidth === 0 || container.clientHeight === 0) return;
-
     renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(renderer.domElement);
 
     scene = new THREE.Scene();
@@ -596,11 +766,15 @@
     camera.position.set(cx + dist * 0.7, maxDim * 0.8, cy + dist * 0.7);
     camera.lookAt(cx, 0, cy);
 
-    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
     dir.position.set(maxDim, maxDim * 2, maxDim * 0.8);
+    dir.castShadow = true;
+    dir.shadow.mapSize.set(2048, 2048);
+    dir.shadow.camera.near = 0.5;
+    dir.shadow.camera.far = maxDim * 10;
     scene.add(dir);
-    scene.add(new THREE.HemisphereLight(0x88aaff, 0x444444, 0.4));
+    scene.add(new THREE.HemisphereLight(themeColors().hemi, themeColors().hemiGround, 0.5));
 
     controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
@@ -609,6 +783,10 @@
     controls.target.set(cx, 0, cy);
     controls.minDistance = 0.5;
     controls.maxDistance = Math.max(maxDim * 10, 500);
+    controls.addEventListener('change', markRender);
+    controls.addEventListener('start', () => {
+      uiState.viewPreset = 'perspective';
+    });
 
     buildBase();
     mounted = true;
@@ -616,31 +794,67 @@
     window.addEventListener('resize', onResize);
   }
 
+  onMount(() => {
+    requestAnimationFrame(() => requestAnimationFrame(() => initThree()));
+  });
+
   onDestroy(() => {
     window.removeEventListener('resize', onResize);
     cancelAnimationFrame(animId);
     renderer?.dispose();
   });
 
-  // Model change → update instance matrices + rebuild slabs/labels
+  // Model change → update instances + slabs
   $effect(() => {
     model.slabs; model.columns; model.walls; model.polylineWalls;
-    model.beams; model.dropPanels;
-    model.planImage; model.isCalibrated; model.pixelsPerMeter;
+    model.beams; model.dropPanels; model.planImage; model.isCalibrated; model.pixelsPerMeter;
     uiState.show3DPlanOverlay; uiState.showLabels;
     if (mounted && group && scene) {
       updateInstances();
       rebuildSlabsAndLabels();
       rebuildGrid();
+      markRender();
     }
   });
 
-  // FEM results change → rebuild deflection mesh only
+  // FEM results changed → rebuild geometry from scratch
   $effect(() => {
     const r = [...femState.slabResults.values()];
-    femState.showFEMContour; femState.resultType;
-    if (mounted && group && femGroup) {
+    femState.showFEMContour;
+    if (mounted && group) {
       rebuildFEMMesh();
+      rebuildReactions();
+      rebuildLoads();
+      markRender();
+    }
+  });
+
+  // Result type / display settings → just update colors (fast, no geometry rebuild)
+  $effect(() => {
+    femState.resultType; uiState.colorRamp;
+    // Only run if we already have a mesh with geometry
+    if (mounted && femMesh && femMesh.geometry) {
+      updateFEMColors();
+      markRender();
+    }
+  });
+
+  // Deformed scale / animation → just update positions (fast, no geometry rebuild)
+  $effect(() => {
+    femState.deformedScale; uiState.femAnimationEnabled; animationTime;
+    if (mounted && femMesh && femMesh.geometry) {
+      updateFEMDeformation();
+      markRender();
+    }
+  });
+
+  // View preset / reset view
+  $effect(() => {
+    uiState.viewPreset;
+    uiState.resetViewTrigger;
+    if (mounted) {
+      if (uiState.viewPreset !== 'perspective') applyViewPreset();
+      markRender();
     }
   });
 </script>

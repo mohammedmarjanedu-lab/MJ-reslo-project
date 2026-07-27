@@ -16,6 +16,7 @@ export interface SlabPolygon {
   concreteGrade?: string;
   color?: string;
   crackingModifier?: number;
+  discontinuousEdges?: { startPoint: Point2D; endPoint: Point2D }[];
 }
 
 export type BoundaryCondition = 'fixed-fixed' | 'fixed-free';
@@ -170,6 +171,56 @@ export interface FEMMembraneResult {
   angle: number;
 }
 
+export interface WoodArmerMoment {
+  elementId: number;
+  mx_top: number;
+  my_top: number;
+  mx_bot: number;
+  my_bot: number;
+}
+
+export interface ReinforcementDesign {
+  elementId: number;
+  ast_x_top: number;
+  ast_y_top: number;
+  ast_x_bot: number;
+  ast_y_bot: number;
+  ast_x_top_spacing: number;
+  ast_y_top_spacing: number;
+  ast_x_bot_spacing: number;
+  ast_y_bot_spacing: number;
+  bar_dia: number;
+  status: 'OK' | 'WARNING' | 'FAIL';
+}
+
+export interface ShearDesign {
+  elementId: number;
+  tau_v: number;
+  tau_c: number;
+  ratio: number;
+  status: 'OK' | 'WARNING' | 'FAIL';
+  requireShearReinforcement: boolean;
+}
+
+export interface CrackWidthResult {
+  elementId: number;
+  crackWidth: number;
+  limit: number;
+  status: 'OK' | 'WARNING' | 'FAIL';
+}
+
+export interface DeflectionCheckResult {
+  slabId: string;
+  maxDeflection: number;
+  span: number;
+  spanRatio: number;
+  limitRatio: number;
+  shortTermStatus: 'OK' | 'WARNING' | 'FAIL';
+  longTermDeflection: number;
+  longTermRatio: number;
+  longTermStatus: 'OK' | 'WARNING' | 'FAIL';
+}
+
 export interface SlabFEMResult {
   slabId: string;
   mesh: FEMMesh;
@@ -181,12 +232,19 @@ export interface SlabFEMResult {
   shears?: FEMShearResult[];
   membraneForces?: FEMMembraneResult[];
   columnPunching?: ColumnPunchingResult[];
+  woodArmer?: WoodArmerMoment[];
+  reinforcement?: ReinforcementDesign[];
+  shearDesign?: ShearDesign[];
+  crackWidth?: CrackWidthResult[];
+  deflectionCheck?: DeflectionCheckResult;
   minWz: number;
   maxWz: number;
   minMx: number;
   maxMx: number;
   minMy: number;
   maxMy: number;
+  minMxy?: number;
+  maxMxy?: number;
   minVx?: number;
   maxVx?: number;
   minVy?: number;
@@ -197,6 +255,16 @@ export interface SlabFEMResult {
   maxNy?: number;
   minNxy?: number;
   maxNxy?: number;
+  minAstXTop?: number;
+  maxAstXTop?: number;
+  minAstYTop?: number;
+  maxAstYTop?: number;
+  minAstXBot?: number;
+  maxAstXBot?: number;
+  minAstYBot?: number;
+  maxAstYBot?: number;
+  minCrack?: number;
+  maxCrack?: number;
   crX?: number;
   crY?: number;
 }
@@ -210,7 +278,29 @@ export interface ColumnPunchingResult {
   status: 'OK' | 'WARNING' | 'FAIL';
 }
 
-export type FEMResultType = 'deflection' | 'mx' | 'my' | 'mxy' | 'stress_s1' | 'stress_s2' | 'stress_vm' | 'shear_vx' | 'shear_vy' | 'shear_v1' | 'membrane_nx' | 'membrane_ny' | 'membrane_nxy' | 'membrane_n1' | 'punching';
+export type FEMResultType = 'deflection' | 'mx' | 'my' | 'mxy' | 'stress_s1' | 'stress_s2' | 'stress_vm' | 'shear_vx' | 'shear_vy' | 'shear_v1' | 'membrane_nx' | 'membrane_ny' | 'membrane_nxy' | 'membrane_n1' | 'punching' | 'ast_x_top' | 'ast_x_bot' | 'ast_y_top' | 'ast_y_bot' | 'ast_max' | 'crack_width' | 'deflection_check';
+
+export type ColorRampName = 'jet' | 'viridis' | 'diverging' | 'thermal' | 'cool_warm';
+
+export type LoadCaseName = 'DL' | 'LL' | 'PL' | 'WL' | 'EQ' | 'user';
+
+export interface LoadCase {
+  id: string;
+  name: LoadCaseName;
+  label: string;
+  selfWeightFactor: number;
+  liveLoadFactor: number;
+  partitionLoadFactor: number;
+  active: boolean;
+}
+
+export interface LoadCombination {
+  id: string;
+  label: string;
+  description: string;
+  factors: { loadCaseId: string; factor: number }[];
+  isServiceLoad: boolean;
+}
 
 export interface Dimension {
   id: string;
@@ -337,6 +427,14 @@ export interface FEMWorkerInput {
   meshSize: number;
   poissonRatio: number;
   useQ8: boolean;
+  designOptions?: {
+    concreteGrade?: string;
+    steelGrade?: string;
+    cover?: number;
+    barDia?: number;
+    exposureLimit?: number;
+    longTermFactor?: number;
+  };
 }
 
 export type FEMWorkerOutput =

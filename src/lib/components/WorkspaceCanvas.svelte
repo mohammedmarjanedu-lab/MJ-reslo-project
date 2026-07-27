@@ -5,7 +5,7 @@
   import { femState } from '../stores/femResults.svelte';
   import { drawBackground, drawPlanImage, drawGrid, drawAxes, drawSlabs, drawColumn, drawColumnSelected, drawColumnDisconnected, drawShearWall, drawShearWallSelected, drawShearWallDisconnected, drawPolylineWall, drawPolylineWallSelected, drawNonStructuralWall, drawNonStructuralWallSelected, drawNonStructuralPolylineWall, drawNonStructuralPolylineWallSelected, drawNonStructuralWallPreview, drawBeam, drawBeamSelected, drawDropPanel, drawDropPanelSelected, drawDropPanelPreview, drawCMmarker, drawCRmarker, drawEccentricityVector, drawCalibrationLine, drawColumnPreview, drawWallPreview, drawBeamPreview, drawSelectionRect, drawDimensionLabel, drawMeasureLine, drawDimensions, drawFEMContour, drawFEMMesh, drawColorLegend, drawDeformedShape, sampleFEMResultAtPoint, drawPunchingMarkers, drawSnapCoordinateLabel, drawElementLabels, drawUnconnectedJointNode } from '../canvas/renderer';
   import { hitTestColumns, hitTestWalls, hitTestPolylineWalls, hitTestNonStructuralWalls, hitTestPolylineNonStructuralWalls, hitTestBeams, hitTestSlabs, hitTestDropPanels, hitTestDimensions } from '../canvas/hitTester';
-  import { distance, computeGlobalMetrics } from '../engine/mathEngine';
+  import { distance, pointInPolygon, pointToSegmentDistance, computeGlobalMetrics } from '../engine/mathEngine';
   import { floorLayers } from '../stores/floorLayers.svelte';
   import { loadPlanFile, loadPDFPages } from '../imageUploader';
   import type { Point2D } from '../engine/types';
@@ -119,6 +119,12 @@
     model.hiddenElementIds;
     uiState.selectedElementIds;
     uiState.selectedHoleIndex;
+    uiState.showSlabs;
+    uiState.showColumns;
+    uiState.showWalls;
+    uiState.showBeams;
+    uiState.showDropPanels;
+    uiState.showNonStructuralWalls;
     femState.slabResults;
     femState.resultType;
     femState.deformedScale;
@@ -174,17 +180,41 @@
     for (let i = 0; i < joints.length; i++) {
       const j1 = joints[i];
       let connected = false;
-      for (let k = 0; k < joints.length; k++) {
-        if (i === k) continue;
-        const j2 = joints[k];
-        if (j1.elementId !== j2.elementId) {
-          const dist = Math.hypot(j1.x - j2.x, j1.y - j2.y);
-          if (dist < TOL) {
+
+      // Check if joint is inside or near any slab polygon
+      for (const s of model.slabs) {
+        if (model.isHidden(s.id)) continue;
+        if (s.vertices && s.vertices.length >= 3) {
+          if (pointInPolygon({ x: j1.x, y: j1.y }, s.vertices)) {
             connected = true;
             break;
           }
+          for (let v = 0; v < s.vertices.length; v++) {
+            const v1 = s.vertices[v];
+            const v2 = s.vertices[(v + 1) % s.vertices.length];
+            if (pointToSegmentDistance({ x: j1.x, y: j1.y }, v1, v2) < 0.20) {
+              connected = true;
+              break;
+            }
+          }
+          if (connected) break;
         }
       }
+
+      if (!connected) {
+        for (let k = 0; k < joints.length; k++) {
+          if (i === k) continue;
+          const j2 = joints[k];
+          if (j1.elementId !== j2.elementId) {
+            const dist = Math.hypot(j1.x - j2.x, j1.y - j2.y);
+            if (dist < TOL) {
+              connected = true;
+              break;
+            }
+          }
+        }
+      }
+
       if (!connected) {
         unconnected.push({ x: j1.x, y: j1.y, elementId: j1.elementId });
       }
@@ -332,14 +362,34 @@
 
   let shiftHeld = $state(false);
   let contextHoleInfo: { slabId: string; holeIndex: number } | null = $state(null);
-  let canvasDragFileOver = $state(false);
+  let lastMouseEvent: MouseEvent | null = null;
 
   function orthoPoint(start: Point2D, mouse: Point2D, shift: boolean): Point2D {
     if (!shift) return { ...mouse };
-    const dx = Math.abs(mouse.x - start.x);
-    const dy = Math.abs(mouse.y - start.y);
-    if (dx > dy) return { x: mouse.x, y: start.y };
-    return { x: start.x, y: mouse.y };
+    const dx = mouse.x - start.x;
+    const dy = mouse.y - start.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1e-6) return { ...mouse };
+    const angle = Math.atan2(dy, dx);
+    const step = Math.PI / 4; // 45-degree angle snapping (0°, 45°, 90°, 135°, 180°, etc.)
+    const snappedAngle = Math.round(angle / step) * step;
+    return {
+      x: start.x + dist * Math.cos(snappedAngle),
+      y: start.y + dist * Math.sin(snappedAngle)
+    };
+  }
+
+  function orthoVector(dx: number, dy: number, shift: boolean): { dx: number; dy: number } {
+    if (!shift) return { dx, dy };
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1e-6) return { dx, dy };
+    const angle = Math.atan2(dy, dx);
+    const step = Math.PI / 4; // 45-degree angle snapping
+    const snappedAngle = Math.round(angle / step) * step;
+    return {
+      dx: dist * Math.cos(snappedAngle),
+      dy: dist * Math.sin(snappedAngle)
+    };
   }
 
   // --- Snap geometry helpers (AutoCAD-style) ---
@@ -474,12 +524,18 @@
       if (d < minDist) { minDist = d; bestSnap = mid; snapTypeName = 'Midpoint'; snapped = true; }
     }
 
-    // Priority 3: Intersection snap (skip during drag for performance — O(n²) is too expensive at 60fps)
-    const isDragging = localDrag.type.startsWith('dragging');
-    if (!isDragging && edges.length < 200) {
+    // Priority 3: Intersection snap (with spatial bounding-box filter for high performance)
+    if (edges.length < 300) {
+      const SEARCH_R = 2.5; // 2.5m spatial bounding box
       for (let i = 0; i < edges.length; i++) {
+        const e1 = edges[i];
+        const m1x = (e1.a.x + e1.b.x) / 2, m1y = (e1.a.y + e1.b.y) / 2;
+        if (Math.abs(m1x - mouse.x) > SEARCH_R || Math.abs(m1y - mouse.y) > SEARCH_R) continue;
         for (let j = i + 1; j < edges.length; j++) {
-          const inter = segmentIntersection(edges[i].a, edges[i].b, edges[j].a, edges[j].b);
+          const e2 = edges[j];
+          const m2x = (e2.a.x + e2.b.x) / 2, m2y = (e2.a.y + e2.b.y) / 2;
+          if (Math.abs(m2x - mouse.x) > SEARCH_R || Math.abs(m2y - mouse.y) > SEARCH_R) continue;
+          const inter = segmentIntersection(e1.a, e1.b, e2.a, e2.b);
           if (inter) {
             const d = distance(mouse, inter);
             if (d < minDist) { minDist = d; bestSnap = { ...inter }; snapTypeName = 'Intersection'; snapped = true; }
@@ -678,8 +734,8 @@
 
       // 2. Render each active slab's contour using the unified global scale
       for (const [slabId, result] of femState.slabResults) {
-        const slab = model.slabs.find(s => s.id === slabId);
-        if (!slab || !visibleSlabIds.has(slabId)) continue;
+        const slab = model.slabs.find(s => s.id === slabId || s.label === slabId);
+        if (!slab || (model.isHidden(slab.id))) continue;
         const nodeValues = cache.perSlab.get(slabId)?.nodeValues ?? new Map<number, number>();
 
         ctx.save();
@@ -699,7 +755,7 @@
         ctx.clip('evenodd');
 
         if (globalMax !== globalMin) {
-          drawFEMContour(ctx, result.mesh, nodeValues, globalMin, globalMax, 0.75, 3, femState.resultType === 'deflection');
+          drawFEMContour(ctx, result.mesh, nodeValues, globalMin, globalMax, 0.75, 3, false);
         }
         if (femState.resultType === 'punching' && result.columnPunching && result.columnPunching.length > 0) {
           drawPunchingMarkers(ctx, result.mesh, model.columns, result.columnPunching);
@@ -716,20 +772,10 @@
         const legendX = (W - legendW) / 2;
         const legendY = H - 60;
 
-        let label = '';
-        switch (femState.resultType) {
-          case 'deflection': label = `Defl (${unitMap.deflection})`; break;
-          case 'mx': label = `Mx (${unitMap.mx})`; break;
-          case 'my': label = `My (${unitMap.my})`; break;
-          case 'mxy': label = `Mxy (${unitMap.mxy})`; break;
-          case 'punching': label = 'Punching Ratio'; break;
-          default:
-            label = `${femState.resultType === 'stress_s1' ? 'σ₁' : femState.resultType === 'stress_s2' ? 'σ₂' : 'σᵥₘ'} (${unitMap.stress_vm})`;
-            break;
-        }
+        const label = 'Deflection (mm)';
 
         if (globalMax !== globalMin) {
-          drawColorLegend(ctx, legendX, legendY, legendW, legendH, globalMin, globalMax, label, undefined, femState.resultType === 'deflection');
+          drawColorLegend(ctx, legendX, legendY, legendW, legendH, globalMin, globalMax, label, undefined, false);
         }
 
         ctx.setTransform(ppm * z, 0, 0, -ppm * z, ox, oy);
@@ -872,10 +918,12 @@
       drawDimensionLabel(ctx, { x: midX, y: midY - 0.3 }, `L=${wallLen.toFixed(2)}m  ${angle.toFixed(1)}°`);
     }
 
-    if (localDrag.type === 'drawingWallPolyline' && localDrag.verts.length > 0) {
+    if ((localDrag.type === 'drawingWallPolyline' || localDrag.type === 'drawingNonStructuralWallPolyline') && localDrag.verts.length > 0) {
       const startPt = localDrag.verts[localDrag.verts.length - 1];
       const currentMouseWorld = getSnappedPoint(mouseWorld, startPt, shiftHeld);
-      ctx.strokeStyle = '#EF4444'; ctx.lineWidth = 0.03;
+      const isNSW = localDrag.type === 'drawingNonStructuralWallPolyline';
+      const color = isNSW ? '#f97316' : '#EF4444';
+      ctx.strokeStyle = color; ctx.lineWidth = 0.03;
       ctx.setLineDash([0.08, 0.06]);
       ctx.beginPath();
       ctx.moveTo(localDrag.verts[0].x, localDrag.verts[0].y);
@@ -884,7 +932,7 @@
       ctx.stroke(); ctx.setLineDash([]);
       for (const v of localDrag.verts) {
         ctx.beginPath(); ctx.arc(v.x, v.y, 0.06, 0, Math.PI * 2);
-        ctx.fillStyle = '#EF4444'; ctx.fill();
+        ctx.fillStyle = color; ctx.fill();
       }
       const d = distance(startPt, currentMouseWorld);
       drawDimensionLabel(ctx, { x: (startPt.x + currentMouseWorld.x) / 2, y: (startPt.y + currentMouseWorld.y) / 2 - 0.3 }, `L=${d.toFixed(2)}m`);
@@ -976,7 +1024,7 @@
     }
 
     if (localDrag.type === 'idle') {
-      if (['wall', 'beam', 'slab', 'opening', 'calibrate', 'measure'].includes(uiState.tool)) {
+      if (['wall', 'nonStructuralWall', 'beam', 'slab', 'opening', 'calibrate', 'measure'].includes(uiState.tool)) {
         getSnappedPoint(mouseWorld, undefined, false);
       }
     }
@@ -1555,6 +1603,7 @@
   }
 
   function handleMouseMove(e: MouseEvent): void {
+    lastMouseEvent = e;
     dirty = true;
     shiftHeld = e.shiftKey;
     const rect = canvasEl.getBoundingClientRect();
@@ -1682,7 +1731,7 @@
       const col = model.columns.find(c => c.id === drag.id);
       if (col) {
         const rawPos = { x: world.x - drag.offset.x, y: world.y - drag.offset.y };
-        const snappedPos = getSnappedPoint(rawPos, undefined, false);
+        const snappedPos = getSnappedPoint(rawPos, col.position, e.shiftKey || shiftHeld);
         model.updateColumn(drag.id, { position: snappedPos });
       }
       return;
@@ -1693,16 +1742,18 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const wall = model.walls.find(w => w.id === drag.id);
       const nsWall = wall ? null : model.nonStructuralWalls.find(w => w.id === drag.id);
+      let dx = world.x - drag.offset.x - (wall ? (wall.startPoint.x + wall.endPoint.x) / 2 : (nsWall!.startPoint.x + nsWall!.endPoint.x) / 2);
+      let dy = world.y - drag.offset.y - (wall ? (wall.startPoint.y + wall.endPoint.y) / 2 : (nsWall!.startPoint.y + nsWall!.endPoint.y) / 2);
+      if (e.shiftKey || shiftHeld) {
+        if (Math.abs(dx) > Math.abs(dy)) dy = 0;
+        else dx = 0;
+      }
       if (wall) {
-        const dx = world.x - drag.offset.x - (wall.startPoint.x + wall.endPoint.x) / 2;
-        const dy = world.y - drag.offset.y - (wall.startPoint.y + wall.endPoint.y) / 2;
         model.updateWall(drag.id, {
           startPoint: { x: wall.startPoint.x + dx, y: wall.startPoint.y + dy },
           endPoint: { x: wall.endPoint.x + dx, y: wall.endPoint.y + dy },
         });
       } else if (nsWall) {
-        const dx = world.x - drag.offset.x - (nsWall.startPoint.x + nsWall.endPoint.x) / 2;
-        const dy = world.y - drag.offset.y - (nsWall.startPoint.y + nsWall.endPoint.y) / 2;
         model.updateNonStructuralWall(drag.id, {
           startPoint: { x: nsWall.startPoint.x + dx, y: nsWall.startPoint.y + dy },
           endPoint: { x: nsWall.endPoint.x + dx, y: nsWall.endPoint.y + dy },
@@ -1716,8 +1767,8 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const wall = model.walls.find(w => w.id === drag.id);
       const nsWall = wall ? null : model.nonStructuralWalls.find(w => w.id === drag.id);
-      if (wall) { const pt = getSnappedPoint(world, wall.endPoint, e.shiftKey); model.updateWall(drag.id, { startPoint: pt }); }
-      else if (nsWall) { const pt = getSnappedPoint(world, nsWall.endPoint, e.shiftKey); model.updateNonStructuralWall(drag.id, { startPoint: pt }); }
+      if (wall) { const pt = getSnappedPoint(world, wall.endPoint, e.shiftKey || shiftHeld); model.updateWall(drag.id, { startPoint: pt }); }
+      else if (nsWall) { const pt = getSnappedPoint(world, nsWall.endPoint, e.shiftKey || shiftHeld); model.updateNonStructuralWall(drag.id, { startPoint: pt }); }
       return;
     }
 
@@ -1726,8 +1777,8 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const wall = model.walls.find(w => w.id === drag.id);
       const nsWall = wall ? null : model.nonStructuralWalls.find(w => w.id === drag.id);
-      if (wall) { const pt = getSnappedPoint(world, wall.startPoint, e.shiftKey); model.updateWall(drag.id, { endPoint: pt }); }
-      else if (nsWall) { const pt = getSnappedPoint(world, nsWall.startPoint, e.shiftKey); model.updateNonStructuralWall(drag.id, { endPoint: pt }); }
+      if (wall) { const pt = getSnappedPoint(world, wall.startPoint, e.shiftKey || shiftHeld); model.updateWall(drag.id, { endPoint: pt }); }
+      else if (nsWall) { const pt = getSnappedPoint(world, nsWall.startPoint, e.shiftKey || shiftHeld); model.updateNonStructuralWall(drag.id, { endPoint: pt }); }
       return;
     }
 
@@ -1739,7 +1790,7 @@
         const origV = drag.startVerts[drag.vertexIndex];
         let dx = world.x - origV.x;
         let dy = world.y - origV.y;
-        if (e.shiftKey) {
+        if (e.shiftKey || shiftHeld) {
           if (Math.abs(dx) > Math.abs(dy)) dy = 0;
           else dx = 0;
         }
@@ -1756,8 +1807,12 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const beam = model.beams.find(b => b.id === drag.id);
       if (beam) {
-        const dx = world.x - drag.offset.x - (beam.startPoint.x + beam.endPoint.x) / 2;
-        const dy = world.y - drag.offset.y - (beam.startPoint.y + beam.endPoint.y) / 2;
+        let dx = world.x - drag.offset.x - (beam.startPoint.x + beam.endPoint.x) / 2;
+        let dy = world.y - drag.offset.y - (beam.startPoint.y + beam.endPoint.y) / 2;
+        if (e.shiftKey || shiftHeld) {
+          if (Math.abs(dx) > Math.abs(dy)) dy = 0;
+          else dx = 0;
+        }
         model.updateBeam(drag.id, {
           startPoint: { x: beam.startPoint.x + dx, y: beam.startPoint.y + dy },
           endPoint: { x: beam.endPoint.x + dx, y: beam.endPoint.y + dy },
@@ -1770,7 +1825,7 @@
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const beam = model.beams.find(b => b.id === drag.id);
-      if (beam) { const pt = getSnappedPoint(world, beam.endPoint, e.shiftKey); model.updateBeam(drag.id, { startPoint: pt }); }
+      if (beam) { const pt = getSnappedPoint(world, beam.endPoint, e.shiftKey || shiftHeld); model.updateBeam(drag.id, { startPoint: pt }); }
       return;
     }
 
@@ -1778,15 +1833,19 @@
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const beam = model.beams.find(b => b.id === drag.id);
-      if (beam) { const pt = getSnappedPoint(world, beam.startPoint, e.shiftKey); model.updateBeam(drag.id, { endPoint: pt }); }
+      if (beam) { const pt = getSnappedPoint(world, beam.startPoint, e.shiftKey || shiftHeld); model.updateBeam(drag.id, { endPoint: pt }); }
       return;
     }
 
     if (localDrag.type === 'draggingSlab') {
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
-      const dx = world.x - drag.startMouse.x;
-      const dy = world.y - drag.startMouse.y;
+      let dx = world.x - drag.startMouse.x;
+      let dy = world.y - drag.startMouse.y;
+      if (e.shiftKey || shiftHeld) {
+        if (Math.abs(dx) > Math.abs(dy)) dy = 0;
+        else dx = 0;
+      }
       model.updateSlab(drag.id, { vertices: drag.startVerts.map(v => ({ x: v.x + dx, y: v.y + dy })) });
       return;
     }
@@ -1797,7 +1856,7 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const verts = [...drag.startVerts];
       const startRef = drag.startVerts[drag.vertexIndex];
-      const pt = getSnappedPoint(world, startRef, e.shiftKey);
+      const pt = getSnappedPoint(world, startRef, e.shiftKey || shiftHeld);
       verts[drag.vertexIndex] = pt;
       model.updateSlab(drag.id, { vertices: verts });
       return;
@@ -1809,7 +1868,7 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const verts = [...drag.startVerts];
       const startRef = drag.startVerts[drag.vertexIndex];
-      const pt = getSnappedPoint(world, startRef, e.shiftKey);
+      const pt = getSnappedPoint(world, startRef, e.shiftKey || shiftHeld);
       verts[drag.vertexIndex] = pt;
       model.updateSlab(drag.id, { vertices: verts });
       return;
@@ -1819,7 +1878,7 @@
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const startRef = drag.startHoleVerts[drag.vertexIndex];
-      const pt = getSnappedPoint(world, startRef, e.shiftKey);
+      const pt = getSnappedPoint(world, startRef, e.shiftKey || shiftHeld);
       model.updateSlabHoleVertex(drag.id, drag.holeIndex, drag.vertexIndex, pt);
       return;
     }
@@ -1830,7 +1889,7 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const verts = [...drag.startHoleVerts];
       const startRef = drag.startHoleVerts[drag.vertexIndex];
-      const pt = getSnappedPoint(world, startRef, e.shiftKey);
+      const pt = getSnappedPoint(world, startRef, e.shiftKey || shiftHeld);
       verts[drag.vertexIndex] = pt;
       model.updateSlabHole(drag.id, drag.holeIndex, verts);
       return;
@@ -1839,8 +1898,12 @@
     if (localDrag.type === 'draggingSlabHole') {
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
-      const dx = world.x - drag.startMouse.x;
-      const dy = world.y - drag.startMouse.y;
+      let dx = world.x - drag.startMouse.x;
+      let dy = world.y - drag.startMouse.y;
+      if (e.shiftKey || shiftHeld) {
+        if (Math.abs(dx) > Math.abs(dy)) dy = 0;
+        else dx = 0;
+      }
       const newHoleVerts = drag.startHoleVerts.map(v => ({ x: v.x + dx, y: v.y + dy }));
       model.updateSlabHole(drag.id, drag.holeIndex, newHoleVerts);
       return;
@@ -1849,8 +1912,12 @@
     if (localDrag.type === 'draggingDropPanel') {
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
-      const dx = world.x - drag.startMouse.x;
-      const dy = world.y - drag.startMouse.y;
+      let dx = world.x - drag.startMouse.x;
+      let dy = world.y - drag.startMouse.y;
+      if (e.shiftKey || shiftHeld) {
+        if (Math.abs(dx) > Math.abs(dy)) dy = 0;
+        else dx = 0;
+      }
       model.updateDropPanel(drag.id, { vertices: drag.startVerts.map(v => ({ x: v.x + dx, y: v.y + dy })) });
       return;
     }
@@ -1882,8 +1949,12 @@
     if (localDrag.type === 'draggingMulti') {
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
-      const dx = world.x - drag.startWorld.x;
-      const dy = world.y - drag.startWorld.y;
+      let dx = world.x - drag.startWorld.x;
+      let dy = world.y - drag.startWorld.y;
+      if (e.shiftKey || shiftHeld) {
+        if (Math.abs(dx) > Math.abs(dy)) dy = 0;
+        else dx = 0;
+      }
       for (const [id, orig] of multiDragOriginals) {
         if (orig.type === 'column') {
           const el = model.columns.find(c => c.id === id);
@@ -2327,9 +2398,21 @@
     } catch (err) { console.error('[handleKeyDown]', err); }
   }
 
+  function updateDragWithCurrentMouse(): void {
+    if (lastMouseEvent) {
+      handleMouseMove(lastMouseEvent);
+    }
+  }
+
   function onWindowKeyDown(e: KeyboardEvent): void {
     try {
-    if (e.key === 'Shift') { shiftHeld = true; }
+    if (e.key === 'Shift') {
+      if (!shiftHeld) {
+        shiftHeld = true;
+        dirty = true;
+        if (localDrag.type !== 'idle') updateDragWithCurrentMouse();
+      }
+    }
     if (e.key === 'Escape') { e.preventDefault(); handleEscape(); return; }
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) return;
 
@@ -2372,7 +2455,11 @@
   }
 
   function onWindowKeyUp(e: KeyboardEvent): void {
-    if (e.key === 'Shift') { shiftHeld = false; }
+    if (e.key === 'Shift') {
+      shiftHeld = false;
+      dirty = true;
+      if (localDrag.type !== 'idle') updateDragWithCurrentMouse();
+    }
   }
 
   $effect(() => {

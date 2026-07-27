@@ -12,40 +12,16 @@
     { value: 'M55', label: 'M55 (fck=55 MPa)' },
     { value: 'M60', label: 'M60 (fck=60 MPa)' },
   ];
-
-  const rebarGrades = [
-    { value: 'Fe250', label: 'Fe250 (fy=250 MPa)' },
-    { value: 'Fe415', label: 'Fe415 (fy=415 MPa)' },
-    { value: 'Fe500', label: 'Fe500 (fy=500 MPa)' },
-    { value: 'Fe550', label: 'Fe550 (fy=550 MPa)' },
-    { value: 'Fe600', label: 'Fe600 (fy=600 MPa)' },
-  ];
 </script>
 
-<div class="sidebar-panel flex flex-col gap-3 rounded-lg bg-[#1a1a1a] p-3 border border-[#333333]">
-  <div class="text-xs font-bold text-[#ffffff] uppercase tracking-wider">Material Property</div>
-
-  <div class="flex flex-col gap-1">
-    <label class="text-xs text-[#ffffff] font-medium">Concrete Grade</label>
-    <select
-      bind:value={model.concreteGrade}
-      class="rounded bg-[#333333] px-2 py-1.5 text-xs text-white border border-[#444444]"
-    >
-      {#each concreteGrades as g}
-        <option value={g.value}>{g.label}</option>
-      {/each}
-    </select>
-  </div>
-
-  <div class="flex flex-col gap-1">
-    <label class="text-xs text-[#ffffff] font-medium">Rebar Grade</label>
-    <select
-      bind:value={model.rebarGrade}
-      class="rounded bg-[#333333] px-2 py-1.5 text-xs text-white border border-[#444444]"
-    >
-      {#each rebarGrades as g}
-        <option value={g.value}>{g.label}</option>
-      {/each}
-    </select>
-  </div>
+<div class="flex flex-col gap-1.5 px-1.5 py-1">
+  <div class="text-[9px] font-bold text-[#ffffff] uppercase tracking-wider">Default Concrete Grade</div>
+  <select
+    bind:value={model.concreteGrade}
+    class="w-full rounded bg-[#333333] px-2 py-1 text-[10px] text-white border border-[#444444] focus:border-[#D62430] focus:outline-none"
+  >
+    {#each concreteGrades as g}
+      <option value={g.value}>{g.label}</option>
+    {/each}
+  </select>
 </div>

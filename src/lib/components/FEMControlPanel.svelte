@@ -6,13 +6,6 @@
 
   const resultTypes: { value: FEMResultType; label: string; unit: string }[] = [
     { value: 'deflection', label: 'Deflection', unit: 'mm' },
-    { value: 'mx', label: 'Moment Mx', unit: 'kN·m/m' },
-    { value: 'my', label: 'Moment My', unit: 'kN·m/m' },
-    { value: 'mxy', label: 'Moment Mxy', unit: 'kN·m/m' },
-    { value: 'stress_s1', label: 'Principal σ₁', unit: 'kPa' },
-    { value: 'stress_s2', label: 'Principal σ₂', unit: 'kPa' },
-    { value: 'stress_vm', label: 'Von Mises σ', unit: 'kPa' },
-    { value: 'punching', label: 'Punching', unit: 'ratio' },
   ];
 
   function handleResultTypeChange(e: Event) {
@@ -43,43 +36,9 @@
   }
 
   function getCurrentMinMax(): { min: number; max: number } {
-    switch (femState.resultType) {
-      case 'deflection': {
-        const a = Math.abs(femState.globalMinWz) * 1000;
-        const b = Math.abs(femState.globalMaxWz) * 1000;
-        return { min: Math.min(a, b), max: Math.max(a, b) };
-      }
-      case 'mx': return { min: femState.globalMinMx, max: femState.globalMaxMx };
-      case 'my': return { min: femState.globalMinMy, max: femState.globalMaxMy };
-      case 'mxy': {
-        let min = Infinity, max = -Infinity;
-        for (const r of femState.slabResults.values()) {
-          for (const m of r.momentMxy) { if (m.value < min) min = m.value; if (m.value > max) max = m.value; }
-        }
-        return { min: min === Infinity ? 0 : min, max: max === -Infinity ? 0 : max };
-      }
-      case 'stress_s1': case 'stress_s2': case 'stress_vm': {
-        let min = Infinity, max = -Infinity;
-        const key = femState.resultType === 'stress_s1' ? 's1' : femState.resultType === 'stress_s2' ? 's2' : 'vm';
-        for (const r of femState.slabResults.values()) {
-          for (const s of r.stresses) {
-            const v = s[key as 's1' | 's2' | 'vm'];
-            if (v < min) min = v; if (v > max) max = v;
-          }
-        }
-        return { min: min === Infinity ? 0 : min, max: max === -Infinity ? 0 : max };
-      }
-      case 'punching': {
-        let maxRatio = 0;
-        for (const r of femState.slabResults.values()) {
-          for (const p of (r.columnPunching || [])) {
-            if (p.ratio > maxRatio) maxRatio = p.ratio;
-          }
-        }
-        return { min: 0, max: maxRatio };
-      }
-      default: return { min: 0, max: 0 };
-    }
+    const a = Math.abs(femState.globalMinWz);
+    const b = Math.abs(femState.globalMaxWz);
+    return { min: Math.min(a, b), max: Math.max(a, b) };
   }
 
   const mmRange = $derived(getCurrentMinMax());
@@ -162,17 +121,10 @@
 
     <!-- Result Type -->
     <div>
-      <label class="block text-[10px] text-slate-500 mb-0.5">Result Type</label>
-      <select
-        onchange={handleResultTypeChange}
-        class="w-full rounded bg-slate-700 px-2 py-1 text-white text-[11px] border border-slate-600"
-      >
-        {#each resultTypes as rt}
-          <option value={rt.value} selected={femState.resultType === rt.value}>
-            {rt.label} ({rt.unit})
-          </option>
-        {/each}
-      </select>
+      <label class="block text-[10px] text-slate-500 mb-0.5">Result Display</label>
+      <div class="w-full rounded bg-slate-800/80 px-2 py-1 text-sky-400 font-medium text-[11px] border border-slate-700">
+        Deflection (mm)
+      </div>
     </div>
 
     <!-- Auto Compute Toggle -->

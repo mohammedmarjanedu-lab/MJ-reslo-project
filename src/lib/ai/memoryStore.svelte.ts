@@ -28,7 +28,7 @@ export interface EditPayload {
 }
 
 export interface SolvePayload {
-  solver: 'worker' | 'openseespy';
+  solver: 'worker' | 'kratos' | 'openseespy';
   slabCount: number;
   elementCount: number;
   durationMs: number;

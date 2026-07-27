@@ -9,7 +9,7 @@ class FEMResultState {
   disconnectedIds = $state<Set<string>>(new Set());
   resultType = $state<FEMResultType>('deflection');
   deformedScale = $state(30);
-  showFEMContour = $state(false);
+  showFEMContour = $state(true);
   showFEMMesh = $state(false);
   activeSlabId = $state<string | null>(null);
 
@@ -40,7 +40,6 @@ class FEMResultState {
   // Returns per-slab node-value maps + unified global min/max for the current result type.
   contourCache = $derived.by(() => {
     const rt = this.resultType;
-    const useVisible = (s: SlabFEMResult) => s; // all slabs (visibility handled in renderer)
     const slabs: SlabFEMResult[] = [];
     for (const r of this.slabResults.values()) slabs.push(r);
 
@@ -55,61 +54,184 @@ class FEMResultState {
       for (let i = 1; i < arr.length; i++) { if (arr[i] < mn) mn = arr[i]; if (arr[i] > mx) mx = arr[i]; }
       return [mn, mx];
     }
-    function elemToNodeValues(result: SlabFEMResult, data: { elementId: number; value?: number }[], valueKey?: string): Map<number, number> {
-      const elemIdMap = new Map<number, number[]>();
-      for (const e of result.mesh.elements) elemIdMap.set(e.id, e.nodeIds);
-      const accum = new Map<number, number[]>();
-      for (const item of data) {
-        const nodeIds = elemIdMap.get(item.elementId);
-        if (!nodeIds) continue;
-        const v = valueKey ? (item as any)[valueKey] : (item as any).value;
-        if (v === undefined || !isFinite(v)) continue;
-        for (const nid of nodeIds) {
-          let arr = accum.get(nid);
-          if (!arr) { arr = []; accum.set(nid, arr); }
-          arr.push(v);
+
+    // Spatial node map: spatialKey "X_Y" -> array of values from surrounding elements across ALL slabs
+    // Ensures smooth continuous contour across multi-slab boundaries (ETABS/SAFE standard)
+    function elemToGlobalNodeValues(
+      dataExtractor: (r: SlabFEMResult) => { elementId: number; value?: number }[],
+      valueKey?: string
+    ): Map<string, Map<number, number>> {
+      const accum = new Map<string, number[]>();
+      function pKey(x: number, y: number): string {
+        return Math.round(x * 1000) + '_' + Math.round(y * 1000);
+      }
+
+      for (const r of slabs) {
+        const nodePosMap = new Map(r.mesh.nodes.map(n => [n.id, pKey(n.x, n.y)]));
+        const elemIdMap = new Map(r.mesh.elements.map(e => [e.id, e.nodeIds]));
+        const data = dataExtractor(r);
+
+        for (const item of data) {
+          const nodeIds = elemIdMap.get(item.elementId);
+          if (!nodeIds) continue;
+          const v = valueKey ? (item as any)[valueKey] : (item as any).value;
+          if (v === undefined || !isFinite(v)) continue;
+
+          for (const nid of nodeIds) {
+            const pk = nodePosMap.get(nid);
+            if (!pk) continue;
+            let arr = accum.get(pk);
+            if (!arr) { arr = []; accum.set(pk, arr); }
+            arr.push(v);
+          }
         }
       }
-      const out = new Map<number, number>();
-      for (const [nid, vals] of accum) {
-        let sum = 0; for (let i = 0; i < vals.length; i++) sum += vals[i];
-        out.set(nid, sum / vals.length);
+
+      const avgMap = new Map<string, number>();
+      for (const [pk, vals] of accum) {
+        let sum = 0;
+        for (let i = 0; i < vals.length; i++) sum += vals[i];
+        avgMap.set(pk, sum / vals.length);
       }
-      return out;
+
+      const resultMap = new Map<string, Map<number, number>>();
+      for (const r of slabs) {
+        const localMap = new Map<number, number>();
+        for (const n of r.mesh.nodes) {
+          const pk = pKey(n.x, n.y);
+          localMap.set(n.id, avgMap.get(pk) ?? 0);
+        }
+        resultMap.set(r.slabId, localMap);
+      }
+
+      return resultMap;
     }
 
     const allVals: number[] = [];
-    for (const r of slabs) {
-      let nodeValues: Map<number, number>;
-      switch (rt) {
-        case 'deflection': {
-          nodeValues = new Map<number, number>();
-          for (const d of r.nodeDeflections) nodeValues.set(d.nodeId, d.wz * 1000);
-          for (const d of r.nodeDeflections) allVals.push(d.wz * 1000);
-          break;
+    let resultMap: Map<string, Map<number, number>> | null = null;
+
+    switch (rt) {
+      case 'deflection': {
+        const accum = new Map<string, number[]>();
+        function pKeyDefl(x: number, y: number): string {
+          return Math.round(x * 200) + '_' + Math.round(y * 200);
         }
-        case 'mx': { nodeValues = elemToNodeValues(r, r.momentMx); for (const m of r.momentMx) allVals.push(m.value); break; }
-        case 'my': { nodeValues = elemToNodeValues(r, r.momentMy); for (const m of r.momentMy) allVals.push(m.value); break; }
-        case 'mxy': { nodeValues = elemToNodeValues(r, r.momentMxy); for (const m of r.momentMxy) allVals.push(m.value); break; }
-        case 'punching': {
-          nodeValues = new Map<number, number>();
-          for (const p of (r.columnPunching || [])) { nodeValues.set(p.nodeId, p.ratio); allVals.push(p.ratio); }
-          break;
+        for (const r of slabs) {
+          for (const d of r.nodeDeflections) {
+            const node = r.mesh.nodes.find(n => n.id === d.nodeId);
+            if (node && isFinite(d.wz)) {
+              const pk = pKeyDefl(node.x, node.y);
+              let arr = accum.get(pk);
+              if (!arr) { arr = []; accum.set(pk, arr); }
+              arr.push(d.wz);
+            }
+          }
         }
-        default: {
-          const key = rt === 'stress_s1' ? 's1' : rt === 'stress_s2' ? 's2' : 'vm';
-          nodeValues = elemToNodeValues(r, r.stresses, key);
-          for (const s of r.stresses) { const v = (s as any)[key]; if (isFinite(v)) allVals.push(v); }
-          break;
+        const avgDeflMap = new Map<string, number>();
+        for (const [pk, vals] of accum) {
+          let sum = 0; for (let i = 0; i < vals.length; i++) sum += vals[i];
+          avgDeflMap.set(pk, sum / vals.length);
         }
+        resultMap = new Map();
+        for (const r of slabs) {
+          const m = new Map<number, number>();
+          for (const d of r.nodeDeflections) {
+            const node = r.mesh.nodes.find(n => n.id === d.nodeId);
+            const val = node ? (avgDeflMap.get(pKeyDefl(node.x, node.y)) ?? d.wz) : d.wz;
+            m.set(d.nodeId, val);
+            allVals.push(val);
+          }
+          resultMap.set(r.slabId, m);
+        }
+        break;
       }
-      perSlab.set(r.slabId, { nodeValues, globalMin: 0, globalMax: 0 });
+      case 'mx': {
+        resultMap = elemToGlobalNodeValues(r => r.momentMx);
+        for (const r of slabs) for (const m of r.momentMx) allVals.push(m.value);
+        break;
+      }
+      case 'my': {
+        resultMap = elemToGlobalNodeValues(r => r.momentMy);
+        for (const r of slabs) for (const m of r.momentMy) allVals.push(m.value);
+        break;
+      }
+      case 'mxy': {
+        resultMap = elemToGlobalNodeValues(r => r.momentMxy);
+        for (const r of slabs) for (const m of r.momentMxy) allVals.push(m.value);
+        break;
+      }
+      case 'punching': {
+        resultMap = new Map();
+        for (const r of slabs) {
+          const m = new Map<number, number>();
+          for (const p of (r.columnPunching || [])) { m.set(p.nodeId, p.ratio); allVals.push(p.ratio); }
+          resultMap.set(r.slabId, m);
+        }
+        break;
+      }
+      case 'ast_x_top': {
+        resultMap = elemToGlobalNodeValues(r => r.reinforcement || [], 'ast_x_top');
+        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(m.ast_x_top);
+        break;
+      }
+      case 'ast_y_top': {
+        resultMap = elemToGlobalNodeValues(r => r.reinforcement || [], 'ast_y_top');
+        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(m.ast_y_top);
+        break;
+      }
+      case 'ast_x_bot': {
+        resultMap = elemToGlobalNodeValues(r => r.reinforcement || [], 'ast_x_bot');
+        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(m.ast_x_bot);
+        break;
+      }
+      case 'ast_y_bot': {
+        resultMap = elemToGlobalNodeValues(r => r.reinforcement || [], 'ast_y_bot');
+        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(m.ast_y_bot);
+        break;
+      }
+      case 'ast_max': {
+        resultMap = elemToGlobalNodeValues(r => (r.reinforcement || []).map(m => ({
+          elementId: m.elementId,
+          value: Math.max(m.ast_x_top, m.ast_y_top, m.ast_x_bot, m.ast_y_bot)
+        })));
+        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(Math.max(m.ast_x_top, m.ast_y_top, m.ast_x_bot, m.ast_y_bot));
+        break;
+      }
+      case 'crack_width': {
+        resultMap = elemToGlobalNodeValues(r => r.crackWidth || [], 'crackWidth');
+        for (const r of slabs) for (const m of (r.crackWidth || [])) allVals.push(m.crackWidth);
+        break;
+      }
+      case 'deflection_check': {
+        resultMap = new Map();
+        for (const r of slabs) {
+          const m = new Map<number, number>();
+          for (const d of r.nodeDeflections) {
+            const val = Math.abs(d.wz);
+            m.set(d.nodeId, val);
+            allVals.push(val);
+          }
+          resultMap.set(r.slabId, m);
+        }
+        break;
+      }
+      default: {
+        const key = rt === 'stress_s1' ? 's1' : rt === 'stress_s2' ? 's2' : (rt.startsWith('shear') ? (rt === 'shear_vx' ? 'vx' : rt === 'shear_vy' ? 'vy' : 'v1') : rt.startsWith('membrane') ? rt.replace('membrane_', '') : 'vm');
+        const getter = (r: SlabFEMResult) => (rt.startsWith('shear') ? (r.shears || []) : rt.startsWith('membrane') ? (r.membraneForces || []) : r.stresses) as any[];
+        resultMap = elemToGlobalNodeValues(getter, key);
+        for (const r of slabs) for (const s of getter(r)) { const v = s[key]; if (isFinite(v)) allVals.push(v); }
+        break;
+      }
     }
 
     if (rt === 'punching') { globalMin = 0; globalMax = 1; }
     else [globalMin, globalMax] = safeMinMax(allVals);
 
-    for (const cd of perSlab.values()) { cd.globalMin = globalMin; cd.globalMax = globalMax; }
+    for (const r of slabs) {
+      const nodeValues = resultMap?.get(r.slabId) ?? new Map();
+      perSlab.set(r.slabId, { nodeValues, globalMin, globalMax });
+    }
+
     return { perSlab, globalMin, globalMax };
   });
 

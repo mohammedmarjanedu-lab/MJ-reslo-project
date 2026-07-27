@@ -4,7 +4,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from opensees_solver import analyze_slab_opensees
+from kratos_solver import solve_reslo_structure
 from mesher import generate_mesh
 from models import MeshRequest, SlabGeometry, Point2D, AnalysisRequest
 
@@ -42,17 +42,18 @@ req_dict = {
 }
 
 req = AnalysisRequest(**req_dict)
-res = analyze_slab_opensees(req)
+res = solve_reslo_structure(req)
 res_dict = res.model_dump()
 
-print("\n--- ETABS vs OpenSeesPy Comparison Summary ---")
+print("\n--- ETABS vs Kratos Multiphysics Comparison Summary ---")
 print(f"Total Applied Load: {15.0 * 49.0:.2f} kN")
-print(f"OpenSeesPy Column Reactions Sum: {sum(p['force_kN'] for p in res_dict['columnPunching']):.2f} kN")
+print(f"Kratos Column Reactions Sum: {sum(p['force_kN'] for p in res_dict['columnPunching']):.2f} kN")
 
 print("\n--- Column Reaction Comparison ---")
 for p in res_dict['columnPunching']:
-    print(f"Col Node {p['nodeId']}: OpenSees = {p['force_kN']:.2f} kN, ETABS = 183.75 kN (Diff: {p['force_kN'] - 183.75:+.2f} kN)")
+    print(f"Col Node {p['nodeId']}: Kratos = {p['force_kN']:.2f} kN, ETABS = 183.75 kN (Diff: {p['force_kN'] - 183.75:+.2f} kN)")
 
 print("\n--- Bending Moments Summary ---")
-print(f"OpenSeesPy Min Mx = {res_dict['minMx']:.3f} kN·m/m, Max Mx = {res_dict['maxMx']:.3f} kN·m/m")
-print(f"OpenSeesPy Min My = {res_dict['minMy']:.3f} kN·m/m, Max My = {res_dict['maxMy']:.3f} kN·m/m")
+print(f"Kratos Min Mx = {res_dict['minMx']:.3f} kN·m/m, Max Mx = {res_dict['maxMx']:.3f} kN·m/m")
+print(f"Kratos Min My = {res_dict['minMy']:.3f} kN·m/m, Max My = {res_dict['maxMy']:.3f} kN·m/m")
+

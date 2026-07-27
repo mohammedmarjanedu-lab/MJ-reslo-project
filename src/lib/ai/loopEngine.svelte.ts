@@ -7,6 +7,7 @@ import { model } from '../stores/structuralModel.svelte';
 import { femState } from '../stores/femResults.svelte';
 import { uiState } from '../stores/uiState.svelte';
 import { getCurrentFps, getPerfHistory, startPerfProbe, perfProbeStop, perfProbeIsRunning as isPerfProbeRunning } from './perfProbe';
+import { llmClient } from './llmClient.svelte';
 
 export type LoopPhase = 'observe' | 'remember' | 'reason' | 'act' | 'verify';
 
@@ -308,8 +309,8 @@ class LoopEngine {
           kind: 'architecture',
           severity: 'info',
           title: 'Dual solver architecture detected',
-          description: 'Both in-browser Q4 solver and OpenSeesPy backend present. Ensure fallback logic is tested.',
-          affectedFiles: ['src/lib/engine/femSolver.ts', 'src/workers/fem.worker.ts', 'backend/opensees_solver.py'],
+          description: 'Both in-browser Q4 solver and Kratos Multiphysics backend present. Ensure fallback logic is tested.',
+          affectedFiles: ['src/lib/engine/femSolver.ts', 'src/workers/fem.worker.ts', 'backend/kratos_solver.py'],
           suggestedAction: 'Run benchmark suite to validate parity between solvers.',
           confidence: 0.85,
           tokensEstimate: 200,
@@ -339,6 +340,81 @@ class LoopEngine {
       }
     } catch (e) {
       console.warn('[loopEngine] Reason failed:', e);
+    }
+
+    // Optional: augment heuristic reasoning with the connected LLM (Omniroute).
+    await this._reasonWithLLM();
+  }
+
+  /**
+   * When an OpenAI-compatible LLM proxy (e.g. Omniroute) is reachable, send a
+   * compact snapshot of the current structural model + FEM state and turn the
+   * model's reply into insight cards. Fails silently — the loop keeps working
+   * on heuristics alone if the LLM is offline or unconfigured.
+   */
+  private async _reasonWithLLM(): Promise<void> {
+    if (!llmClient.isConfigured()) return;
+    try {
+      if (!(await llmClient.health())) return;
+
+      const snapshot = {
+        elements: {
+          slabs: model.slabs.length,
+          columns: model.columns.length,
+          walls: model.walls.length + model.polylineWalls.length,
+          beams: model.beams.length,
+          dropPanels: model.dropPanels.length,
+        },
+        concreteGrade: model.concreteGrade,
+        rebarGrade: model.rebarGrade,
+        fem: femState.hasResults ? {
+          slabCount: femState.slabResults.size,
+          maxDeflection_mm: +(femState.globalMinWz * 1000).toFixed(2),
+          warnings: (femState.warnings ?? []).slice(0, 5),
+        } : null,
+        headroomTokens: graphStore.report?.tokens ?? 0,
+      };
+
+      const insights = await llmClient.chatJson<{
+        title: string;
+        description: string;
+        kind?: string;
+        severity?: string;
+        suggestedAction?: string;
+        confidence?: number;
+        affectedFiles?: string[];
+      }[]>([
+        {
+          role: 'system',
+          content:
+            'You are a structural-engineering assistant embedded in Reslo, an IS 456:2000 RC floor design tool. ' +
+            'Given a JSON snapshot of the current model and FEM results, return concise, actionable insights. ' +
+            'Respond ONLY with a JSON array of at most 3 objects, each with keys: ' +
+            'title (string), description (string), kind (one of perf|architecture|numerical|workflow|memory), ' +
+            'severity (one of info|warning|critical), suggestedAction (string), confidence (0..1).',
+        },
+        { role: 'user', content: JSON.stringify(snapshot) },
+      ], { maxTokens: 700 });
+
+      if (!Array.isArray(insights)) return;
+      const allowedKind = new Set(['perf', 'architecture', 'numerical', 'workflow', 'memory']);
+      const allowedSev = new Set(['info', 'warning', 'critical']);
+      for (const it of insights.slice(0, 3)) {
+        if (!it?.title || !it?.description) continue;
+        this._addInsight({
+          phase: 'reason',
+          kind: (allowedKind.has(it.kind as string) ? it.kind : 'architecture') as Insight['kind'],
+          severity: (allowedSev.has(it.severity as string) ? it.severity : 'info') as Insight['severity'],
+          title: `🤖 ${it.title}`,
+          description: it.description,
+          affectedFiles: Array.isArray(it.affectedFiles) ? it.affectedFiles : [],
+          suggestedAction: it.suggestedAction,
+          confidence: typeof it.confidence === 'number' ? Math.max(0, Math.min(1, it.confidence)) : 0.6,
+          tokensEstimate: 200,
+        });
+      }
+    } catch (e) {
+      console.warn('[loopEngine] LLM reasoning skipped:', e instanceof Error ? e.message : e);
     }
   }
 

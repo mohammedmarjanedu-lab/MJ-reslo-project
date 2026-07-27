@@ -33,194 +33,226 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
     geo = request.geometry
     _ensure_gmsh()
     with _lock:
-        gmsh.model.add("slab")
+        try:
+            gmsh.model.add("slab")
 
-        slab_verts = []
-        for v in geo.vertices:
-            if not slab_verts or np.hypot(v.x - slab_verts[-1][0], v.y - slab_verts[-1][1]) > 1e-6:
-                slab_verts.append((v.x, v.y))
-        if len(slab_verts) >= 3 and np.hypot(slab_verts[0][0] - slab_verts[-1][0], slab_verts[0][1] - slab_verts[-1][1]) < 1e-6:
-            slab_verts.pop()
+            slab_verts = []
+            for v in geo.vertices:
+                if not slab_verts or np.hypot(v.x - slab_verts[-1][0], v.y - slab_verts[-1][1]) > 1e-6:
+                    slab_verts.append((v.x, v.y))
+            if len(slab_verts) >= 3 and np.hypot(slab_verts[0][0] - slab_verts[-1][0], slab_verts[0][1] - slab_verts[-1][1]) < 1e-6:
+                slab_verts.pop()
 
-        # --- Build boundary points, splitting edges at beam and wall endpoints ---
-        support_endpoints = []
-        if geo.beams:
-            for beam in geo.beams:
-                support_endpoints.append((beam.startPoint.x, beam.startPoint.y))
-                support_endpoints.append((beam.endPoint.x, beam.endPoint.y))
-        if geo.walls:
-            for wall in geo.walls:
-                support_endpoints.append((wall.startPoint.x, wall.startPoint.y))
-                support_endpoints.append((wall.endPoint.x, wall.endPoint.y))
+            # --- Build boundary points, splitting edges at beam and wall endpoints ---
+            support_endpoints = []
+            if geo.beams:
+                for beam in geo.beams:
+                    support_endpoints.append((beam.startPoint.x, beam.startPoint.y))
+                    support_endpoints.append((beam.endPoint.x, beam.endPoint.y))
+            if geo.walls:
+                for wall in geo.walls:
+                    support_endpoints.append((wall.startPoint.x, wall.startPoint.y))
+                    support_endpoints.append((wall.endPoint.x, wall.endPoint.y))
+            if geo.columns:
+                for col in geo.columns:
+                    support_endpoints.append((col.position.x, col.position.y))
 
-        # For each slab edge, check if any support endpoint lies on it
-        split_edges = []  # list of list of (x, y) along each original edge (including endpoints)
-        nv = len(slab_verts)
-        for i in range(nv):
-            ax, ay = slab_verts[i]
-            bx, by = slab_verts[(i + 1) % nv]
-            pts = [(ax, ay)]
-            for ep_x, ep_y in support_endpoints:
-                if _point_on_segment(ep_x, ep_y, ax, ay, bx, by):
-                    pts.append((ep_x, ep_y))
-            pts.append((bx, by))
-            # Sort along the edge by distance from A
-            dx, dy = bx - ax, by - ay
-            len2 = dx * dx + dy * dy
-            if len2 > 1e-12:
-                pts.sort(key=lambda p: ((p[0] - ax) * dx + (p[1] - ay) * dy) / len2)
-            split_edges.append(pts)
+            # For each slab edge, check if any support endpoint lies on it
+            split_edges = []  # list of list of (x, y) along each original edge (including endpoints)
+            nv = len(slab_verts)
+            for i in range(nv):
+                ax, ay = slab_verts[i]
+                bx, by = slab_verts[(i + 1) % nv]
+                pts = [(ax, ay)]
+                for ep_x, ep_y in support_endpoints:
+                    if _point_on_segment(ep_x, ep_y, ax, ay, bx, by):
+                        pts.append((ep_x, ep_y))
+                pts.append((bx, by))
+                # Sort along the edge by distance from A
+                dx, dy = bx - ax, by - ay
+                len2 = dx * dx + dy * dy
+                if len2 > 1e-12:
+                    pts.sort(key=lambda p: ((p[0] - ax) * dx + (p[1] - ay) * dy) / len2)
+                split_edges.append(pts)
 
-        # Create Gmsh points (deduplicated) — boundary vertices first
-        point_tags = {}
-        next_pt_tag = 1000
-        for edge_pts in split_edges:
-            for (x, y) in edge_pts:
-                key = (x, y)
-                if key not in point_tags:
-                    point_tags[key] = next_pt_tag
-                    gmsh.model.occ.addPoint(x, y, 0, tag=next_pt_tag)
-                    next_pt_tag += 1
-
-        # Add interior beam and wall endpoints (not on boundary)
-        if geo.beams:
-            for beam in geo.beams:
-                for (ep_x, ep_y) in [(beam.startPoint.x, beam.startPoint.y),
-                                     (beam.endPoint.x, beam.endPoint.y)]:
-                    key = (ep_x, ep_y)
+            # Create Gmsh points (deduplicated) — boundary vertices first
+            point_tags = {}
+            next_pt_tag = 1000
+            for edge_pts in split_edges:
+                for (x, y) in edge_pts:
+                    key = (x, y)
                     if key not in point_tags:
                         point_tags[key] = next_pt_tag
-                        gmsh.model.occ.addPoint(ep_x, ep_y, 0, tag=next_pt_tag)
-                        next_pt_tag += 1
-        if geo.walls:
-            for wall in geo.walls:
-                for (ep_x, ep_y) in [(wall.startPoint.x, wall.startPoint.y),
-                                     (wall.endPoint.x, wall.endPoint.y)]:
-                    key = (ep_x, ep_y)
-                    if key not in point_tags:
-                        point_tags[key] = next_pt_tag
-                        gmsh.model.occ.addPoint(ep_x, ep_y, 0, tag=next_pt_tag)
+                        gmsh.model.occ.addPoint(x, y, 0, tag=next_pt_tag)
                         next_pt_tag += 1
 
-        # Create boundary lines from split edges
-        line_tags = []
-        existing_edges = set()
-        next_line_tag = 2000
-        for edge_pts in split_edges:
-            for i in range(len(edge_pts) - 1):
-                pa = edge_pts[i]
-                pb = edge_pts[i + 1]
-                ta, tb = point_tags[pa], point_tags[pb]
-                if ta == tb:
-                    continue
-                edge_key = (min(ta, tb), max(ta, tb))
-                if edge_key not in existing_edges:
-                    gmsh.model.occ.addLine(ta, tb, tag=next_line_tag)
-                    line_tags.append(next_line_tag)
-                    existing_edges.add(edge_key)
-                    next_line_tag += 1
+            # Add interior beam and wall endpoints (not on boundary)
+            if geo.beams:
+                for beam in geo.beams:
+                    for (ep_x, ep_y) in [(beam.startPoint.x, beam.startPoint.y),
+                                         (beam.endPoint.x, beam.endPoint.y)]:
+                        key = (ep_x, ep_y)
+                        if key not in point_tags:
+                            point_tags[key] = next_pt_tag
+                            gmsh.model.occ.addPoint(ep_x, ep_y, 0, tag=next_pt_tag)
+                            next_pt_tag += 1
+            if geo.walls:
+                for wall in geo.walls:
+                    for (ep_x, ep_y) in [(wall.startPoint.x, wall.startPoint.y),
+                                         (wall.endPoint.x, wall.endPoint.y)]:
+                        key = (ep_x, ep_y)
+                        if key not in point_tags:
+                            point_tags[key] = next_pt_tag
+                            gmsh.model.occ.addPoint(ep_x, ep_y, 0, tag=next_pt_tag)
+                            next_pt_tag += 1
 
-        curve_loop = gmsh.model.occ.addCurveLoop(line_tags, tag=3000)
-        slab_surf = gmsh.model.occ.addPlaneSurface([curve_loop], tag=4000)
-
-        for i, opening in enumerate(geo.openings):
-            hole_verts = []
-            for v in opening.vertices:
-                if not hole_verts or np.hypot(v.x - hole_verts[-1][0], v.y - hole_verts[-1][1]) > 1e-6:
-                    hole_verts.append((v.x, v.y))
-            if len(hole_verts) >= 3 and np.hypot(hole_verts[0][0] - hole_verts[-1][0], hole_verts[0][1] - hole_verts[-1][1]) < 1e-6:
-                hole_verts.pop()
+            # Create boundary lines from split edges (strictly ordered head-to-tail closed loop)
+            line_tags = []
+            existing_edges = set()
+            next_line_tag = 2000
             
-            if len(hole_verts) < 3:
-                continue
+            # Flatten split_edges into a continuous ordered sequence of boundary points
+            ordered_boundary_pts = []
+            for edge_pts in split_edges:
+                for pt in edge_pts[:-1]:  # omit last point of edge since it's the start point of next edge
+                    if not ordered_boundary_pts or np.hypot(pt[0] - ordered_boundary_pts[-1][0], pt[1] - ordered_boundary_pts[-1][1]) > 1e-6:
+                        ordered_boundary_pts.append(pt)
+            
+            # Ensure loop closes
+            if len(ordered_boundary_pts) >= 3 and np.hypot(ordered_boundary_pts[0][0] - ordered_boundary_pts[-1][0], ordered_boundary_pts[0][1] - ordered_boundary_pts[-1][1]) < 1e-6:
+                ordered_boundary_pts.pop()
 
-            hole_pt_tags = []
-            for j, (x, y) in enumerate(hole_verts):
-                pt = gmsh.model.occ.addPoint(x, y, 0, tag=5000 + i * 100 + j)
-                hole_pt_tags.append(pt)
-            hole_line_tags = []
-            for j in range(len(hole_pt_tags)):
-                k = (j + 1) % len(hole_pt_tags)
-                if hole_pt_tags[j] == hole_pt_tags[k]:
+            for i in range(len(ordered_boundary_pts)):
+                pa = ordered_boundary_pts[i]
+                pb = ordered_boundary_pts[(i + 1) % len(ordered_boundary_pts)]
+                ta = point_tags.get(pa)
+                tb = point_tags.get(pb)
+                if ta is None or tb is None or ta == tb:
                     continue
-                line = gmsh.model.occ.addLine(hole_pt_tags[j], hole_pt_tags[k], tag=6000 + i * 100 + j)
-                hole_line_tags.append(line)
-                existing_edges.add((min(hole_pt_tags[j], hole_pt_tags[k]), max(hole_pt_tags[j], hole_pt_tags[k])))
-            hole_loop = gmsh.model.occ.addCurveLoop(hole_line_tags, tag=7000 + i)
-            gmsh.model.occ.cut([(2, slab_surf)], [(2, gmsh.model.occ.addPlaneSurface([hole_loop]))], removeObject=True)
+                gmsh.model.occ.addLine(ta, tb, tag=next_line_tag)
+                line_tags.append(next_line_tag)
+                existing_edges.add((min(ta, tb), max(ta, tb)))
+                next_line_tag += 1
 
-        # --- Create beam and wall lines (embedded curves for mesh alignment) ---
-        embedded_curve_tags = []
-        if geo.beams:
-            for beam in geo.beams:
-                p1 = point_tags.get((beam.startPoint.x, beam.startPoint.y))
-                p2 = point_tags.get((beam.endPoint.x, beam.endPoint.y))
-                if p1 and p2 and p1 != p2:
-                    edge_key = (min(p1, p2), max(p1, p2))
-                    if edge_key not in existing_edges:
-                        gmsh.model.occ.addLine(p1, p2, tag=next_line_tag)
-                        embedded_curve_tags.append(next_line_tag)
-                        existing_edges.add(edge_key)
-                        next_line_tag += 1
-        if geo.walls:
-            for wall in geo.walls:
-                p1 = point_tags.get((wall.startPoint.x, wall.startPoint.y))
-                p2 = point_tags.get((wall.endPoint.x, wall.endPoint.y))
-                if p1 and p2 and p1 != p2:
-                    edge_key = (min(p1, p2), max(p1, p2))
-                    if edge_key not in existing_edges:
-                        gmsh.model.occ.addLine(p1, p2, tag=next_line_tag)
-                        embedded_curve_tags.append(next_line_tag)
-                        existing_edges.add(edge_key)
-                        next_line_tag += 1
+            if len(line_tags) < 3:
+                return FEMMesh(nodes=[], elements=[], nodeCount=0, elementCount=0, minAngle=0, maxAspectRatio=1, meshQuality="poor")
 
-        col_pt_tags = []
-        if request.refineAtColumns and geo.columns:
-            for col in geo.columns:
-                col_key = (col.position.x, col.position.y)
-                if col_key in point_tags:
-                    pt = point_tags[col_key]
-                else:
-                    pt = next_pt_tag
-                    gmsh.model.occ.addPoint(col.position.x, col.position.y, 0, tag=next_pt_tag)
-                    point_tags[col_key] = next_pt_tag
-                    next_pt_tag += 1
-                if pt not in col_pt_tags:
-                    col_pt_tags.append(pt)
+            curve_loop = gmsh.model.occ.addCurveLoop(line_tags, tag=3000)
+            slab_surf = gmsh.model.occ.addPlaneSurface([curve_loop], tag=4000)
 
-        gmsh.model.occ.synchronize()
+            for i, opening in enumerate(geo.openings):
+                hole_verts = []
+                for v in opening.vertices:
+                    if not hole_verts or np.hypot(v.x - hole_verts[-1][0], v.y - hole_verts[-1][1]) > 1e-6:
+                        hole_verts.append((v.x, v.y))
+                if len(hole_verts) >= 3 and np.hypot(hole_verts[0][0] - hole_verts[-1][0], hole_verts[0][1] - hole_verts[-1][1]) < 1e-6:
+                    hole_verts.pop()
+                
+                if len(hole_verts) < 3:
+                    continue
 
-        # Embed beam and wall curves into the slab surface for mesh alignment
-        if embedded_curve_tags:
-            gmsh.model.mesh.embed(1, embedded_curve_tags, 2, slab_surf)
+                hole_pt_tags = []
+                for j, (x, y) in enumerate(hole_verts):
+                    pt = gmsh.model.occ.addPoint(x, y, 0, tag=5000 + i * 100 + j)
+                    hole_pt_tags.append(pt)
+                hole_line_tags = []
+                for j in range(len(hole_pt_tags)):
+                    k = (j + 1) % len(hole_pt_tags)
+                    if hole_pt_tags[j] == hole_pt_tags[k]:
+                        continue
+                    line = gmsh.model.occ.addLine(hole_pt_tags[j], hole_pt_tags[k], tag=6000 + i * 100 + j)
+                    hole_line_tags.append(line)
+                    existing_edges.add((min(hole_pt_tags[j], hole_pt_tags[k]), max(hole_pt_tags[j], hole_pt_tags[k])))
+                hole_loop = gmsh.model.occ.addCurveLoop(hole_line_tags, tag=7000 + i)
+                gmsh.model.occ.cut([(2, slab_surf)], [(2, gmsh.model.occ.addPlaneSurface([hole_loop]))], removeObject=True)
 
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", request.meshSize * 0.3)
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", request.meshSize)
-        gmsh.option.setNumber("Mesh.MinimumCirclePoints", 12)
+            # --- Create beam and wall lines (embedded curves for mesh alignment) ---
+            embedded_curve_tags = []
+            if geo.beams:
+                for beam in geo.beams:
+                    p1 = point_tags.get((beam.startPoint.x, beam.startPoint.y))
+                    p2 = point_tags.get((beam.endPoint.x, beam.endPoint.y))
+                    if p1 and p2 and p1 != p2:
+                        edge_key = (min(p1, p2), max(p1, p2))
+                        if edge_key not in existing_edges:
+                            gmsh.model.occ.addLine(p1, p2, tag=next_line_tag)
+                            embedded_curve_tags.append(next_line_tag)
+                            existing_edges.add(edge_key)
+                            next_line_tag += 1
+            if geo.walls:
+                for wall in geo.walls:
+                    p1 = point_tags.get((wall.startPoint.x, wall.startPoint.y))
+                    p2 = point_tags.get((wall.endPoint.x, wall.endPoint.y))
+                    if p1 and p2 and p1 != p2:
+                        edge_key = (min(p1, p2), max(p1, p2))
+                        if edge_key not in existing_edges:
+                            gmsh.model.occ.addLine(p1, p2, tag=next_line_tag)
+                            embedded_curve_tags.append(next_line_tag)
+                            existing_edges.add(edge_key)
+                            next_line_tag += 1
 
-        if col_pt_tags:
-            dist_field = gmsh.model.mesh.field.add("Distance")
-            gmsh.model.mesh.field.setNumbers(dist_field, "PointsList", col_pt_tags)
-            threshold_field = gmsh.model.mesh.field.add("Threshold")
-            gmsh.model.mesh.field.setNumber(threshold_field, "InField", dist_field)
-            gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", request.meshSize * 0.35)
-            gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", request.meshSize)
-            gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", 0.5)
-            gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", 2.0)
-            gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
-        else:
-            const_field = gmsh.model.mesh.field.add("Constant")
-            gmsh.model.mesh.field.setNumber(const_field, "VIn", request.meshSize)
-            gmsh.model.mesh.field.setAsBackgroundMesh(const_field)
+            col_pt_tags = []
+            if request.refineAtColumns and geo.columns:
+                for col in geo.columns:
+                    col_key = (col.position.x, col.position.y)
+                    if col_key in point_tags:
+                        pt = point_tags[col_key]
+                    else:
+                        pt = next_pt_tag
+                        gmsh.model.occ.addPoint(col.position.x, col.position.y, 0, tag=next_pt_tag)
+                        point_tags[col_key] = next_pt_tag
+                        next_pt_tag += 1
+                    if pt not in col_pt_tags:
+                        col_pt_tags.append(pt)
 
-        gmsh.model.mesh.generate(2)
-        gmsh.model.mesh.optimize("Netgen")
+            gmsh.model.occ.synchronize()
 
-        # Extract nodes and elements BEFORE clear
-        node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
-        elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(dim=2)
+            # Embed beam and wall curves as well as column points into the slab surface for mesh alignment
+            if embedded_curve_tags:
+                try:
+                    gmsh.model.mesh.embed(1, embedded_curve_tags, 2, slab_surf)
+                except Exception:
+                    pass
+            if col_pt_tags:
+                try:
+                    gmsh.model.mesh.embed(0, col_pt_tags, 2, slab_surf)
+                except Exception:
+                    pass
 
-        gmsh.clear()
+            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", request.meshSize * 0.3)
+            gmsh.option.setNumber("Mesh.CharacteristicLengthMax", request.meshSize)
+            gmsh.option.setNumber("Mesh.MinimumCirclePoints", 12)
+
+            # ETABS Parity: Quad-Dominant recombination settings
+            gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 3)  # Blossom-Full-Quad
+            gmsh.option.setNumber("Mesh.RecombineAll", 1)
+            gmsh.option.setNumber("Mesh.Algorithm", 8)  # Frontal-Delaunay for Quads
+
+            # ETABS Parity: 3-Ring Column Refinement
+            if col_pt_tags:
+                d_eff = max(0.05, 0.85 * (geo.thickness if hasattr(geo, 'thickness') else 0.2))
+                dist_field = gmsh.model.mesh.field.add("Distance")
+                gmsh.model.mesh.field.setNumbers(dist_field, "PointsList", col_pt_tags)
+                
+                threshold_field = gmsh.model.mesh.field.add("Threshold")
+                gmsh.model.mesh.field.setNumber(threshold_field, "InField", dist_field)
+                gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", max(0.05, request.meshSize * 0.33)) # Ring 1: t/3
+                gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", request.meshSize) # Beyond Ring 3
+                gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", d_eff / 2.0) # Ring 1 radius
+                gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", 2.0 * d_eff) # Ring 3 radius
+                gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
+            else:
+                const_field = gmsh.model.mesh.field.add("Constant")
+                gmsh.model.mesh.field.setNumber(const_field, "VIn", request.meshSize)
+                gmsh.model.mesh.field.setAsBackgroundMesh(const_field)
+
+            gmsh.model.mesh.generate(2)
+
+            # Extract nodes and elements BEFORE clear
+            node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+            elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(dim=2)
+        finally:
+            gmsh.clear()
 
     # --- Deduplicate nodes ---
     coord_to_tag: dict = {}
@@ -239,21 +271,20 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
             nodes_list.append(FEMNode(id=new_id, x=node_coords[i], y=node_coords[i+1]))
             new_id += 1
 
-    # --- Extract triangles with deduped node IDs ---
+    # --- Extract triangles and quadrilaterals with deduped node IDs ---
     triangles = []
-    seen_tri = set()
+    seen_elem = set()
     elem_id = 0
     for typ, tags, conn in zip(elem_types, elem_tags, elem_node_tags):
-        if typ == 2:
-            npe = 3
+        # typ == 2: 3-node triangle, typ == 3: 4-node quadrilateral
+        if typ in (2, 3):
+            npe = 3 if typ == 2 else 4
             for i in range(0, len(conn), npe):
-                tri_nodes = tuple(
-                    sorted([node_id_map[conn[i+j]] for j in range(npe)
-                           if conn[i+j] in node_id_map])
-                )
-                if len(tri_nodes) == 3 and tri_nodes not in seen_tri:
-                    seen_tri.add(tri_nodes)
-                    triangles.append(Triangle(nodeIds=list(tri_nodes), id=elem_id))
+                elem_nodes = [node_id_map[conn[i+j]] for j in range(npe) if conn[i+j] in node_id_map]
+                elem_tuple = tuple(sorted(elem_nodes))
+                if len(elem_nodes) == npe and elem_tuple not in seen_elem:
+                    seen_elem.add(elem_tuple)
+                    triangles.append(Triangle(nodeIds=elem_nodes, id=elem_id))
                     elem_id += 1
 
     min_angle, max_ar = _compute_mesh_quality(nodes_list, triangles) if triangles else (90, 1)

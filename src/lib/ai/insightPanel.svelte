@@ -1,11 +1,31 @@
 <script lang="ts">
   import { loopEngine } from './loopEngine.svelte';
   import { memoryStore } from './memoryStore.svelte';
+  import { llmClient } from './llmClient.svelte';
   import { onMount, onDestroy } from 'svelte';
 
   let show = $state(false);
+  let showSettings = $state(false);
   let insights = $derived(loopEngine.state.pendingInsights);
   let verified = $derived(loopEngine.state.verifiedInsights);
+
+  let testing = $state(false);
+  let testMsg = $state<string | null>(null);
+  let models = $state<string[]>([]);
+
+  async function testConnection(): Promise<void> {
+    testing = true;
+    testMsg = null;
+    try {
+      const ids = await llmClient.listModels();
+      models = ids;
+      testMsg = `✓ Connected — ${ids.length} model(s) available`;
+    } catch (e) {
+      testMsg = `✗ ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      testing = false;
+    }
+  }
 
   function toggle(): void {
     show = !show;
@@ -63,9 +83,39 @@
         <span class="status" class:running={loopEngine.state.running}>
           {loopEngine.state.running ? 'Running' : 'Paused'}
         </span>
+        <span class="llm-dot" class:on={llmClient.connected} title={llmClient.connected ? 'LLM connected' : 'LLM not connected'}></span>
+        <button class="gear-btn" onclick={() => (showSettings = !showSettings)} aria-label="LLM settings" title="LLM connection settings">⚙</button>
         <button class="close-btn" onclick={toggle} aria-label="Close">×</button>
       </div>
     </div>
+
+    {#if showSettings}
+    <div class="llm-settings">
+      <div class="llm-title">Omniroute / LLM Connection</div>
+      <label class="llm-field">
+        <span>Base URL</span>
+        <input type="text" value={llmClient.baseUrl} onchange={(e) => llmClient.setBaseUrl((e.currentTarget as HTMLInputElement).value)} placeholder="http://localhost:20128/v1" />
+      </label>
+      <label class="llm-field">
+        <span>API Key</span>
+        <input type="password" value={llmClient.apiKey} onchange={(e) => llmClient.setApiKey((e.currentTarget as HTMLInputElement).value)} placeholder="(optional for local proxy)" />
+      </label>
+      <label class="llm-field">
+        <span>Model</span>
+        {#if models.length > 0}
+          <select value={llmClient.model} onchange={(e) => llmClient.setModel((e.currentTarget as HTMLSelectElement).value)}>
+            {#each models as m}<option value={m}>{m}</option>{/each}
+          </select>
+        {:else}
+          <input type="text" value={llmClient.model} onchange={(e) => llmClient.setModel((e.currentTarget as HTMLInputElement).value)} placeholder="model id" />
+        {/if}
+      </label>
+      <div class="llm-actions">
+        <button class="test-btn" onclick={testConnection} disabled={testing}>{testing ? 'Testing…' : 'Test connection'}</button>
+      </div>
+      {#if testMsg}<p class="llm-msg" class:err={testMsg.startsWith('✗')}>{testMsg}</p>{/if}
+    </div>
+    {/if}
 
     {#if insights.length === 0 && verified.length === 0}
     <div class="empty-state">
@@ -245,6 +295,82 @@
   }
 
   .close-btn:hover { color: #fff; }
+
+  .gear-btn {
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 13px;
+    cursor: pointer;
+    padding: 0 2px;
+    line-height: 1;
+  }
+  .gear-btn:hover { color: #fff; }
+
+  .llm-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #555;
+  }
+  .llm-dot.on {
+    background: #10b981;
+    box-shadow: 0 0 6px #10b981;
+  }
+
+  .llm-settings {
+    padding: 12px;
+    border-bottom: 1px solid #222;
+    background: #151515;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .llm-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #888;
+  }
+  .llm-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 9px;
+    color: #999;
+  }
+  .llm-field input, .llm-field select {
+    background: #0e0e0e;
+    border: 1px solid #333;
+    border-radius: 4px;
+    color: #eee;
+    padding: 5px 7px;
+    font-size: 10px;
+    font-family: inherit;
+  }
+  .llm-field input:focus, .llm-field select:focus {
+    outline: none;
+    border-color: #d62430;
+  }
+  .llm-actions { display: flex; gap: 8px; }
+  .test-btn {
+    background: #d62430;
+    border: none;
+    color: #fff;
+    padding: 6px 12px;
+    border-radius: 4px;
+    font-size: 10px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .test-btn:hover { background: #b01e28; }
+  .test-btn:disabled { opacity: 0.6; cursor: default; }
+  .llm-msg {
+    margin: 0;
+    font-size: 9px;
+    color: #86efac;
+  }
+  .llm-msg.err { color: #fca5a5; }
 
   .empty-state {
     padding: 24px;

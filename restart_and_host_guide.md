@@ -10,9 +10,9 @@ To run the application entirely on your local machine:
 
 ### 1. Start the Python Backend
 1. Open a terminal (PowerShell, Command Prompt, or terminal of your choice).
-2. Run the FastAPI server:
+2. Run the FastAPI server (using Python 3.10 is highly recommended on this system, as Windows Smart App Control blocks the newer OpenSeesPy DLL version installed on Python 3.12):
    ```bash
-   py -3.12 backend/main.py
+   py -3.10 backend/main.py
    ```
    *The backend will start running locally at **`http://localhost:8000`**.*
 

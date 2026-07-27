@@ -16,6 +16,14 @@
   let polylineWallStiffness = $derived(selectedPolylineWall ? computePolylineWallStiffness(selectedPolylineWall) : null);
   let slabArea = $derived(selectedSlab ? Math.abs(polygonSignedArea(selectedSlab.vertices)) : 0);
 
+  let selectedColumns = $derived(model.columns.filter(c => uiState.selectedElementIds.includes(c.id)));
+  let selectedWalls = $derived(model.walls.filter(w => uiState.selectedElementIds.includes(w.id)));
+  let selectedPolylineWalls = $derived(model.polylineWalls.filter(pw => uiState.selectedElementIds.includes(pw.id)));
+  let selectedBeams = $derived(model.beams.filter(b => uiState.selectedElementIds.includes(b.id)));
+  let selectedSlabs = $derived(model.slabs.filter(s => uiState.selectedElementIds.includes(s.id)));
+  let selectedDropPanels = $derived(model.dropPanels.filter(dp => uiState.selectedElementIds.includes(dp.id)));
+  let totalSelected = $derived(uiState.selectedElementIds.length);
+
   let editingVertexIndex: number | null = $state(null);
   let editingVertexX = $state('');
   let editingVertexY = $state('');
@@ -169,8 +177,394 @@
 
     <div class="flex-1 overflow-y-auto pr-1 space-y-3">
       {#if uiState.selectedElementIds.length > 1}
-        <div class="text-slate-300 font-bold text-sm mb-1">{uiState.selectedElementIds.length} elements selected</div>
-        <div class="text-slate-500 font-medium">Multiple elements are selected. Deselect or edit them individually.</div>
+        <div class="text-slate-300 font-bold text-sm mb-1">{totalSelected} elements selected</div>
+        <div class="text-slate-400 font-medium mb-3 text-[11px]">Edit properties of all selected elements below. Unchanged fields retain their values.</div>
+
+        <div class="space-y-3">
+          {#if selectedSlabs.length > 0}
+            <div class="border border-slate-700/50 rounded-lg p-2.5 bg-slate-900/30 space-y-2">
+              <div class="flex items-center justify-between border-b border-slate-800 pb-1.5 mb-1.5">
+                <div class="font-bold text-blue-400 text-[10px] uppercase tracking-wider">Slabs ({selectedSlabs.length})</div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Thickness (m)</label>
+                  <input type="number" step="0.01" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const s of selectedSlabs) model.updateSlab(s.id, { thickness: v });
+                        uiState.setStatusMessage(`Updated thickness to ${v}m for ${selectedSlabs.length} slabs`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-blue-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Concrete Grade</label>
+                  <select
+                    onchange={(e) => {
+                      const g = e.currentTarget.value;
+                      if (g) {
+                        model.beginAction();
+                        for (const s of selectedSlabs) model.updateSlab(s.id, { concreteGrade: g });
+                        uiState.setStatusMessage(`Updated concrete grade to ${g} for ${selectedSlabs.length} slabs`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-blue-500 focus:outline-none"
+                  >
+                    <option value="">Keep original</option>
+                    <option value="M20">M20</option>
+                    <option value="M25">M25</option>
+                    <option value="M30">M30</option>
+                    <option value="M35">M35</option>
+                    <option value="M40">M40</option>
+                    <option value="M45">M45</option>
+                    <option value="M50">M50</option>
+                    <option value="M55">M55</option>
+                    <option value="M60">M60</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label class="block text-slate-500 mb-0.5 text-[10px]">Uniform Load (kN/m²)</label>
+                <input type="number" step="0.5" placeholder="Keep original"
+                  onchange={(e) => {
+                    const v = parseFloat(e.currentTarget.value);
+                    if (!isNaN(v)) {
+                      model.beginAction();
+                      for (const s of selectedSlabs) model.updateSlab(s.id, { uniformLoad: v });
+                      uiState.setStatusMessage(`Updated uniform load to ${v} kN/m² for ${selectedSlabs.length} slabs`);
+                    }
+                  }}
+                  class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-blue-500 focus:outline-none" />
+              </div>
+            </div>
+          {/if}
+
+          {#if selectedColumns.length > 0}
+            <div class="border border-slate-700/50 rounded-lg p-2.5 bg-slate-900/30 space-y-2">
+              <div class="flex items-center justify-between border-b border-slate-800 pb-1.5 mb-1.5">
+                <div class="font-bold text-amber-400 text-[10px] uppercase tracking-wider">Columns ({selectedColumns.length})</div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Shape</label>
+                  <select
+                    onchange={(e) => {
+                      const shape = e.currentTarget.value as 'rectangular' | 'circular';
+                      if (shape) {
+                        model.beginAction();
+                        for (const c of selectedColumns) model.updateColumn(c.id, { shape });
+                        uiState.setStatusMessage(`Updated shape to ${shape} for ${selectedColumns.length} columns`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-amber-500 focus:outline-none"
+                  >
+                    <option value="">Keep original</option>
+                    <option value="rectangular">Rectangular</option>
+                    <option value="circular">Circular</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Concrete Grade</label>
+                  <select
+                    onchange={(e) => {
+                      const g = e.currentTarget.value;
+                      if (g) {
+                        model.beginAction();
+                        for (const c of selectedColumns) model.updateColumn(c.id, { concreteGrade: g });
+                        uiState.setStatusMessage(`Updated concrete grade to ${g} for ${selectedColumns.length} columns`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-amber-500 focus:outline-none"
+                  >
+                    <option value="">Keep original</option>
+                    <option value="M20">M20</option>
+                    <option value="M25">M25</option>
+                    <option value="M30">M30</option>
+                    <option value="M35">M35</option>
+                    <option value="M40">M40</option>
+                    <option value="M45">M45</option>
+                    <option value="M50">M50</option>
+                    <option value="M55">M55</option>
+                    <option value="M60">M60</option>
+                  </select>
+                </div>
+              </div>
+              <div class="grid grid-cols-3 gap-1">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[9px]">Width b (m)</label>
+                  <input type="number" step="0.05" placeholder="b"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const c of selectedColumns) {
+                          if (c.shape !== 'circular') model.updateColumn(c.id, { width: v });
+                        }
+                        uiState.setStatusMessage(`Updated width to ${v}m for selected columns`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-1 py-1 text-white border border-slate-600 focus:border-amber-500 focus:outline-none text-center" />
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[9px]">Depth h (m)</label>
+                  <input type="number" step="0.05" placeholder="h"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const c of selectedColumns) {
+                          if (c.shape !== 'circular') model.updateColumn(c.id, { depth: v });
+                        }
+                        uiState.setStatusMessage(`Updated depth to ${v}m for selected columns`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-1 py-1 text-white border border-slate-600 focus:border-amber-500 focus:outline-none text-center" />
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[9px]">Diam. D (m)</label>
+                  <input type="number" step="0.05" placeholder="D"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const c of selectedColumns) {
+                          if (c.shape === 'circular') model.updateColumn(c.id, { diameter: v, width: v, depth: v });
+                        }
+                        uiState.setStatusMessage(`Updated diameter to ${v}m for selected circular columns`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-1 py-1 text-white border border-slate-600 focus:border-amber-500 focus:outline-none text-center" />
+                </div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Height (m)</label>
+                  <input type="number" step="0.1" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const c of selectedColumns) model.updateColumn(c.id, { height: v });
+                        uiState.setStatusMessage(`Updated height to ${v}m for ${selectedColumns.length} columns`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-amber-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Boundary Cond.</label>
+                  <select
+                    onchange={(e) => {
+                      const bc = e.currentTarget.value as BoundaryCondition;
+                      if (bc) {
+                        model.beginAction();
+                        for (const c of selectedColumns) model.updateColumn(c.id, { boundaryCondition: bc });
+                        uiState.setStatusMessage(`Updated boundary condition to ${bc} for ${selectedColumns.length} columns`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-amber-500 focus:outline-none"
+                  >
+                    <option value="">Keep original</option>
+                    <option value="fixed-fixed">Fixed-Fixed</option>
+                    <option value="fixed-pinned">Fixed-Pinned</option>
+                    <option value="fixed-free">Fixed-Free</option>
+                    <option value="pinned-pinned">Pinned-Pinned</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          {/if}
+
+          {#if selectedBeams.length > 0}
+            <div class="border border-slate-700/50 rounded-lg p-2.5 bg-slate-900/30 space-y-2">
+              <div class="flex items-center justify-between border-b border-slate-800 pb-1.5 mb-1.5">
+                <div class="font-bold text-violet-400 text-[10px] uppercase tracking-wider">Beams ({selectedBeams.length})</div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Width (m)</label>
+                  <input type="number" step="0.05" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const b of selectedBeams) model.updateBeam(b.id, { width: v });
+                        uiState.setStatusMessage(`Updated width to ${v}m for ${selectedBeams.length} beams`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-violet-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Depth (m)</label>
+                  <input type="number" step="0.05" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const b of selectedBeams) model.updateBeam(b.id, { depth: v });
+                        uiState.setStatusMessage(`Updated depth to ${v}m for ${selectedBeams.length} beams`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-violet-500 focus:outline-none" />
+                </div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Concrete Grade</label>
+                  <select
+                    onchange={(e) => {
+                      const g = e.currentTarget.value;
+                      if (g) {
+                        model.beginAction();
+                        for (const b of selectedBeams) model.updateBeam(b.id, { concreteGrade: g });
+                        uiState.setStatusMessage(`Updated concrete grade to ${g} for ${selectedBeams.length} beams`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-violet-500 focus:outline-none"
+                  >
+                    <option value="">Keep original</option>
+                    <option value="M20">M20</option>
+                    <option value="M25">M25</option>
+                    <option value="M30">M30</option>
+                    <option value="M35">M35</option>
+                    <option value="M40">M40</option>
+                    <option value="M45">M45</option>
+                    <option value="M50">M50</option>
+                    <option value="M55">M55</option>
+                    <option value="M60">M60</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Height (m)</label>
+                  <input type="number" step="0.1" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const b of selectedBeams) model.updateBeam(b.id, { height: v });
+                        uiState.setStatusMessage(`Updated height to ${v}m for ${selectedBeams.length} beams`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-violet-500 focus:outline-none" />
+                </div>
+              </div>
+            </div>
+          {/if}
+
+          {#if (selectedWalls.length + selectedPolylineWalls.length) > 0}
+            <div class="border border-slate-700/50 rounded-lg p-2.5 bg-slate-900/30 space-y-2">
+              <div class="flex items-center justify-between border-b border-slate-800 pb-1.5 mb-1.5">
+                <div class="font-bold text-purple-400 text-[10px] uppercase tracking-wider">Walls ({selectedWalls.length + selectedPolylineWalls.length})</div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Thickness (m)</label>
+                  <input type="number" step="0.05" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const w of selectedWalls) model.updateWall(w.id, { thickness: v });
+                        for (const pw of selectedPolylineWalls) model.updatePolylineWall(pw.id, { thickness: v });
+                        uiState.setStatusMessage(`Updated thickness to ${v}m for selected walls`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-purple-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Height (m)</label>
+                  <input type="number" step="0.1" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const w of selectedWalls) model.updateWall(w.id, { height: v });
+                        for (const pw of selectedPolylineWalls) model.updatePolylineWall(pw.id, { height: v });
+                        uiState.setStatusMessage(`Updated height to ${v}m for selected walls`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-purple-500 focus:outline-none" />
+                </div>
+              </div>
+              <div>
+                <label class="block text-slate-500 mb-0.5 text-[10px]">Concrete Grade</label>
+                <select
+                  onchange={(e) => {
+                    const g = e.currentTarget.value;
+                    if (g) {
+                      model.beginAction();
+                      for (const w of selectedWalls) model.updateWall(w.id, { concreteGrade: g });
+                      for (const pw of selectedPolylineWalls) model.updatePolylineWall(pw.id, { concreteGrade: g });
+                      uiState.setStatusMessage(`Updated concrete grade to ${g} for selected walls`);
+                    }
+                  }}
+                  class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-purple-500 focus:outline-none"
+                >
+                  <option value="">Keep original</option>
+                  <option value="M20">M20</option>
+                  <option value="M25">M25</option>
+                  <option value="M30">M30</option>
+                  <option value="M35">M35</option>
+                  <option value="M40">M40</option>
+                  <option value="M45">M45</option>
+                  <option value="M50">M50</option>
+                  <option value="M55">M55</option>
+                  <option value="M60">M60</option>
+                </select>
+              </div>
+            </div>
+          {/if}
+
+          {#if selectedDropPanels.length > 0}
+            <div class="border border-slate-700/50 rounded-lg p-2.5 bg-slate-900/30 space-y-2">
+              <div class="flex items-center justify-between border-b border-slate-800 pb-1.5 mb-1.5">
+                <div class="font-bold text-pink-400 text-[10px] uppercase tracking-wider">Drop Panels ({selectedDropPanels.length})</div>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Drop thickness (m)</label>
+                  <input type="number" step="0.05" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (v > 0) {
+                        model.beginAction();
+                        for (const dp of selectedDropPanels) model.updateDropPanel(dp.id, { drop: v });
+                        uiState.setStatusMessage(`Updated drop depth to ${v}m for ${selectedDropPanels.length} drop panels`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-pink-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Concrete Grade</label>
+                  <select
+                    onchange={(e) => {
+                      const g = e.currentTarget.value;
+                      if (g) {
+                        model.beginAction();
+                        for (const dp of selectedDropPanels) model.updateDropPanel(dp.id, { concreteGrade: g });
+                        uiState.setStatusMessage(`Updated concrete grade to ${g} for ${selectedDropPanels.length} drop panels`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-pink-500 focus:outline-none"
+                  >
+                    <option value="">Keep original</option>
+                    <option value="M20">M20</option>
+                    <option value="M25">M25</option>
+                    <option value="M30">M30</option>
+                    <option value="M35">M35</option>
+                    <option value="M40">M40</option>
+                    <option value="M45">M45</option>
+                    <option value="M50">M50</option>
+                    <option value="M55">M55</option>
+                    <option value="M60">M60</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          {/if}
+        </div>
       {:else if uiState.selectedElementId && (selectedColumn || selectedWall || selectedPolylineWall || selectedNonStructuralWall || selectedNonStructuralPolylineWall || selectedBeam || selectedSlab || selectedDropPanel)}
     <div class="flex items-center justify-between">
       <div class="font-bold text-slate-300 text-sm">
@@ -803,19 +1197,7 @@
               <option value="M60">M60</option>
             </select>
           </div>
-          <div>
-            <label class="block text-slate-500 mb-0.5">Cracking Modifier</label>
-            <input
-              type="number"
-              step="0.05"
-              min="0.01"
-              max="1.0"
-              value={slab.crackingModifier ?? 0.25}
-              onfocus={beginEdit}
-              oninput={(e) => { const v = parseNum(e.currentTarget.value); if (v !== null && v > 0) model.updateSlab(slab.id, { crackingModifier: v }); }}
-              class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600 focus:border-indigo-500 focus:outline-none"
-            />
-          </div>
+
         </div>
         <div>
           <label class="block text-slate-500 mb-0.5">Vertex Coordinates</label>

@@ -18,12 +18,17 @@ class ColumnSupport(BaseModel):
     width: float = 0.3
     depth: float = 0.3
     height: float = 3.0
+    shape: str = "rectangular"
+    diameter: float = 0.5
+    concreteGrade: str = "M25"
+    boundaryCondition: str = "fixed-fixed"
 
 class WallSupport(BaseModel):
     startPoint: Point2D
     endPoint: Point2D
     thickness: float = 0.25
     height: float = 3.0
+    elasticModulus: float = 25e9
 
 class BeamDef(BaseModel):
     startPoint: Point2D
@@ -56,9 +61,9 @@ class FEMMesh(BaseModel):
     elements: List[Triangle]
     nodeCount: int
     elementCount: int
-    minAngle: float
-    maxAspectRatio: float
-    meshQuality: str
+    minAngle: float = 60.0
+    maxAspectRatio: float = 1.0
+    meshQuality: str = "Good"
     unconnectedNodeIds: List[int] = []
 
 class MeshResponse(BaseModel):
@@ -73,6 +78,11 @@ class PunchingStress(BaseModel):
     capacity_MPa: float
     ratio: float
     status: str  # "OK", "WARNING", "FAIL"
+    gamma_v: Optional[float] = None
+    Jc: Optional[float] = None
+    M_unbalanced: Optional[float] = None
+    v_u_direct: Optional[float] = None
+    v_u_eccentric: Optional[float] = None
 
 class DropPanelDef(BaseModel):
     vertices: List[Point2D]
@@ -85,6 +95,11 @@ class LineLoadSegment(BaseModel):
     endY: float
     lineLoad: float  # kN/m
 
+class EqualDofConstraint(BaseModel):
+    nodeIdA: int
+    nodeIdB: int
+    dofs: List[int]
+
 class AnalysisRequest(BaseModel):
     mesh: FEMMesh
     thickness: float
@@ -92,11 +107,16 @@ class AnalysisRequest(BaseModel):
     poissonRatio: float
     uniformLoad: float
     selfWeight: float = 0
+    # Multi-slab parallel vectors per mesh element
+    elementLoads: List[float] = []        # kN/m²
+    elementThicknesses: List[float] = []  # m
+    elementElasticModuli: List[float] = [] # Pa
     wallNodeIds: List[int] = []
     wallStartPoints: List[Point2D] = []
     wallEndPoints: List[Point2D] = []
     wallThicknesses: List[float] = []
     wallHeights: List[float] = []
+    wallElasticModuli: List[float] = []
     columnNodeIds: List[int] = []
     columnHeights: List[float] = []
     columnStiffnesses: List[float] = []
@@ -116,6 +136,10 @@ class AnalysisRequest(BaseModel):
     beamElasticModuli: List[float] = []  # Pa
     dropPanels: List[DropPanelDef] = []
     partitionWallSegments: List[LineLoadSegment] = []  # line loads from partition walls (kN/m)
+    equalDofConstraints: List[EqualDofConstraint] = []
+    performCrackedAnalysis: bool = False
+    adaptiveMeshRefinement: bool = False
+    maxAdaptivePasses: int = 3
 
 class NodeDeflection(BaseModel):
     nodeId: int
@@ -134,6 +158,18 @@ class ElementMoment(BaseModel):
     m1: float
     m2: float
     angle: float
+    mxd_pos: Optional[float] = 0.0
+    myd_pos: Optional[float] = 0.0
+    mxd_neg: Optional[float] = 0.0
+    myd_neg: Optional[float] = 0.0
+    spr_mx: Optional[float] = None
+    spr_my: Optional[float] = None
+    spr_mxy: Optional[float] = None
+    ast_x_bot: Optional[float] = None
+    ast_y_bot: Optional[float] = None
+    ast_x_top: Optional[float] = None
+    ast_y_top: Optional[float] = None
+
 
 class ElementStress(BaseModel):
     elementId: int
@@ -189,4 +225,39 @@ class AnalysisResponse(BaseModel):
     solverTime: float = 0
     crX: Optional[float] = None
     crY: Optional[float] = None
+    zz_error_eta: Optional[float] = None
+    adaptive_iterations: Optional[int] = None
+    cracked_deflection_max: Optional[float] = None
+    error: Optional[str] = None
+
+class SingleSlabPayload(BaseModel):
+    slabId: str
+    geometry: SlabGeometry
+    meshSize: float = 0.5
+    thickness: float = 0.2
+    elasticModulus: float = 25e9
+    poissonRatio: float = 0.2
+    uniformLoad: float = 5.0
+    selfWeight: float = 0.0
+
+class MultiSlabAnalysisRequest(BaseModel):
+    slabs: List[SingleSlabPayload]
+    walls: List[WallSupport] = []
+    columns: List[ColumnSupport] = []
+    beams: List[BeamDef] = []
+    dropPanels: List[DropPanelDef] = []
+    nonStructuralWalls: List[LineLoadSegment] = []
+    partitionWallSegments: List[LineLoadSegment] = []
+    meshSize: float = 0.5
+
+class SlabAnalysisResult(BaseModel):
+    slabId: str
+    mesh: FEMMesh
+    result: AnalysisResponse
+
+class MultiSlabAnalysisResponse(BaseModel):
+    success: bool
+    results: List[SlabAnalysisResult] = []
+    warnings: List[str] = []
+    disconnectedIds: List[str] = []
     error: Optional[str] = None

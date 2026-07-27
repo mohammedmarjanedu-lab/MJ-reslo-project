@@ -1,0 +1,18 @@
+{
+  "solver": "python_dkt",
+  "success": true,
+  "maxDeflection_mm": 1.8713935,
+  "centerDeflection_mm": 1.8713934621128487,
+  "minMx": 0,
+  "maxMx": 0,
+  "minMy": 0,
+  "maxMy": 0,
+  "minMxy": 0,
+  "maxMxy": 0,
+  "minVx": 0,
+  "maxVx": 0,
+  "minVy": 0,
+  "maxVy": 0,
+  "nodeCount": 225,
+  "elementCount": 196
+}

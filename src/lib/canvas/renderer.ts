@@ -1495,9 +1495,10 @@ function extractNodeValues(
   const nodeValues = new Map<number, number>();
 
   if (resultType === 'deflection') {
-    for (const d of result.nodeDeflections) nodeValues.set(d.nodeId, Math.abs(d.wz) * 1000);
+    for (const d of result.nodeDeflections) nodeValues.set(d.nodeId, d.wz);
     return nodeValues;
   }
+
 
   if (resultType === 'punching') {
     const r = result as any;

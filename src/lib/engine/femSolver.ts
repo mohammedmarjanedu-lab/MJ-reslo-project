@@ -1,10 +1,12 @@
 import type {
   SlabPolygon, ColumnElement, ShearWallElement, PolylineWallElement, BeamElement,
   DropPanelElement, Point2D, FEMNode, FEMMesh, FEMElement,
-  SlabFEMResult, FEMStressResult, NonStructuralWallElement, PolylineNonStructuralWallElement
+  SlabFEMResult, FEMStressResult, NonStructuralWallElement, PolylineNonStructuralWallElement,
+  ColumnPunchingResult
 } from './types';
 import { generateSlabMesh } from './meshGenerator';
 import { pointInPolygon, distance, polygonSignedArea, polygonCentroid } from './mathEngine';
+import { runSlabDesign } from './is456Design';
 
 function pointToSegmentDist(p: Point2D, a: Point2D, b: Point2D): number {
   const dx = b.x - a.x, dy = b.y - a.y;
@@ -13,6 +15,50 @@ function pointToSegmentDist(p: Point2D, a: Point2D, b: Point2D): number {
   let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
   t = Math.max(0, Math.min(1, t));
   return distance(p, { x: a.x + t * dx, y: a.y + t * dy });
+}
+
+/**
+ * Check if two slab polygons touch, overlap, or share an edge within tolerance.
+ * Used to detect connected components for multi-slab analysis.
+ */
+function slabsTouch(a: Point2D[], b: Point2D[], tol = 0.75): boolean {
+  if (a.length < 3 || b.length < 3) return false;
+  // Quick bounding-box check
+  const aMinX = Math.min(...a.map(v => v.x)), aMaxX = Math.max(...a.map(v => v.x));
+  const aMinY = Math.min(...a.map(v => v.y)), aMaxY = Math.max(...a.map(v => v.y));
+  const bMinX = Math.min(...b.map(v => v.x)), bMaxX = Math.max(...b.map(v => v.x));
+  const bMinY = Math.min(...b.map(v => v.y)), bMaxY = Math.max(...b.map(v => v.y));
+  if (aMinX > bMaxX + tol || aMaxX < bMinX - tol || aMinY > bMaxY + tol || aMaxY < bMinY - tol) {
+    return false; // bounding boxes don't overlap
+  }
+  // Check direct vertex-to-vertex proximity
+  for (const va of a) {
+    for (const vb of b) {
+      if (distance(va, vb) <= tol) return true;
+    }
+  }
+  // Check if any vertex of a is inside b or within tol of an edge
+  for (const v of a) {
+    if (pointInPolygon(v, b)) return true;
+    for (let i = 0; i < b.length; i++) {
+      const j = (i + 1) % b.length;
+      if (pointToSegmentDist(v, b[i], b[j]) < tol) return true;
+    }
+  }
+  // Check if any vertex of b is inside a
+  for (const v of b) {
+    if (pointInPolygon(v, a)) return true;
+  }
+  // Check edge-edge intersections
+  for (let i = 0; i < a.length; i++) {
+    const ai = a[i], aj = a[(i + 1) % a.length];
+    for (let k = 0; k < b.length; k++) {
+      const bk = b[k], bl = b[(k + 1) % b.length];
+      const inter = lineSegmentIntersection(ai, aj, bk, bl);
+      if (inter) return true;
+    }
+  }
+  return false;
 }
 
 function projectPointOnSegment(p: Point2D, a: Point2D, b: Point2D): Point2D {
@@ -326,8 +372,8 @@ function computeQ8PlateStiffness(
     }
   }
 
-  // Shear contribution (1-point reduced integration — standard for Q4)
-  for (const gp of G1) {
+  // Shear contribution (2×2 reduced integration — prevents shear locking for Q8)
+  for (const gp of G2x2) {
     const { dN_dξ, dN_dη } = q8DShape(gp.ξ, gp.η);
     const N = q8Shape(gp.ξ, gp.η);
 
@@ -537,6 +583,18 @@ function findNodesOnSegment(nodes: FEMNode[], a: Point2D, b: Point2D, tolerance:
   return result;
 }
 
+export function pointToPolygonDist(p: Point2D, poly: Point2D[]): number {
+  if (poly.length < 3) return Infinity;
+  let minD = Infinity;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const d = pointToSegmentDist(p, a, b);
+    if (d < minD) minD = d;
+  }
+  return minD;
+}
+
 function findPolygonIntersectingSegments(poly: Point2D[], segmentA: Point2D, segmentB: Point2D): Point2D[] {
   const pts: Point2D[] = [];
   for (let i = 0; i < poly.length; i++) {
@@ -584,10 +642,11 @@ export function findCollinearSlabEdge(poly: Point2D[], a: Point2D, b: Point2D, t
  * Solve K*u = f using banded LDL^T factorization.
  * K is stored as lower banded matrix: K[i][j] for i-j >= 0, bandwidth bw.
  */
-function solveBanded(K: number[][], f: number[], bw: number): number[] {
+function solveBanded(K: number[][], f: number[], bw: number): { u: number[]; warnings: string[] } {
   const n = f.length;
   const L: number[][] = Array.from({ length: n }, () => new Array(bw).fill(0));
   const D = new Array(n).fill(0);
+  const warnings: string[] = [];
 
   for (let i = 0; i < n; i++) {
     // LDL^T factorization
@@ -599,8 +658,10 @@ function solveBanded(K: number[][], f: number[], bw: number): number[] {
         }
       }
       if (i === j) {
-        if (Math.abs(sum) < 1e-15) D[i] = 1e-15;
-        else D[i] = sum;
+        if (Math.abs(sum) < 1e-15) {
+          warnings.push(`Singular DOF at index ${i} (pivot=${sum.toExponential(2)}) — structure may be unstable or unsupported.`);
+          D[i] = 1e-15;
+        } else D[i] = sum;
         L[i][0] = 1;
       } else {
         if (Math.abs(D[i]) < 1e-15) L[j][j - i] = 0;
@@ -629,7 +690,7 @@ function solveBanded(K: number[][], f: number[], bw: number): number[] {
     u[i] = sum;
   }
 
-  return u;
+  return { u, warnings };
 }
 
 /**
@@ -648,8 +709,16 @@ export function analyzeAllSlabs(
   meshSize: number,
   poissonRatio: number,
   useQ8 = false,
-  onProgress?: (pct: number, slabId?: string) => void
-): SlabFEMResult[] {
+  onProgress?: (pct: number, slabId?: string) => void,
+  designOptions?: {
+    concreteGrade?: string;
+    steelGrade?: string;
+    cover?: number;
+    barDia?: number;
+    exposureLimit?: number;
+    longTermFactor?: number;
+  }
+): { results: SlabFEMResult[]; warnings: string[] } {
   onProgress?.(0.05);
 
   // 1. Mesh all slabs individually
@@ -661,8 +730,53 @@ export function analyzeAllSlabs(
     }
   }
 
-  if (slabMeshes.length === 0) return [];
+  if (slabMeshes.length === 0) return { results: [], warnings: [] };
   onProgress?.(0.10);
+
+  // 1b. Detect disconnected slab groups — solve each independently
+  const groups: { slab: SlabPolygon; mesh: FEMMesh }[][] = [];
+  const assigned = new Set<number>();
+  for (let i = 0; i < slabMeshes.length; i++) {
+    if (assigned.has(i)) continue;
+    const group: typeof slabMeshes = [slabMeshes[i]];
+    assigned.add(i);
+    // Find all slabs that touch this group (transitive closure)
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let j = 0; j < slabMeshes.length; j++) {
+        if (assigned.has(j)) continue;
+        if (group.some(g => slabsTouch(g.slab.vertices, slabMeshes[j].slab.vertices, Math.max(0.75, meshSize * 1.5)))) {
+          group.push(slabMeshes[j]);
+          assigned.add(j);
+          changed = true;
+        }
+      }
+    }
+    groups.push(group);
+  }
+
+  if (groups.length > 1) {
+    // Multiple disconnected groups — solve each independently and merge
+    const allResults: SlabFEMResult[] = [];
+    const allWarnings: string[] = [];
+    for (let g = 0; g < groups.length; g++) {
+      const grp = groups[g];
+      const grpSlabs = grp.map(sm => sm.slab);
+      // Filter columns to those near this group's slabs
+      const grpColumns = columns.filter(col =>
+        grp.some(({ slab }) => pointInPolygon(col.position, slab.vertices) ||
+          pointToPolygonDist(col.position, slab.vertices) < Math.max(0.75, meshSize * 1.5))
+      );
+      // Solve this group via recursion (re-meshes, but that's fast and avoids duplicating 700 lines)
+      const grpResult = analyzeAllSlabs(grpSlabs, grpColumns, walls, polylineWalls, beams,
+        dropPanels, nonStructuralWalls, polylineNonStructuralWalls,
+        meshSize, poissonRatio, useQ8, undefined, designOptions);
+      allResults.push(...grpResult.results);
+      allWarnings.push(...grpResult.warnings);
+    }
+    return { results: allResults, warnings: allWarnings };
+  }
 
   // 2. Build global nodes and merge coincident nodes (within tolerance)
   interface NodeRef {
@@ -682,30 +796,52 @@ export function analyzeAllSlabs(
   // Sort nodes along the X-axis to group coincident nodes together
   allNodes.sort((a, b) => a.x - b.x);
 
-  const mergeTol = meshSize * 0.1;
-  const uniqueNodes: FEMNode[] = [];
+  const mergeTol = Math.max(0.12, meshSize * 0.35);
+  const mergeTolSq = mergeTol * mergeTol;
+  interface UniqueNodeRef extends FEMNode {
+    slabId: string;
+  }
+  const uniqueNodes: UniqueNodeRef[] = [];
+
+  // Spatial grid for O(n) node merging instead of O(n²)
+  const gridSize = Math.max(mergeTol, 0.5);
+  const grid = new Map<string, number[]>(); // "gx,gy" -> indices into uniqueNodes
 
   for (const node of allNodes) {
     let foundIdx = -1;
-    // Since uniqueNodes is naturally sorted by X coordinate, we only need to scan back
-    // a very small distance until the difference in X exceeds the merge tolerance.
-    for (let u = uniqueNodes.length - 1; u >= 0; u--) {
-      const un = uniqueNodes[u];
-      if (node.x - un.x > mergeTol) {
-        break; // Coincident nodes cannot be further back
+
+    // Check only nearby grid cells (3x3 neighborhood)
+    const gx = Math.floor(node.x / gridSize);
+    const gy = Math.floor(node.y / gridSize);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const key = (gx + dx) + ',' + (gy + dy);
+        const cell = grid.get(key);
+        if (cell) {
+          for (const ui of cell) {
+            const un = uniqueNodes[ui];
+            const distSq = (node.x - un.x) ** 2 + (node.y - un.y) ** 2;
+            if (distSq < mergeTolSq) {
+              foundIdx = ui;
+              break;
+            }
+          }
+        }
+        if (foundIdx >= 0) break;
       }
-      if (Math.abs(node.y - un.y) < mergeTol) {
-        foundIdx = u;
-        break;
-      }
+      if (foundIdx >= 0) break;
     }
 
     if (foundIdx >= 0) {
       node.globalIdx = foundIdx;
     } else {
       const newIdx = uniqueNodes.length;
-      uniqueNodes.push({ id: newIdx, x: node.x, y: node.y });
+      uniqueNodes.push({ id: newIdx, x: node.x, y: node.y, slabId: node.slabId });
       node.globalIdx = newIdx;
+      const gk = gx + ',' + gy;
+      let cell = grid.get(gk);
+      if (!cell) { cell = []; grid.set(gk, cell); }
+      cell.push(newIdx);
     }
   }
 
@@ -720,24 +856,61 @@ export function analyzeAllSlabs(
     nodeMap.get(node.slabId)!.set(node.localId, node.globalIdx!);
   }
 
-  const ndof = globalNodes.length * 3;
-  if (ndof === 0) return [];
+  // Build unmerged rotational DOFs map for discontinuous slab edges (hinged joints)
+  const unmergedRotMap = new Map<string, { rx: number; ry: number }>();
+  let nextExtraDof = globalNodes.length * 3;
+
+  for (const { slab, mesh } of slabMeshes) {
+    if (slab.discontinuousEdges && slab.discontinuousEdges.length > 0) {
+      const tol = meshSize * 0.2;
+      for (const n of mesh.nodes) {
+        let isDiscont = false;
+        for (const seg of slab.discontinuousEdges) {
+          if (pointToSegmentDist({ x: n.x, y: n.y }, seg.startPoint, seg.endPoint) < tol) {
+            isDiscont = true;
+            break;
+          }
+        }
+        if (isDiscont) {
+          const key = slab.id + '_' + n.id;
+          unmergedRotMap.set(key, { rx: nextExtraDof, ry: nextExtraDof + 1 });
+          nextExtraDof += 2;
+        }
+      }
+    }
+  }
+
+  function getNodeDofs(slabId: string, localNodeId: number, gNodeIdx: number): [number, number, number] {
+    const key = slabId + '_' + localNodeId;
+    const rot = unmergedRotMap.get(key);
+    if (rot) {
+      return [gNodeIdx * 3, rot.rx, rot.ry];
+    }
+    return [gNodeIdx * 3, gNodeIdx * 3 + 1, gNodeIdx * 3 + 2];
+  }
+
+  const ndof = nextExtraDof;
+  if (ndof === 0) return { results: [], warnings: [] };
   
   onProgress?.(0.15);
 
-  // 3. Compute bandwidth
+  // 3. Compute bandwidth considering all element DOFs (including unmerged rotational DOFs)
   let maxDiff = 0;
   for (const { slab, mesh } of slabMeshes) {
     const localMap = nodeMap.get(slab.id)!;
     for (const elem of mesh.elements) {
-      const gIndices = elem.nodeIds.map(nid => localMap.get(nid)!);
-      const minI = Math.min(...gIndices);
-      const maxI = Math.max(...gIndices);
-      const diff = maxI - minI;
+      const elemDofs: number[] = [];
+      for (const nid of elem.nodeIds) {
+        const gIdx = localMap.get(nid)!;
+        elemDofs.push(...getNodeDofs(slab.id, nid, gIdx));
+      }
+      const minD = Math.min(...elemDofs);
+      const maxD = Math.max(...elemDofs);
+      const diff = maxD - minD;
       if (diff > maxDiff) maxDiff = diff;
     }
   }
-  const bw = Math.min((maxDiff + 1) * 3, ndof);
+  const bw = Math.min(maxDiff + 1, ndof);
   
   const K_band: number[][] = Array.from({ length: ndof }, () => new Array(bw).fill(0));
   const f_global = new Array(ndof).fill(0);
@@ -750,7 +923,7 @@ export function analyzeAllSlabs(
 
   for (const { slab, mesh } of slabMeshes) {
     const localMap = nodeMap.get(slab.id)!;
-    let E = slab.elasticModulus * (slab.crackingModifier ?? 0.25);
+    let E = slab.elasticModulus * (slab.crackingModifier ?? 1.0);
     if (E > 1e8) E /= 1000.0; // Normalize Pa to kPa
     const ν = poissonRatio;
     const t = slab.thickness;
@@ -759,8 +932,8 @@ export function analyzeAllSlabs(
     for (const elem of mesh.elements) {
       const npe = nodesPerElem(elem);
       const elemNodes: Point2D[] = elem.nodeIds.map(nid => {
-        const ni = mesh.nodes.find(n => n.id === nid)!;
-        return { x: ni.x, y: ni.y };
+        const ni = mesh.nodes.find(n => n.id === nid);
+        return { x: ni ? ni.x : 0, y: ni ? ni.y : 0 };
       });
 
       let t_elem = t;
@@ -790,18 +963,18 @@ export function analyzeAllSlabs(
 
       for (let a = 0; a < npe; a++) {
         const gRowNode = localMap.get(elem.nodeIds[a])!;
-        const rowBase = gRowNode * 3;
-        f_global[rowBase] += fe[3 * a];
-        f_global[rowBase + 1] += fe[3 * a + 1];
-        f_global[rowBase + 2] += fe[3 * a + 2];
+        const rowDofs = getNodeDofs(slab.id, elem.nodeIds[a], gRowNode);
+        f_global[rowDofs[0]] += fe[3 * a];
+        f_global[rowDofs[1]] += fe[3 * a + 1];
+        f_global[rowDofs[2]] += fe[3 * a + 2];
 
         for (let b = 0; b < npe; b++) {
           const gColNode = localMap.get(elem.nodeIds[b])!;
-          const colBase = gColNode * 3;
+          const colDofs = getNodeDofs(slab.id, elem.nodeIds[b], gColNode);
           for (let dofA = 0; dofA < 3; dofA++) {
             for (let dofB = 0; dofB < 3; dofB++) {
-              const r = rowBase + dofA;
-              const c = colBase + dofB;
+              const r = rowDofs[dofA];
+              const c = colDofs[dofB];
               const k_val = Ke[3 * a + dofA][3 * b + dofB];
               if (r <= c && (c - r) < bw) {
                 K_band[r][c - r] += k_val;
@@ -891,54 +1064,93 @@ export function analyzeAllSlabs(
   const searchTol = meshSize * 0.6;
   const colTol = meshSize * 1.2;
 
-  // Point supports (columns) — Model as elastic column springs matching OpenSeesPy & ETABS
+  // Point supports (columns) — Model as elastic column springs matching Kratos Multiphysics & ETABS
   const columnPunchingMap = new Map<string, { K_z: number; col: ColumnElement; nodeIdx: number }>();
 
   for (const col of columns) {
     let nearSlab = false;
     for (const { slab } of slabMeshes) {
-      if (pointInPolygon(col.position, slab.vertices) || slab.vertices.some(v => distance(col.position, v) < colTol * 2)) {
+      if (pointInPolygon(col.position, slab.vertices) || pointToPolygonDist(col.position, slab.vertices) < Math.max(0.75, meshSize * 1.5)) {
         nearSlab = true;
         break;
       }
     }
     if (nearSlab) {
-      let minD = Infinity;
-      let ni = -1;
+      let matchedCount = 0;
       for (let i = 0; i < globalNodes.length; i++) {
         const d = distance(col.position, globalNodes[i]);
-        if (d < minD) { minD = d; ni = i; }
-      }
-      if (ni >= 0 && minD < colTol) {
-        const wcol = col.width || 0.3;
-        const dcol = col.depth || 0.3;
-        const Hcol = col.height || 3.0;
-        let E_col = col.elasticModulus || 25e6; // kPa
-        if (E_col > 1e8) E_col /= 1000.0;
+        if (d < colTol) {
+          matchedCount++;
+          const wcol = col.width || 0.3;
+          const dcol = col.depth || 0.3;
+          const Hcol = col.height || 3.0;
+          let E_col = col.elasticModulus || 25e6; // kPa
+          if (E_col > 1e8) E_col /= 1000.0;
 
-        let A_col = wcol * dcol;
-        let Ix = wcol * Math.pow(dcol, 3) / 12.0;
-        let Iy = dcol * Math.pow(wcol, 3) / 12.0;
-        if (col.shape === 'circular') {
-          const diam = col.diameter || 0.5;
-          A_col = Math.PI * Math.pow(diam, 2) / 4.0;
-          Ix = Math.PI * Math.pow(diam, 4) / 64.0;
-          Iy = Ix;
+          let A_col = wcol * dcol;
+          let Ix = wcol * Math.pow(dcol, 3) / 12.0;
+          let Iy = dcol * Math.pow(wcol, 3) / 12.0;
+          if (col.shape === 'circular') {
+            const diam = col.diameter || 0.5;
+            A_col = Math.PI * Math.pow(diam, 2) / 4.0;
+            Ix = Math.PI * Math.pow(diam, 4) / 64.0;
+            Iy = Ix;
+          }
+
+          const K_z = E_col * A_col / Hcol;
+          const K_rx = 4.0 * E_col * Ix / Hcol;
+          const K_ry = 4.0 * E_col * Iy / Hcol;
+
+          const r_w = i * 3;
+          const r_rx = i * 3 + 1;
+          const r_ry = i * 3 + 2;
+
+          K_band[r_w][0] += K_z;
+          K_band[r_rx][0] += K_rx;
+          K_band[r_ry][0] += K_ry;
+
+          columnPunchingMap.set(col.id, { K_z, col, nodeIdx: i });
         }
+      }
 
-        const K_z = E_col * A_col / Hcol;
-        const K_rx = 4.0 * E_col * Ix / Hcol;
-        const K_ry = 4.0 * E_col * Iy / Hcol;
+      if (matchedCount === 0 && globalNodes.length > 0) {
+        let minD = Infinity;
+        let bestIdx = 0;
+        for (let i = 0; i < globalNodes.length; i++) {
+          const d = distance(col.position, globalNodes[i]);
+          if (d < minD) { minD = d; bestIdx = i; }
+        }
+        if (minD < Math.max(1.0, meshSize * 2.0)) {
+          const wcol = col.width || 0.3;
+          const dcol = col.depth || 0.3;
+          const Hcol = col.height || 3.0;
+          let E_col = col.elasticModulus || 25e6;
+          if (E_col > 1e8) E_col /= 1000.0;
 
-        const r_w = ni * 3;
-        const r_rx = ni * 3 + 1;
-        const r_ry = ni * 3 + 2;
+          let A_col = wcol * dcol;
+          let Ix = wcol * Math.pow(dcol, 3) / 12.0;
+          let Iy = dcol * Math.pow(wcol, 3) / 12.0;
+          if (col.shape === 'circular') {
+            const diam = col.diameter || 0.5;
+            A_col = Math.PI * Math.pow(diam, 2) / 4.0;
+            Ix = Math.PI * Math.pow(diam, 4) / 64.0;
+            Iy = Ix;
+          }
 
-        K_band[r_w][0] += K_z;
-        K_band[r_rx][0] += K_rx;
-        K_band[r_ry][0] += K_ry;
+          const K_z = E_col * A_col / Hcol;
+          const K_rx = 4.0 * E_col * Ix / Hcol;
+          const K_ry = 4.0 * E_col * Iy / Hcol;
 
-        columnPunchingMap.set(col.id, { K_z, col, nodeIdx: ni });
+          const r_w = bestIdx * 3;
+          const r_rx = bestIdx * 3 + 1;
+          const r_ry = bestIdx * 3 + 2;
+
+          K_band[r_w][0] += K_z;
+          K_band[r_rx][0] += K_rx;
+          K_band[r_ry][0] += K_ry;
+
+          columnPunchingMap.set(col.id, { K_z, col, nodeIdx: bestIdx });
+        }
       }
     }
   }
@@ -1007,10 +1219,10 @@ export function analyzeAllSlabs(
     }
   }
 
-  if (supportCount === 0) return []; // Unstable structure
+  if (supportCount === 0 && columnPunchingMap.size === 0) return { results: [], warnings: [] }; // Unstable structure
 
   // 7. Solve Global System
-  const u_global = solveBanded(K_band, f_global, bw);
+  const { u: u_global, warnings: solverWarnings } = solveBanded(K_band, f_global, bw);
 
   onProgress?.(0.70);
 
@@ -1020,7 +1232,7 @@ export function analyzeAllSlabs(
   for (let sIdx = 0; sIdx < slabMeshes.length; sIdx++) {
     const { slab, mesh } = slabMeshes[sIdx];
     const localMap = nodeMap.get(slab.id)!;
-    const E = slab.elasticModulus * (slab.crackingModifier ?? 0.25);
+    const E = slab.elasticModulus * (slab.crackingModifier ?? 1.0);
     const ν = poissonRatio;
     const t = slab.thickness;
     
@@ -1053,7 +1265,8 @@ export function analyzeAllSlabs(
       const u_e: number[] = [];
       for (const nid of elem.nodeIds) {
         const gIdx = localMap.get(nid)!;
-        u_e.push(u_global[gIdx * 3], u_global[gIdx * 3 + 1], u_global[gIdx * 3 + 2]);
+        const dofs = getNodeDofs(slab.id, nid, gIdx);
+        u_e.push(u_global[dofs[0]], u_global[dofs[1]], u_global[dofs[2]]);
       }
 
       const D = E * t_elem * t_elem * t_elem / (12 * (1 - ν * ν));
@@ -1116,9 +1329,11 @@ export function analyzeAllSlabs(
 
       let κx = 0, κy = 0, κxy = 0;
       for (let i = 0; i < npe; i++) {
-        κx += dN_dx[i] * u_e[3 * i + 1];
-        κy += dN_dy[i] * u_e[3 * i + 2];
-        κxy += dN_dy[i] * u_e[3 * i + 1] + dN_dx[i] * u_e[3 * i + 2];
+        const theta_x = u_e[3 * i + 1]; // Rotation about X (d_w / d_y)
+        const theta_y = u_e[3 * i + 2]; // Rotation about Y (-d_w / d_x)
+        κx += dN_dx[i] * theta_y;  // d^2_w / d_x^2
+        κy += dN_dy[i] * theta_x;  // d^2_w / d_y^2
+        κxy += dN_dx[i] * theta_x + dN_dy[i] * theta_y; // 2 * d^2_w / (dx dy)
       }
 
       const mx = (Dmat[0][0] * κx + Dmat[0][1] * κy);
@@ -1194,7 +1409,7 @@ export function analyzeAllSlabs(
       const status = ratio < 0.7 ? 'OK' : ratio < 1.0 ? 'WARNING' : 'FAIL';
 
       columnPunching.push({
-        nodeId: nodeIdx + 1,
+        nodeId: nodeIdx,
         force_kN: Math.round(force_kN * 100) / 100,
         stress_MPa: Math.round(v_u_MPa * 1000) / 1000,
         capacity_MPa: Math.round(v_c_MPa * 1000) / 1000,
@@ -1206,6 +1421,7 @@ export function analyzeAllSlabs(
     let minWz = Infinity, maxWz = -Infinity;
     let minMx = Infinity, maxMx = -Infinity;
     let minMy = Infinity, maxMy = -Infinity;
+    let minMxy = Infinity, maxMxy = -Infinity;
     let minVx = Infinity, maxVx = -Infinity;
     let minVy = Infinity, maxVy = -Infinity;
 
@@ -1218,9 +1434,40 @@ export function analyzeAllSlabs(
     for (const m of momentMy) {
       const v = m.value; if (isFinite(v)) { if (v < minMy) minMy = v; if (v > maxMy) maxMy = v; }
     }
+    for (const m of momentMxy) {
+      const v = m.value; if (isFinite(v)) { if (v < minMxy) minMxy = v; if (v > maxMxy) maxMxy = v; }
+    }
     for (const s of shears) {
       if (isFinite(s.vx)) { if (s.vx < minVx) minVx = s.vx; if (s.vx > maxVx) maxVx = s.vx; }
       if (isFinite(s.vy)) { if (s.vy < minVy) minVy = s.vy; if (s.vy > maxVy) maxVy = s.vy; }
+    }
+
+    // ─── IS 456:2000 Design Suite ───
+    const design = designOptions ? runSlabDesign({
+      slabId: slab.id, mesh, nodeDeflections, momentMx, momentMy, momentMxy, stresses, shears, columnPunching
+    } as SlabFEMResult, slab, designOptions) : null;
+
+    let minAstXTop = Infinity, maxAstXTop = -Infinity;
+    let minAstYTop = Infinity, maxAstYTop = -Infinity;
+    let minAstXBot = Infinity, maxAstXBot = -Infinity;
+    let minAstYBot = Infinity, maxAstYBot = -Infinity;
+    let minCrack = Infinity, maxCrack = -Infinity;
+
+    if (design) {
+      for (const r of design.reinforcement) {
+        if (r.ast_x_top < minAstXTop) minAstXTop = r.ast_x_top;
+        if (r.ast_x_top > maxAstXTop) maxAstXTop = r.ast_x_top;
+        if (r.ast_y_top < minAstYTop) minAstYTop = r.ast_y_top;
+        if (r.ast_y_top > maxAstYTop) maxAstYTop = r.ast_y_top;
+        if (r.ast_x_bot < minAstXBot) minAstXBot = r.ast_x_bot;
+        if (r.ast_x_bot > maxAstXBot) maxAstXBot = r.ast_x_bot;
+        if (r.ast_y_bot < minAstYBot) minAstYBot = r.ast_y_bot;
+        if (r.ast_y_bot > maxAstYBot) maxAstYBot = r.ast_y_bot;
+      }
+      for (const c of design.crackWidth) {
+        if (c.crackWidth < minCrack) minCrack = c.crackWidth;
+        if (c.crackWidth > maxCrack) maxCrack = c.crackWidth;
+      }
     }
 
     results.push({
@@ -1229,19 +1476,36 @@ export function analyzeAllSlabs(
       nodeDeflections,
       momentMx, momentMy, momentMxy,
       stresses, shears, columnPunching,
+      woodArmer: design?.woodArmer,
+      reinforcement: design?.reinforcement,
+      shearDesign: design?.shearDesign,
+      crackWidth: design?.crackWidth,
+      deflectionCheck: design?.deflectionCheck,
       minWz: isFinite(minWz) ? minWz : 0,
       maxWz: isFinite(maxWz) ? maxWz : 0,
       minMx: isFinite(minMx) ? minMx : 0,
       maxMx: isFinite(maxMx) ? maxMx : 0,
       minMy: isFinite(minMy) ? minMy : 0,
       maxMy: isFinite(maxMy) ? maxMy : 0,
+      minMxy: isFinite(minMxy) ? minMxy : 0,
+      maxMxy: isFinite(maxMxy) ? maxMxy : 0,
       minVx: isFinite(minVx) ? minVx : 0,
       maxVx: isFinite(maxVx) ? maxVx : 0,
       minVy: isFinite(minVy) ? minVy : 0,
       maxVy: isFinite(maxVy) ? maxVy : 0,
+      minAstXTop: isFinite(minAstXTop) ? minAstXTop : 0,
+      maxAstXTop: isFinite(maxAstXTop) ? maxAstXTop : 0,
+      minAstYTop: isFinite(minAstYTop) ? minAstYTop : 0,
+      maxAstYTop: isFinite(maxAstYTop) ? maxAstYTop : 0,
+      minAstXBot: isFinite(minAstXBot) ? minAstXBot : 0,
+      maxAstXBot: isFinite(maxAstXBot) ? maxAstXBot : 0,
+      minAstYBot: isFinite(minAstYBot) ? minAstYBot : 0,
+      maxAstYBot: isFinite(maxAstYBot) ? maxAstYBot : 0,
+      minCrack: isFinite(minCrack) ? minCrack : 0,
+      maxCrack: isFinite(maxCrack) ? maxCrack : 0,
     });
   }
 
   onProgress?.(1.0);
-  return results;
+  return { results, warnings: solverWarnings };
 }

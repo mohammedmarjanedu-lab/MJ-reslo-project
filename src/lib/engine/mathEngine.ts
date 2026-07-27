@@ -415,7 +415,7 @@ export function computeGlobalMetrics(
     const detailRows = allStiff.map(s =>
       `  ${s.id.padEnd(12)} pos=(${s.position.x.toFixed(3)},${s.position.y.toFixed(3)})  kx=${s.kx.toExponential(3)}  ky=${s.ky.toExponential(3)}  kxy=${s.kxy.toExponential(3)}`
     ).join('\n');
-    const label = usingBackend ? '3D Finite Element (OpenSeesPy)' : 'Weighted-Centroid (no kθ)';
+    const label = usingBackend ? '3D Finite Element (Kratos Multiphysics)' : 'Weighted-Centroid (no kθ)';
     console.log(
       `%c[CR Debug]%c Center-of-Rigidity calculation\n` +
       `─ Method ─────────────────────────────────────\n` +
