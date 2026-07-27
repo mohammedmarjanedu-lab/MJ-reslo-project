@@ -975,29 +975,54 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
         nids = elem.nodeIds
         if len(nids) < 3:
             continue
-        p1 = node_coords_k.get(nids[0])
-        p2 = node_coords_k.get(nids[1])
-        p3 = node_coords_k.get(nids[2])
-        if not p1 or not p2 or not p3:
+
+        pts = [node_coords_k.get(nid) for nid in nids]
+        if any(p is None for p in pts):
             continue
 
-        twoA = (p2[0] * p3[1] - p3[0] * p2[1]) + (p3[0] * p1[1] - p1[0] * p3[1]) + (p1[0] * p2[1] - p2[0] * p1[1])
-        area = 0.5 * abs(twoA)
-        if area < 1e-12:
-            continue
+        knodes = [kratos_nodes_map.get(nid) for nid in nids]
+        rots = [(kn.GetSolutionStepValue(KM.ROTATION)[0], kn.GetSolutionStepValue(KM.ROTATION)[1]) if kn else (0.0, 0.0) for kn in knodes]
+        rx = np.array([r[0] for r in rots])
+        ry = np.array([r[1] for r in rots])
+        coords = np.array(pts)
 
-        b1 = p2[1] - p3[1]; b2 = p3[1] - p1[1]; b3 = p1[1] - p2[1]
-        c1 = p3[0] - p2[0]; c2 = p1[0] - p3[0]; c3 = p2[0] - p1[0]
+        nn_elem = len(nids)
+        if nn_elem == 4:
+            dN_dxi = np.array([
+                [-0.25,  0.25,  0.25, -0.25],
+                [-0.25, -0.25,  0.25,  0.25]
+            ])
+            J = dN_dxi @ coords
+            detJ = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
+            if abs(detJ) < 1e-15:
+                continue
+            area = abs(detJ)
+            invJ = np.linalg.inv(J)
+            dN_dxy = invJ @ dN_dxi
 
-        kn1, kn2, kn3 = kratos_nodes_map.get(nids[0]), kratos_nodes_map.get(nids[1]), kratos_nodes_map.get(nids[2])
-        rx1, ry1 = (kn1.GetSolutionStepValue(KM.ROTATION)[0], kn1.GetSolutionStepValue(KM.ROTATION)[1]) if kn1 else (0.0, 0.0)
-        rx2, ry2 = (kn2.GetSolutionStepValue(KM.ROTATION)[0], kn2.GetSolutionStepValue(KM.ROTATION)[1]) if kn2 else (0.0, 0.0)
-        rx3, ry3 = (kn3.GetSolutionStepValue(KM.ROTATION)[0], kn3.GetSolutionStepValue(KM.ROTATION)[1]) if kn3 else (0.0, 0.0)
+            dry_dx = float(np.dot(dN_dxy[0], ry))
+            dry_dy = float(np.dot(dN_dxy[1], ry))
+            drx_dx = float(np.dot(dN_dxy[0], rx))
+            drx_dy = float(np.dot(dN_dxy[1], rx))
 
-        dry_dx = (b1 * ry1 + b2 * ry2 + b3 * ry3) / twoA
-        dry_dy = (c1 * ry1 + c2 * ry2 + c3 * ry3) / twoA
-        drx_dx = (b1 * rx1 + b2 * rx2 + b3 * rx3) / twoA
-        drx_dy = (c1 * rx1 + c2 * rx2 + c3 * rx3) / twoA
+            b = dN_dxy[0] * area
+            c = dN_dxy[1] * area
+            twoA = 2.0 * area
+        else:
+            p1, p2, p3 = pts[0], pts[1], pts[2]
+            twoA = (p2[0] * p3[1] - p3[0] * p2[1]) + (p3[0] * p1[1] - p1[0] * p3[1]) + (p1[0] * p2[1] - p2[0] * p1[1])
+            area = 0.5 * abs(twoA)
+            if area < 1e-12:
+                continue
+            b1 = p2[1] - p3[1]; b2 = p3[1] - p1[1]; b3 = p1[1] - p2[1]
+            c1 = p3[0] - p2[0]; c2 = p1[0] - p3[0]; c3 = p2[0] - p1[0]
+            b = [b1, b2, b3]
+            c = [c1, c2, c3]
+
+            dry_dx = (b1 * ry[0] + b2 * ry[1] + b3 * ry[2]) / twoA
+            dry_dy = (c1 * ry[0] + c2 * ry[1] + c3 * ry[2]) / twoA
+            drx_dx = (b1 * rx[0] + b2 * rx[1] + b3 * rx[2]) / twoA
+            drx_dy = (c1 * rx[0] + c2 * rx[1] + c3 * rx[2]) / twoA
 
         kappa_x = dry_dx
         kappa_y = -drx_dy
@@ -1020,7 +1045,7 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
 
         raw_elem_data_k.append({
             'id': elem.id, 'nids': nids, 'area': area,
-            'b': [b1, b2, b3], 'c': [c1, c2, c3], 'twoA': twoA,
+            'b': b, 'c': c, 'twoA': twoA,
             'mx': mx, 'my': my, 'mxy': mxy,
             'm1': m1, 'm2': m2, 'angle': angle,
             'mxd_pos': mxd_pos, 'myd_pos': myd_pos,
@@ -1047,9 +1072,9 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
 
     for ed in raw_elem_data_k:
         nids = ed['nids']
-        spr_mx = (nodal_mx_k[nids[0]] + nodal_mx_k[nids[1]] + nodal_mx_k[nids[2]]) / 3.0
-        spr_my = (nodal_my_k[nids[0]] + nodal_my_k[nids[1]] + nodal_my_k[nids[2]]) / 3.0
-        spr_mxy = (nodal_mxy_k[nids[0]] + nodal_mxy_k[nids[1]] + nodal_mxy_k[nids[2]]) / 3.0
+        spr_mx = sum(nodal_mx_k[nid] for nid in nids) / len(nids)
+        spr_my = sum(nodal_my_k[nid] for nid in nids) / len(nids)
+        spr_mxy = sum(nodal_mxy_k[nid] for nid in nids) / len(nids)
 
         em = ElementMoment(
             elementId=ed['id'],
@@ -1066,10 +1091,16 @@ def solve_reslo_structure(request: AnalysisRequest) -> AnalysisResponse:
         min_mxy = min(min_mxy, ed['mxy']); max_mxy = max(max_mxy, ed['mxy'])
 
         b, c, twoA = ed['b'], ed['c'], ed['twoA']
-        dmx_dx = (b[0] * nodal_mx_k[nids[0]] + b[1] * nodal_mx_k[nids[1]] + b[2] * nodal_mx_k[nids[2]]) / twoA
-        dmxy_dy = (c[0] * nodal_mxy_k[nids[0]] + c[1] * nodal_mxy_k[nids[1]] + c[2] * nodal_mxy_k[nids[2]]) / twoA
-        dmxy_dx = (b[0] * nodal_mxy_k[nids[0]] + b[1] * nodal_mxy_k[nids[1]] + b[2] * nodal_mxy_k[nids[2]]) / twoA
-        dmy_dy = (c[0] * nodal_my_k[nids[0]] + c[1] * nodal_my_k[nids[1]] + c[2] * nodal_my_k[nids[2]]) / twoA
+        if len(nids) == 3:
+            dmx_dx = (b[0] * nodal_mx_k[nids[0]] + b[1] * nodal_mx_k[nids[1]] + b[2] * nodal_mx_k[nids[2]]) / twoA
+            dmxy_dy = (c[0] * nodal_mxy_k[nids[0]] + c[1] * nodal_mxy_k[nids[1]] + c[2] * nodal_mxy_k[nids[2]]) / twoA
+            dmxy_dx = (b[0] * nodal_mxy_k[nids[0]] + b[1] * nodal_mxy_k[nids[1]] + b[2] * nodal_mxy_k[nids[2]]) / twoA
+            dmy_dy = (c[0] * nodal_my_k[nids[0]] + c[1] * nodal_my_k[nids[1]] + c[2] * nodal_my_k[nids[2]]) / twoA
+        else:
+            dmx_dx = sum(b[i] * nodal_mx_k[nids[i]] for i in range(len(nids))) / twoA
+            dmxy_dy = sum(c[i] * nodal_mxy_k[nids[i]] for i in range(len(nids))) / twoA
+            dmxy_dx = sum(b[i] * nodal_mxy_k[nids[i]] for i in range(len(nids))) / twoA
+            dmy_dy = sum(c[i] * nodal_my_k[nids[i]] for i in range(len(nids))) / twoA
 
         vx = dmx_dx + dmxy_dy
         vy = dmxy_dx + dmy_dy

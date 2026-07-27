@@ -461,14 +461,32 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             col_node_indices.append(nidx)
             wcol = col_widths[ci] if ci < len(col_widths) else 0.3
             dcol = col_depths[ci] if ci < len(col_depths) else 0.3
+            H = col_heights[ci] if ci < len(col_heights) else 3.0
             col_dims_map[nidx] = (wcol, dcol)
-            if ci < len(col_stiffnesses) and col_stiffnesses[ci] > 0:
-                kth = col_stiffnesses[ci]
-            else:
-                H = col_heights[ci] if ci < len(col_heights) else 3.0
-                I_col = (wcol * dcol**3) / 12.0
-                kth = 4.0 * E * I_col / H
-            col_spring_map[nidx] = kth
+
+            A_col = wcol * dcol
+            Ixx = dcol * wcol**3 / 12.0
+            Iyy = wcol * dcol**3 / 12.0
+
+            Kz = E * A_col / H
+            kth_x = 4.0 * E * Ixx / H
+            kth_y = 4.0 * E * Iyy / H
+
+            # Vertical axial column spring (W-DOF)
+            rows_list.append(NDOF_PER_NODE * nidx + W)
+            cols_list.append(NDOF_PER_NODE * nidx + W)
+            data_list.append(Kz)
+
+            # Rotational column springs (RX and RY DOFs)
+            rows_list.append(NDOF_PER_NODE * nidx + RX)
+            cols_list.append(NDOF_PER_NODE * nidx + RX)
+            data_list.append(kth_x)
+
+            rows_list.append(NDOF_PER_NODE * nidx + RY)
+            cols_list.append(NDOF_PER_NODE * nidx + RY)
+            data_list.append(kth_y)
+
+            col_spring_map[nidx] = Kz
 
     # Beam elements: discretize along mesh nodes and add 12x12 beam stiffness between adjacent node pairs
     if (len(request.beamNodeIdA) > 0 and len(request.beamNodeIdB) > 0

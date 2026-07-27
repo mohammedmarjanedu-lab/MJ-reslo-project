@@ -404,18 +404,23 @@ function toFrontendResult(slabId: string, mesh: any, result: any): any {
     nodeId: d.nodeId, wz: d.wz * 1000,
     rx: d.rx ?? 0, ry: d.ry ?? 0
   }));
-  // Moments, stresses, shears, membrane forces, and punching are stripped from solver output.
-  // Provide empty arrays so the SlabFEMResult shape is satisfied.
-  const momentMx: { elementId: number; value: number }[] = [];
-  const momentMy: { elementId: number; value: number }[] = [];
-  const momentMxy: { elementId: number; value: number }[] = [];
-  const stresses: any[] = [];
-  const shears: any[] = [];
-  const membraneForces: any[] = [];
-  const columnPunching: any[] = [];
+  const momentMx: { elementId: number; value: number }[] = (result.elementMoments || []).map((m: any) => ({
+    elementId: m.elementId,
+    value: m.spr_mx ?? m.mx ?? 0
+  }));
+  const momentMy: { elementId: number; value: number }[] = (result.elementMoments || []).map((m: any) => ({
+    elementId: m.elementId,
+    value: m.spr_my ?? m.my ?? 0
+  }));
+  const momentMxy: { elementId: number; value: number }[] = (result.elementMoments || []).map((m: any) => ({
+    elementId: m.elementId,
+    value: m.spr_mxy ?? m.mxy ?? 0
+  }));
+  const stresses: any[] = result.elementStresses || [];
+  const shears: any[] = result.elementShears || [];
+  const membraneForces: any[] = result.elementMembraneForces || [];
+  const columnPunching: any[] = result.columnPunching || [];
 
-  // Prefer server-provided global min/max (correct for unified multi-slab groups).
-  // Fall back to local recalculation only when server doesn't supply the value. (all in mm)
   const localMinWz = nodeDeflections.length ? Math.min(...nodeDeflections.map((d: any) => d.wz)) : 0;
   const localMaxWz = nodeDeflections.length ? Math.max(...nodeDeflections.map((d: any) => Math.abs(d.wz))) : 0;
 
@@ -428,23 +433,22 @@ function toFrontendResult(slabId: string, mesh: any, result: any): any {
       unconnectedNodeIds: mesh.unconnectedNodeIds || [],
     },
     nodeDeflections, momentMx, momentMy, momentMxy, stresses, shears, membraneForces, columnPunching,
-    // Use server min/max (global for unified slabs) converted to mm when provided; fall back to local (mm)
     minWz: result.minWz !== undefined ? result.minWz * 1000 : localMinWz,
     maxWz: result.maxWz !== undefined ? result.maxWz * 1000 : localMaxWz,
-    minMx: 0,
-    maxMx: 0,
-    minMy: 0,
-    maxMy: 0,
-    minVx: 0,
-    maxVx: 0,
-    minVy: 0,
-    maxVy: 0,
-    minNx: 0,
-    maxNx: 0,
-    minNy: 0,
-    maxNy: 0,
-    minNxy: 0,
-    maxNxy: 0,
+    minMx: result.minMx ?? 0,
+    maxMx: result.maxMx ?? 0,
+    minMy: result.minMy ?? 0,
+    maxMy: result.maxMy ?? 0,
+    minVx: result.minVx ?? 0,
+    maxVx: result.maxVx ?? 0,
+    minVy: result.minVy ?? 0,
+    maxVy: result.maxVy ?? 0,
+    minNx: result.minNx ?? 0,
+    maxNx: result.maxNx ?? 0,
+    minNy: result.minNy ?? 0,
+    maxNy: result.maxNy ?? 0,
+    minNxy: result.minNxy ?? 0,
+    maxNxy: result.maxNxy ?? 0,
     crX: result.crX,
     crY: result.crY,
   };
@@ -978,14 +982,21 @@ export async function meshAndAnalyzeAllSlabs(
       };
     });
 
-    // Moments, stresses, shears, membrane forces, and punching are stripped from solver output.
-    // Provide empty arrays so the SlabFEMResult shape is satisfied.
-    const momentMx: { elementId: number; value: number }[] = [];
-    const momentMy: { elementId: number; value: number }[] = [];
-    const momentMxy: { elementId: number; value: number }[] = [];
-    const stresses: any[] = [];
-    const shears: any[] = [];
-    const columnPunching: any[] = [];
+    const momentMx: { elementId: number; value: number }[] = (result.elementMoments || []).map((m: any) => ({
+      elementId: m.elementId,
+      value: m.spr_mx ?? m.mx ?? 0
+    }));
+    const momentMy: { elementId: number; value: number }[] = (result.elementMoments || []).map((m: any) => ({
+      elementId: m.elementId,
+      value: m.spr_my ?? m.my ?? 0
+    }));
+    const momentMxy: { elementId: number; value: number }[] = (result.elementMoments || []).map((m: any) => ({
+      elementId: m.elementId,
+      value: m.spr_mxy ?? m.mxy ?? 0
+    }));
+    const stresses: any[] = result.elementStresses || [];
+    const shears: any[] = result.elementShears || [];
+    const columnPunching: any[] = result.columnPunching || [];
 
     results.push({
       slabId: sm.slab.id,
@@ -1004,14 +1015,14 @@ export async function meshAndAnalyzeAllSlabs(
       columnPunching,
       minWz: nodeDeflections.length ? Math.min(...nodeDeflections.map(d => d.wz)) : 0,
       maxWz: nodeDeflections.length ? Math.max(...nodeDeflections.map(d => d.wz)) : 0,
-      minMx: 0,
-      maxMx: 0,
-      minMy: 0,
-      maxMy: 0,
-      minVx: 0,
-      maxVx: 0,
-      minVy: 0,
-      maxVy: 0,
+      minMx: result.minMx ?? 0,
+      maxMx: result.maxMx ?? 0,
+      minMy: result.minMy ?? 0,
+      maxMy: result.maxMy ?? 0,
+      minVx: result.minVx ?? 0,
+      maxVx: result.maxVx ?? 0,
+      minVy: result.minVy ?? 0,
+      maxVy: result.maxVy ?? 0,
       crX: result.crX,
       crY: result.crY
     });
