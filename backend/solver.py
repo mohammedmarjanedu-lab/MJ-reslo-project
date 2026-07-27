@@ -478,32 +478,17 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             kth_x = col_factor * E * Ixx / H
             kth_y = col_factor * E * Iyy / H
 
-            r_footprint = max(0.12, 0.45 * max(wcol, dcol))
-            cx, cy = nodes_xy[nidx, 0], nodes_xy[nidx, 1]
-            footprint_nodes = []
-            for check_idx in range(nn):
-                if np.hypot(nodes_xy[check_idx, 0] - cx, nodes_xy[check_idx, 1] - cy) <= r_footprint:
-                    footprint_nodes.append(check_idx)
+            rows_list.append(NDOF_PER_NODE * nidx + W)
+            cols_list.append(NDOF_PER_NODE * nidx + W)
+            data_list.append(Kz)
 
-            if not footprint_nodes:
-                footprint_nodes = [nidx]
+            rows_list.append(NDOF_PER_NODE * nidx + RX)
+            cols_list.append(NDOF_PER_NODE * nidx + RX)
+            data_list.append(kth_x)
 
-            kz_per_node = Kz / len(footprint_nodes)
-            kth_x_per_node = kth_x / len(footprint_nodes)
-            kth_y_per_node = kth_y / len(footprint_nodes)
-
-            for fp_nidx in footprint_nodes:
-                rows_list.append(NDOF_PER_NODE * fp_nidx + W)
-                cols_list.append(NDOF_PER_NODE * fp_nidx + W)
-                data_list.append(kz_per_node)
-
-                rows_list.append(NDOF_PER_NODE * fp_nidx + RX)
-                cols_list.append(NDOF_PER_NODE * fp_nidx + RX)
-                data_list.append(kth_x_per_node)
-
-                rows_list.append(NDOF_PER_NODE * fp_nidx + RY)
-                cols_list.append(NDOF_PER_NODE * fp_nidx + RY)
-                data_list.append(kth_y_per_node)
+            rows_list.append(NDOF_PER_NODE * nidx + RY)
+            cols_list.append(NDOF_PER_NODE * nidx + RY)
+            data_list.append(kth_y)
 
             col_spring_map[nidx] = Kz
 

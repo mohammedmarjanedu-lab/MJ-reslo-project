@@ -112,34 +112,11 @@ class FEMResultState {
 
     switch (rt) {
       case 'deflection': {
-        const accum = new Map<string, number[]>();
-        function pKeyDefl(x: number, y: number): string {
-          return Math.round(x * 200) + '_' + Math.round(y * 200);
-        }
-        for (const r of slabs) {
-          for (const d of r.nodeDeflections) {
-            const node = r.mesh.nodes.find(n => n.id === d.nodeId);
-            if (node && isFinite(d.wz)) {
-              const pk = pKeyDefl(node.x, node.y);
-              let arr = accum.get(pk);
-              if (!arr) { arr = []; accum.set(pk, arr); }
-              arr.push(d.wz);
-            }
-          }
-        }
-        const avgDeflMap = new Map<string, number>();
-        for (const [pk, vals] of accum) {
-          let sum = 0; for (let i = 0; i < vals.length; i++) sum += vals[i];
-          avgDeflMap.set(pk, sum / vals.length);
-        }
         resultMap = new Map();
         for (const r of slabs) {
           const m = new Map<number, number>();
           for (const d of r.nodeDeflections) {
-            const node = r.mesh.nodes.find(n => n.id === d.nodeId);
-            const val = node ? (avgDeflMap.get(pKeyDefl(node.x, node.y)) ?? d.wz) : d.wz;
-            m.set(d.nodeId, val);
-            allVals.push(val);
+            m.set(d.nodeId, d.wz);
           }
           resultMap.set(r.slabId, m);
         }
@@ -221,6 +198,16 @@ class FEMResultState {
         resultMap = elemToGlobalNodeValues(getter, key);
         for (const r of slabs) for (const s of getter(r)) { const v = s[key]; if (isFinite(v)) allVals.push(v); }
         break;
+      }
+    }
+
+    // Gather allVals from resultMap so globalMin and globalMax match rendered nodal values exactly
+    allVals.length = 0;
+    if (resultMap) {
+      for (const m of resultMap.values()) {
+        for (const v of m.values()) {
+          if (isFinite(v)) allVals.push(v);
+        }
       }
     }
 
