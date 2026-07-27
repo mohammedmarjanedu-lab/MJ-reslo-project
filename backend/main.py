@@ -15,8 +15,7 @@ from models import (
     MultiSlabAnalysisRequest, MultiSlabAnalysisResponse
 )
 from mesher import generate_mesh
-from solver import analyze_slab
-from kratos_solver import solve_reslo_structure, solve_multi_slab_structure
+from solver import analyze_slab, solve_multi_slab_dkt
 import logging
 
 logger = logging.getLogger("uvicorn")
@@ -32,12 +31,7 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health():
-    try:
-        import KratosMultiphysics as KM
-        version = getattr(KM, 'KM_PARSER_VERSION', None) or str(getattr(KM.KratosGlobals, 'Version', 'unknown'))
-    except Exception:
-        version = 'unknown'
-    return {"status": "ok", "solver": "KratosMultiphysics StructuralMechanicsApplication", "kratos_version": version}
+    return {"status": "ok", "solver": "Pure Python DKT Direct Sparse Solver (Local Primary)", "kratos_version": "Independent"}
 
 @app.post("/api/mesh", response_model=MeshResponse)
 def mesh_endpoint(request: MeshRequest):
@@ -91,7 +85,6 @@ def sanitize_analysis_response(res: AnalysisResponse) -> AnalysisResponse:
 @app.post("/api/analyze", response_model=AnalysisResponse)
 def analyze_endpoint(request: AnalysisRequest):
     try:
-        # Primary solver: Python DKT (has correct wall rotational spring implementation)
         result = analyze_slab(request)
         return sanitize_analysis_response(result)
     except Exception as e:
@@ -100,8 +93,7 @@ def analyze_endpoint(request: AnalysisRequest):
 @app.post("/api/analyze_multi", response_model=MultiSlabAnalysisResponse)
 def analyze_multi_endpoint(request: MultiSlabAnalysisRequest):
     try:
-        # Use Kratos for multi-slab (handles connected/disconnected slab grouping)
-        response = solve_multi_slab_structure(request)
+        response = solve_multi_slab_dkt(request)
         if response.results:
             for item in response.results:
                 item.result = sanitize_analysis_response(item.result)

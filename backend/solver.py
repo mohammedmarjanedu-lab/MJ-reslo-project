@@ -8,7 +8,8 @@ import math
 from models import FEMMesh, Triangle, Point2D
 from models import (
     AnalysisRequest, AnalysisResponse,
-    NodeDeflection, ElementMoment, ElementShear, PunchingStress
+    NodeDeflection, ElementMoment, ElementShear, PunchingStress,
+    MultiSlabAnalysisRequest, MultiSlabAnalysisResponse, SlabAnalysisResult
 )
 
 # DOF offsets per node (flat shell: u, v, w, θx, θy, θz)
@@ -1060,3 +1061,91 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
         minVy=round(min_vy, 3), maxVy=round(max_vy, 3),
         solverTime=round(solver_time, 4),
     )
+
+
+def solve_multi_slab_dkt(request: MultiSlabAnalysisRequest) -> MultiSlabAnalysisResponse:
+    from mesher import generate_mesh
+    from models import MeshRequest
+
+    results = []
+    warnings = []
+
+    for sm in request.slabs:
+        try:
+            mesh = generate_mesh(MeshRequest(geometry=sm.geometry, meshSize=sm.meshSize))
+
+            col_nids, col_w, col_d, col_h, col_bcs = [], [], [], [], []
+            if sm.geometry.columns and mesh.nodes:
+                nodes_xy = np.array([[n.x, n.y] for n in mesh.nodes])
+                for col in sm.geometry.columns:
+                    cx, cy = col.position.x, col.position.y
+                    dists = np.hypot(nodes_xy[:, 0] - cx, nodes_xy[:, 1] - cy)
+                    min_idx = int(np.argmin(dists))
+                    if dists[min_idx] <= 1.5:
+                        col_nids.append(mesh.nodes[min_idx].id)
+                        col_w.append(col.width)
+                        col_d.append(col.depth)
+                        col_h.append(col.height)
+                        col_bcs.append(col.boundaryCondition)
+
+            wall_nids_a, wall_nids_b, wall_thick, wall_height = [], [], [], []
+            if sm.geometry.walls and mesh.nodes:
+                nodes_xy = np.array([[n.x, n.y] for n in mesh.nodes])
+                for wall in sm.geometry.walls:
+                    ax, ay = wall.startPoint.x, wall.startPoint.y
+                    bx, by = wall.endPoint.x, wall.endPoint.y
+                    da = np.hypot(nodes_xy[:, 0] - ax, nodes_xy[:, 1] - ay)
+                    db = np.hypot(nodes_xy[:, 0] - bx, nodes_xy[:, 1] - by)
+                    ia, ib = int(np.argmin(da)), int(np.argmin(db))
+                    if da[ia] <= 1.5 and db[ib] <= 1.5 and ia != ib:
+                        wall_nids_a.append(mesh.nodes[ia].id)
+                        wall_nids_b.append(mesh.nodes[ib].id)
+                        wall_thick.append(wall.thickness)
+                        wall_height.append(wall.height)
+
+            beam_nids_a, beam_nids_b, beam_w, beam_d, beam_e = [], [], [], [], []
+            if sm.geometry.beams and mesh.nodes:
+                nodes_xy = np.array([[n.x, n.y] for n in mesh.nodes])
+                for beam in sm.geometry.beams:
+                    ax, ay = beam.startPoint.x, beam.startPoint.y
+                    bx, by = beam.endPoint.x, beam.endPoint.y
+                    da = np.hypot(nodes_xy[:, 0] - ax, nodes_xy[:, 1] - ay)
+                    db = np.hypot(nodes_xy[:, 0] - bx, nodes_xy[:, 1] - by)
+                    ia, ib = int(np.argmin(da)), int(np.argmin(db))
+                    if da[ia] <= 1.5 and db[ib] <= 1.5 and ia != ib:
+                        beam_nids_a.append(mesh.nodes[ia].id)
+                        beam_nids_b.append(mesh.nodes[ib].id)
+                        beam_w.append(0.3)
+                        beam_d.append(0.5)
+                        beam_e.append(sm.elasticModulus)
+
+            analysis_req = AnalysisRequest(
+                mesh=mesh,
+                slabThickness=sm.thickness,
+                elasticModulus=sm.elasticModulus,
+                poissonRatio=sm.poissonRatio,
+                uniformLoad=sm.uniformLoad,
+                selfWeight=sm.selfWeight,
+                columnNodeIds=col_nids,
+                columnWidths=col_w,
+                columnDepths=col_d,
+                columnHeights=col_h,
+                columnBoundaryConditions=col_bcs,
+                wallNodeIdA=wall_nids_a,
+                wallNodeIdB=wall_nids_b,
+                wallThicknesses=wall_thick,
+                wallHeights=wall_height,
+                beamNodeIdA=beam_nids_a,
+                beamNodeIdB=beam_nids_b,
+                beamWidths=beam_w,
+                beamDepths=beam_d,
+                beamElasticModuli=beam_e,
+                dropPanels=request.dropPanels
+            )
+
+            res = analyze_slab(analysis_req)
+            results.append(SlabAnalysisResult(slabId=sm.slabId, mesh=mesh, result=res))
+        except Exception as ex:
+            warnings.append(f"Multi-slab {sm.slabId} failed in DKT solver: {str(ex)}")
+
+    return MultiSlabAnalysisResponse(success=True, results=results, warnings=warnings, disconnectedIds=[])
