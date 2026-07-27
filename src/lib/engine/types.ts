@@ -267,6 +267,9 @@ export interface SlabFEMResult {
   maxCrack?: number;
   crX?: number;
   crY?: number;
+  /** Local mesh node ids lying on discontinuous (hinged) edges — used by SPR contour
+   *  smoothing to keep moment/shear patches segregated across articulated joints. */
+  hingedNodeIds?: number[];
 }
 
 export interface ColumnPunchingResult {

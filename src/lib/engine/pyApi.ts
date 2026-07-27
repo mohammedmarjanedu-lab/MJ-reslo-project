@@ -1,6 +1,6 @@
 import { generateSlabMesh } from './meshGenerator';
 import { pointInPolygon } from './mathEngine';
-import { findCollinearSlabEdge, slabsTouch } from './femSolver';
+import { findCollinearSlabEdge, slabsTouch, computeHingedNodeIds } from './femSolver';
 
 function getInitialApiBase(): string {
   if (typeof window !== 'undefined') {
@@ -399,7 +399,7 @@ export async function meshAndAnalyze(
   return { mesh, result, slabId: slabPolygon.vertices.length > 0 ? `slab_${Date.now()}` : 'slab_0', warnings, disconnectedIds };
 }
 
-function toFrontendResult(slabId: string, mesh: any, result: any): any {
+function toFrontendResult(slabId: string, mesh: any, result: any, hingedNodeIds?: number[]): any {
   // Convert deflection wz from meters to millimeters (mm)
   const nodeDeflections = result.nodeDeflections.map((d: any) => ({
     nodeId: d.nodeId, wz: d.wz * 1000,
@@ -429,6 +429,7 @@ function toFrontendResult(slabId: string, mesh: any, result: any): any {
       unconnectedNodeIds: mesh.unconnectedNodeIds || [],
     },
     nodeDeflections, momentMx, momentMy, momentMxy, stresses, shears, membraneForces, columnPunching,
+    hingedNodeIds,
     // Use server min/max (global for unified slabs) converted to mm when provided; fall back to local (mm)
     minWz: result.minWz !== undefined ? result.minWz * 1000 : localMinWz,
     maxWz: result.maxWz !== undefined ? result.maxWz * 1000 : localMaxWz,
@@ -497,7 +498,7 @@ export async function analyzeSlabViaApi(
     }
   }
   const { mesh, result } = await meshAndAnalyze(slab, allWalls, columns, meshSize, poissonRatio, beams, dropPanels, nonStructuralWalls, polylineNonStructuralWalls);
-  return toFrontendResult(slab.id || 'slab_0', mesh, result);
+  return toFrontendResult(slab.id || 'slab_0', mesh, result, computeHingedNodeIds(slab as any, mesh.nodes, meshSize));
 }
 
 export async function meshAndAnalyzeAllSlabs(
@@ -550,7 +551,11 @@ export async function meshAndAnalyzeAllSlabs(
     if (mr.ok) {
       const data = await mr.json();
       if (data.success && data.results && data.results.length > 0) {
-        const results = data.results.map((r: any) => toFrontendResult(r.slabId, r.mesh, r.result));
+        const results = data.results.map((r: any) => {
+          const slab = slabs.find(s => (s.id || 'slab_0') === r.slabId);
+          const hinged = slab ? computeHingedNodeIds(slab, r.mesh.nodes, meshSize) : [];
+          return toFrontendResult(r.slabId, r.mesh, r.result, hinged);
+        });
         return { results, warnings: data.warnings || [], disconnectedIds: data.disconnectedIds || [] };
       }
     }
@@ -1189,6 +1194,7 @@ export async function meshAndAnalyzeAllSlabs(
       stresses,
       shears,
       columnPunching,
+      hingedNodeIds: computeHingedNodeIds(sm.slab, sm.mesh.nodes, meshSize),
       minWz: nodeDeflections.length ? Math.min(...nodeDeflections.map(d => d.wz)) : 0,
       maxWz: nodeDeflections.length ? Math.max(...nodeDeflections.map(d => d.wz)) : 0,
       minMx: 0,

@@ -642,6 +642,30 @@ export function findCollinearSlabEdge(poly: Point2D[], a: Point2D, b: Point2D, t
 }
 
 /**
+ * Local mesh node ids lying on discontinuous (hinged) edges of a slab.
+ * Shared by the TS worker result assembly and pyApi result mapping so SPR contour
+ * smoothing segregates patches identically on every analysis path.
+ */
+export function computeHingedNodeIds(
+  slab: { discontinuousEdges?: { startPoint: Point2D; endPoint: Point2D }[] },
+  meshNodes: { id: number; x: number; y: number }[],
+  meshSize: number
+): number[] {
+  if (!slab.discontinuousEdges || slab.discontinuousEdges.length === 0) return [];
+  const tol = meshSize * 0.35;
+  const out: number[] = [];
+  for (const n of meshNodes) {
+    for (const seg of slab.discontinuousEdges) {
+      if (pointToSegmentDist(n, seg.startPoint, seg.endPoint) < tol) {
+        out.push(n.id);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Detect supports for a slab from columns, walls, polyline walls, and beams.
  * Returns a boolean array constrained[ndof] and known displacement array u_known[ndof].
  */
@@ -1715,6 +1739,7 @@ export function analyzeAllSlabs(
       nodeDeflections,
       momentMx, momentMy, momentMxy,
       stresses, shears, columnPunching,
+      hingedNodeIds: computeHingedNodeIds(slab, mesh.nodes, meshSize),
       woodArmer: design?.woodArmer,
       reinforcement: design?.reinforcement,
       shearDesign: design?.shearDesign,
