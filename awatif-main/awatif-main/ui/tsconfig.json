@@ -1,5 +1,0 @@
-{
-  // Required so the TS language server picks up vite-env.d.ts,
-  // which declares CSS files as valid imports (fixes ts(2882))
-  "include": ["./**/*.ts"]
-}

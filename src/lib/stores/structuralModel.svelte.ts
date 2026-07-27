@@ -257,10 +257,9 @@ class StructuralModel {
         })),
         dimensions: this.dimensions.map(d => ({
           id: d.id,
-          p1: { x: d.p1.x, y: d.p1.y },
-          p2: { x: d.p2.x, y: d.p2.y },
-          label: d.label,
-          value: d.value,
+          startPoint: { x: d.startPoint.x, y: d.startPoint.y },
+          endPoint: { x: d.endPoint.x, y: d.endPoint.y },
+          distance: d.distance,
         })),
       },
       view: {

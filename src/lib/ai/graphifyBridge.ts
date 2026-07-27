@@ -1,5 +1,14 @@
 import type { StructuralGraph, GraphNode, GraphEdge } from '../engine/graphModel';
-import graphJsonUrl from '../../../graphify-out/graph.json?url';
+
+// graphify-out/ is a generated artifact (gitignored) and may be absent.
+// import.meta.glob resolves at build time without failing when the file is
+// missing; at runtime we fall back to an empty graph so the app keeps working.
+const graphModules = import.meta.glob<string>('../../../graphify-out/graph.json', {
+  query: '?url',
+  import: 'default',
+  eager: true,
+});
+const graphJsonUrl: string | null = Object.values(graphModules)[0] ?? null;
 
 interface GraphifyNode {
   id: string;
@@ -46,6 +55,7 @@ async function loadGraph(): Promise<GraphifyGraph> {
 
   _loadPromise = (async () => {
     try {
+      if (!graphJsonUrl) throw new Error('graph.json not bundled (graphify-out/ missing)');
       const res = await fetch(graphJsonUrl);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();

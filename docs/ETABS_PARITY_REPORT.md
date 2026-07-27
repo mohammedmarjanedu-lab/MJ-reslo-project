@@ -69,3 +69,73 @@ $$\lambda_\Delta = \frac{\xi}{1 + 50\rho'}$$
 ## 4. Conclusion & Parity Verification
 
 The RESLO Kratos-based FEA engine now achieves **exact parity (within < 1% error for standard cases and < 5% across complex geometries)** with CSI ETABS 21 and SAFE 2022.
+
+---
+
+## 5. Solver Core Defect Corrections (Phase 7 — Verification Campaign)
+
+Deep forensic validation of the Kratos backend against closed-form plate theory
+(exact Mindlin-Navier series, classical strip coefficients, and static equilibrium)
+uncovered and fixed three systematic defects in the solver wrapper
+(`backend/kratos_solver.py`); the Kratos kernel itself is sound.
+
+### 5.1 Constitutive law — plane-stress enforcement for plate shells (CRITICAL)
+**Defect**: shell properties used `LinearElastic3DLaw`. A full 3D law cannot
+condense σzz on a plate element, yielding *plane-strain* stiffness
+`E(1−ν)/((1+ν)(1−2ν))` instead of the Kirchhoff plate modulus `E/(1−ν²)`.
+Every plate was systematically too stiff: **+6.7% at ν=0.2, +12.5% at ν=0.25**
+(converged deflections were 7.3% *below* the exact theory for every mesh and
+element type — quads and triangles plateaued identically, ruling out
+discretization).
+**Fix**: `LinearElasticPlaneStress2DLaw()`. Result — SSSS 4×4 m plate now matches
+the exact Mindlin series within **1.2–1.4%** (Kirchhoff limit: 0.2%), matching
+the in-repo scipy DKT solver (−0.7%) inside ETABS ±3% parity.
+
+### 5.2 Nodal load double application (CRITICAL)
+**Defect**: each tributary load was set BOTH on the node
+(`SetSolutionStepValue(POINT_LOAD)`) and on the `PointLoadCondition3D1N`
+condition data — Kratos 10.x consumed **both**, doubling every slab load
+(reaction measured = 2.000 × applied). The legacy "0.561 mm Reissner-Mindlin"
+test reference had been calibrated to the doubled value.
+**Fix**: single idiom — load on the condition data only. Post-fix equilibrium is
+exact: mushroom-panel column reaction **585.00 kN vs 585 kN** total load,
+column head settlement exactly `W·H/(EA)`.
+
+### 5.3 Phantom support from union-find off-by-one (HIGH)
+**Defect**: the floating-node stabilization unioned *0-based* element indices
+against *1-based* node ids. The highest-id mesh node never unioned and was
+**fully fixed** — a phantom pin that silently acted as an extra support on
+any model without an existing restraint there (e.g. it pinned the free corner
+of the mushroom panel, degrading ∼50 % of the load path).
+**Fix**: `uf.union(idx+1, ...)`. The stabilization now also logs the exact node
+IDs it restrains (observability).
+
+### 5.4 Verification results after fixes (backend `pytest`: 20/20)
+| Case | Checked quantity | Result | Reference | Dev |
+|---|---|---|---|---|
+| SSSS plate (Mindlin series) | w_max @0.25 m & @0.20 m mesh | 0.2988 / 0.2990 mm | 0.3029 mm exact series | 1.36 % / 1.28 %, refinement monotone |
+| One-way SS strip | interior centreline w | 0.958 mm | 0.960 mm (5qL⁴/384D) | 0.2 % |
+| Two-span continuous (free long edges) | centreline span peak | 0.3934 mm | 0.3996 mm (0.00542 qL⁴/D) | 1.6 % |
+| Two-span hogging over interior wall | FD-curvature M | −8.87 kN·m/m (− sign ✓) | −10.0 kN·m/m (qL²/8 strip) | sign ✓, > 60 % mobilised |
+| **Joint equivalence (ETABS acceptance)** | two-piece slab vs single piece, pointwise | **0.000 % max gap** | identical fields | PASS |
+| Mushroom single-column panel | reaction vs total load; head settlement | 585.00 kN; w = W·H/EA exact | statics | 0.00 % |
+| Linearity / determinism | w(2q) vs 2·w(q); repeated solves | 0 / 0 deviation | — | exact |
+
+### 5.5 Licensing cleanup (commercial-use closure)
+- **OpenSeesPy removed** (non-commercial license): `opensees_solver.py` and all
+  dependent probe/test files deleted; the migration-era commented import in
+  `main.py` was dropped; the Kratos test suite now validates purely against
+  closed-form plate theory — no external solver dependency.
+- **Vendored `awatif-main/` deleted** (contained Triangle 1.6 / `triangle.out.wasm`,
+  commercial-use-by-arrangement only; never imported by the app).
+- Remaining stack (Kratos BSD-4, gmsh server-side, scipy/numpy BSD, MIT frontend)
+  is fully commercial-use clean per `docs/ENGINEERING_AUDIT.md` §4.
+
+### 5.6 Test-suite re-baseline
+`backend/test_kratos_solver.py` was rewritten as a gmsh-free, closed-form-only
+suite: (1) SSSS vs exact Mindlin series with refinement check, (2) column+beam
+flat-slab stability band, (3) mushroom panel equilibrium / hogging-curvature
+concentration / bowl silhouette, (4) solver linearity + determinism + aggregate
+consistency, (5) two-span ETABS edge-constraint acceptance (two-piece ≡
+single-piece, strip deflection, support hogging sign). References are computed
+inline from theory — no magic constants calibrated to historical artifacts.

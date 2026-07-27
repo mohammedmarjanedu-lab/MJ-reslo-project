@@ -74,6 +74,8 @@ class UIState {
   colorRamp = $state<'jet' | 'viridis' | 'diverging' | 'thermal' | 'cool_warm'>('jet');
   show3DPlanOverlay = $state(false);
   showColorLegend = $state(true);
+  showNodeNumbers = $state(false);
+  showElementNumbers = $state(false);
   femAnimationEnabled = $state(false);
   femAnimationScale = $state(1);
   viewPreset = $state<'top' | 'front' | 'side' | 'iso' | 'perspective'>('iso');

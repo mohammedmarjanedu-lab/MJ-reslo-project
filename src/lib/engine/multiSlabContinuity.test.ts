@@ -79,8 +79,14 @@ describe('Multi-Slab Analysis & Continuity/Discontinuity', () => {
     const resCont = analyzeAllSlabs([s1_cont, s2_cont], [], walls, [], [], [], [], [], 0.5, 0.2).results;
     const resDisc = analyzeAllSlabs([s1_disc, s2_disc], [], walls, [], [], [], [], [], 0.5, 0.2).results;
 
-    // Discontinuous joint at support releases rotation restraint, increasing localized slope curvature
-    expect(resDisc[0].minMx).toBeLessThan(resCont[0].minMx);
+    // Discontinuous joint at the support line releases the rotational restraint, so the
+    // hogging (negative support) moment over the joint must REDUCE in magnitude.
+    // With the validated resultant recovery (sagging positive / hogging negative —
+    // see contourPipeline.test.ts Navier benchmark), minMx of the hinged model stays
+    // ~zero while the continuous model develops strong negative hogging:
+    // disc.minMx (≈ 0) > cont.minMx (< 0).
+    expect(resDisc[0].minMx).toBeGreaterThan(resCont[0].minMx);
+    expect(resCont[0].minMx).toBeLessThan(0);
   });
 
   it('beam line acts as simply supported line constraint along slab boundary', () => {

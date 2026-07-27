@@ -1,4 +1,5 @@
 import type { SlabFEMResult, FEMMesh, FEMResultType } from '../engine/types';
+import { computeSprContour, type SprSlabInput } from '../engine/sprRecovery';
 
 class FEMResultState {
   slabResults = $state<Map<string, SlabFEMResult>>(new Map());
@@ -55,55 +56,42 @@ class FEMResultState {
       return [mn, mx];
     }
 
-    // Spatial node map: spatialKey "X_Y" -> array of values from surrounding elements across ALL slabs
-    // Ensures smooth continuous contour across multi-slab boundaries (ETABS/SAFE standard)
+    // SPR (Superconvergent Patch Recovery) nodal smoothing — ETABS/SAFE-grade contours:
+    // per node, an area-weighted least-squares plane is fitted over the centroid values
+    // of the incident-element patch and evaluated at the node. Nodes of different slabs
+    // at the same position share one patch (continuous contours across joints); hinged
+    // nodes keep segregated patches (moments are discontinuous across articulated lines).
     function elemToGlobalNodeValues(
       dataExtractor: (r: SlabFEMResult) => { elementId: number; value?: number }[],
       valueKey?: string
     ): Map<string, Map<number, number>> {
-      const accum = new Map<string, number[]>();
-      function pKey(x: number, y: number): string {
-        return Math.round(x * 1000) + '_' + Math.round(y * 1000);
-      }
-
-      for (const r of slabs) {
-        const nodePosMap = new Map(r.mesh.nodes.map(n => [n.id, pKey(n.x, n.y)]));
-        const elemIdMap = new Map(r.mesh.elements.map(e => [e.id, e.nodeIds]));
-        const data = dataExtractor(r);
-
-        for (const item of data) {
-          const nodeIds = elemIdMap.get(item.elementId);
-          if (!nodeIds) continue;
+      const inputs: SprSlabInput[] = slabs.map(r => {
+        const values = new Map<number, number>();
+        for (const item of dataExtractor(r)) {
           const v = valueKey ? (item as any)[valueKey] : (item as any).value;
-          if (v === undefined || !isFinite(v)) continue;
-
-          for (const nid of nodeIds) {
-            const pk = nodePosMap.get(nid);
-            if (!pk) continue;
-            let arr = accum.get(pk);
-            if (!arr) { arr = []; accum.set(pk, arr); }
-            arr.push(v);
-          }
+          if (v !== undefined && isFinite(v)) values.set(item.elementId, v);
         }
-      }
+        return {
+          slabId: r.slabId,
+          nodes: r.mesh.nodes,
+          elements: r.mesh.elements,
+          values,
+          hingedNodeIds: r.hingedNodeIds,
+        };
+      });
+      const sprMap = computeSprContour(inputs);
 
-      const avgMap = new Map<string, number>();
-      for (const [pk, vals] of accum) {
-        let sum = 0;
-        for (let i = 0; i < vals.length; i++) sum += vals[i];
-        avgMap.set(pk, sum / vals.length);
-      }
-
+      // Keep the outer shape every node gets a defined value (0 for data-less nodes),
+      // identical to the previous plain-averaging behaviour.
       const resultMap = new Map<string, Map<number, number>>();
       for (const r of slabs) {
+        const smoothed = sprMap.get(r.slabId) ?? new Map();
         const localMap = new Map<number, number>();
         for (const n of r.mesh.nodes) {
-          const pk = pKey(n.x, n.y);
-          localMap.set(n.id, avgMap.get(pk) ?? 0);
+          localMap.set(n.id, smoothed.get(n.id) ?? 0);
         }
         resultMap.set(r.slabId, localMap);
       }
-
       return resultMap;
     }
 
@@ -147,17 +135,14 @@ class FEMResultState {
       }
       case 'mx': {
         resultMap = elemToGlobalNodeValues(r => r.momentMx);
-        for (const r of slabs) for (const m of r.momentMx) allVals.push(m.value);
         break;
       }
       case 'my': {
         resultMap = elemToGlobalNodeValues(r => r.momentMy);
-        for (const r of slabs) for (const m of r.momentMy) allVals.push(m.value);
         break;
       }
       case 'mxy': {
         resultMap = elemToGlobalNodeValues(r => r.momentMxy);
-        for (const r of slabs) for (const m of r.momentMxy) allVals.push(m.value);
         break;
       }
       case 'punching': {
@@ -171,22 +156,18 @@ class FEMResultState {
       }
       case 'ast_x_top': {
         resultMap = elemToGlobalNodeValues(r => r.reinforcement || [], 'ast_x_top');
-        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(m.ast_x_top);
         break;
       }
       case 'ast_y_top': {
         resultMap = elemToGlobalNodeValues(r => r.reinforcement || [], 'ast_y_top');
-        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(m.ast_y_top);
         break;
       }
       case 'ast_x_bot': {
         resultMap = elemToGlobalNodeValues(r => r.reinforcement || [], 'ast_x_bot');
-        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(m.ast_x_bot);
         break;
       }
       case 'ast_y_bot': {
         resultMap = elemToGlobalNodeValues(r => r.reinforcement || [], 'ast_y_bot');
-        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(m.ast_y_bot);
         break;
       }
       case 'ast_max': {
@@ -194,12 +175,10 @@ class FEMResultState {
           elementId: m.elementId,
           value: Math.max(m.ast_x_top, m.ast_y_top, m.ast_x_bot, m.ast_y_bot)
         })));
-        for (const r of slabs) for (const m of (r.reinforcement || [])) allVals.push(Math.max(m.ast_x_top, m.ast_y_top, m.ast_x_bot, m.ast_y_bot));
         break;
       }
       case 'crack_width': {
         resultMap = elemToGlobalNodeValues(r => r.crackWidth || [], 'crackWidth');
-        for (const r of slabs) for (const m of (r.crackWidth || [])) allVals.push(m.crackWidth);
         break;
       }
       case 'deflection_check': {
@@ -219,12 +198,19 @@ class FEMResultState {
         const key = rt === 'stress_s1' ? 's1' : rt === 'stress_s2' ? 's2' : (rt.startsWith('shear') ? (rt === 'shear_vx' ? 'vx' : rt === 'shear_vy' ? 'vy' : 'v1') : rt.startsWith('membrane') ? rt.replace('membrane_', '') : 'vm');
         const getter = (r: SlabFEMResult) => (rt.startsWith('shear') ? (r.shears || []) : rt.startsWith('membrane') ? (r.membraneForces || []) : r.stresses) as any[];
         resultMap = elemToGlobalNodeValues(getter, key);
-        for (const r of slabs) for (const s of getter(r)) { const v = s[key]; if (isFinite(v)) allVals.push(v); }
         break;
       }
     }
 
     if (rt === 'punching') { globalMin = 0; globalMax = 1; }
+    else if (rt !== 'deflection' && rt !== 'deflection_check' && resultMap) {
+      // Legend min/max from the SMOOTHED nodal field so the legend matches the display
+      // exactly (previously the legend used raw element extremes while the map showed
+      // averaged values — a mismatch ETABS never exhibits).
+      const smoothedVals: number[] = [];
+      for (const m of resultMap.values()) for (const v of m.values()) if (isFinite(v)) smoothedVals.push(v);
+      [globalMin, globalMax] = safeMinMax(smoothedVals);
+    }
     else [globalMin, globalMax] = safeMinMax(allVals);
 
     for (const r of slabs) {

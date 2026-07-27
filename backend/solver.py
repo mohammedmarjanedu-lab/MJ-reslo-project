@@ -684,6 +684,38 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
                         cols_list.extend([dof_A, dof_B, dof_B, dof_A])
                         data_list.extend([k_penalty_eq, k_penalty_eq, -k_penalty_eq, -k_penalty_eq])
 
+    # Weighted multi-master MPCs (ETABS-style edge constraints for non-conformal
+    # multi-slab joints): u_slave − Σ w_i·u_master_i = 0, penalty α·c·cᵀ.
+    # Supports constrained later normalize clamped master rows to identity —
+    # meaningful only while the slave stays free (frontend drops slave-restrained ties).
+    if hasattr(request, 'mpcConstraints') and request.mpcConstraints:
+        k_penalty_mpc = 1e11
+        # Slaves whose w-DOF is already support-restrained must not be tied —
+        # constrained DOFs are eliminated later and the orphaned α·w² diagonal
+        # would pin the masters to zero (same rule as the TS worker solver).
+        restrained_slave_nodes = wall_nodes_set | set(col_node_indices)
+        for mpc in request.mpcConstraints:
+            s_n = mpc.slaveNodeId - 1
+            if not (0 <= s_n < nn) or s_n in restrained_slave_nodes:
+                continue
+            dofs_mpc: List[Tuple[int, float]] = [(NDOF_PER_NODE * s_n + (mpc.slaveDof - 1), 1.0)]
+            valid = 0 <= (mpc.slaveDof - 1) < NDOF_PER_NODE
+            for m in mpc.masters:
+                m_n = m.nodeId - 1
+                if not (0 <= m_n < nn):
+                    valid = False
+                    break
+                dofs_mpc.append((NDOF_PER_NODE * m_n + (mpc.slaveDof - 1), -float(m.weight)))
+            if not valid or len(dofs_mpc) < 2:
+                continue
+            for idx_a, (dof_a, ca) in enumerate(dofs_mpc):
+                for idx_b, (dof_b, cb) in enumerate(dofs_mpc):
+                    if idx_a != idx_b and dof_a == dof_b:
+                        continue
+                    rows_list.append(dof_a)
+                    cols_list.append(dof_b)
+                    data_list.append(k_penalty_mpc * ca * cb)
+
     # Column rotational springs (anisotropic, applied at master nodes)
     for nidx, kth in col_spring_map.items():
         wcol, dcol = col_dims_map.get(nidx, (0.3, 0.3))

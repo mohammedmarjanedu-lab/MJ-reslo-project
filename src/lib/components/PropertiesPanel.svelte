@@ -2,6 +2,7 @@
   import { model } from '../stores/structuralModel.svelte';
   import { uiState } from '../stores/uiState.svelte';
   import { computeColumnStiffness, computeShearWallStiffness, computePolylineWallStiffness, polygonSignedArea } from '../engine/mathEngine';
+  import type { BoundaryCondition } from '../engine/types';
 
   let selectedColumn = $derived(uiState.selectedElementType === 'column' && uiState.selectedElementId ? model.columns.find(c => c.id === uiState.selectedElementId) ?? null : null);
   let selectedWall = $derived(uiState.selectedElementType === 'wall' && uiState.selectedElementId ? model.walls.find(w => w.id === uiState.selectedElementId) ?? null : null);
