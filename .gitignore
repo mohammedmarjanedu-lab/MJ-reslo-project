@@ -28,4 +28,7 @@ test_output.txt
 *.njsproj
 *.sln
 *.sw?
+cloudflared.exe
+.freebuff/
+scratch/
 

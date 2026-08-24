@@ -23,10 +23,10 @@ function makeSquareSlab(id: number, side: number): SlabPolygon {
 
 function makeEdgeWalls(side: number): ShearWallElement[] {
   return [
-    { id: '1', name: 'Wall', startPoint: { x: 0, y: 0 }, endPoint: { x: side, y: 0 }, thickness: 0.3, height: 3.0, elasticModulus: 25e6, color: '#888' } as any,
-    { id: '2', name: 'Wall', startPoint: { x: side, y: 0 }, endPoint: { x: side, y: side }, thickness: 0.3, height: 3.0, elasticModulus: 25e6, color: '#888' } as any,
-    { id: '3', name: 'Wall', startPoint: { x: side, y: side }, endPoint: { x: 0, y: side }, thickness: 0.3, height: 3.0, elasticModulus: 25e6, color: '#888' } as any,
-    { id: '4', name: 'Wall', startPoint: { x: 0, y: side }, endPoint: { x: 0, y: 0 }, thickness: 0.3, height: 3.0, elasticModulus: 25e6, color: '#888' } as any,
+    { id: '1', name: 'Wall', startPoint: { x: 0, y: 0 }, endPoint: { x: side, y: 0 }, thickness: 0.3, height: 3.0, elasticModulus: 25e6, boundaryCondition: 'simply-supported', color: '#888' } as any,
+    { id: '2', name: 'Wall', startPoint: { x: side, y: 0 }, endPoint: { x: side, y: side }, thickness: 0.3, height: 3.0, elasticModulus: 25e6, boundaryCondition: 'simply-supported', color: '#888' } as any,
+    { id: '3', name: 'Wall', startPoint: { x: side, y: side }, endPoint: { x: 0, y: side }, thickness: 0.3, height: 3.0, elasticModulus: 25e6, boundaryCondition: 'simply-supported', color: '#888' } as any,
+    { id: '4', name: 'Wall', startPoint: { x: 0, y: side }, endPoint: { x: 0, y: 0 }, thickness: 0.3, height: 3.0, elasticModulus: 25e6, boundaryCondition: 'simply-supported', color: '#888' } as any,
   ];
 }
 
@@ -101,7 +101,7 @@ describe('FEM Solver — Timoshenko Validation', () => {
     const t = slab.thickness;
     const q = slab.uniformLoad + slab.concreteDensity * t;
     const exact = timoshenkoExpectations(side, t, E, 0.2, q);
-    const wMax = Math.abs(result.minWz);
+    const wMax = Math.max(Math.abs(result.minWz), Math.abs(result.maxWz)) / 1000.0;
     const errorW = Math.abs(wMax - exact.wMax) / exact.wMax;
     const errorM = Math.abs(result.maxMx - exact.mMax) / exact.mMax;
     console.log(`${label}: w_max=${wMax.toExponential(4)} error=${(errorW*100).toFixed(1)}% Mx_max=${result.maxMx.toExponential(4)} error=${(errorM*100).toFixed(1)}% nodes=${result.mesh.nodes.length} elements=${result.mesh.elements.length}`);

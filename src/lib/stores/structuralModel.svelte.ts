@@ -1,4 +1,4 @@
-import type { SlabPolygon, ColumnElement, ShearWallElement, PolylineWallElement, BeamElement, Dimension, Point2D, BoundaryCondition, DropPanelElement, NonStructuralWallElement, PolylineNonStructuralWallElement } from '../engine/types';
+import type { SlabPolygon, ColumnElement, ShearWallElement, PolylineWallElement, BeamElement, Dimension, Point2D, BoundaryCondition, DropPanelElement, NonStructuralWallElement, PolylineNonStructuralWallElement, ParametricConfig } from '../engine/types';
 import { ScaleCalibrator, computeScaleLabel } from '../engine/scaleCalibrator';
 import { HistoryManager } from './history.svelte';
 import { uiState } from './uiState.svelte';
@@ -42,7 +42,7 @@ function newSlab(vertices: Point2D[] = [], grade = 'M25', existingLabels: string
     id: genId('S'),
     label: getNextLabelSuffix('S', existingLabels),
     vertices: vertices.map(v => ({ ...v })), holes: [],
-    thickness: 0.2, uniformLoad: 5, partitionLoad: 0, concreteGrade: grade, ...props, crackingModifier: 1.0,
+    thickness: 0.2, deadLoad: 2.0, liveLoad: 3.0, uniformLoad: 5.0, partitionLoad: 0, concreteGrade: grade, ...props, crackingModifier: 1.0,
   };
 }
 
@@ -103,6 +103,10 @@ class StructuralModel {
   history = new HistoryManager();
   private _createdAt = Date.now();
   private _isRestoring = false;
+
+  get isRestoring(): boolean {
+    return this._isRestoring;
+  }
 
   get screenScale(): number {
     return this.calibrator.pixelsPerMeter * this.canvasZoom;
@@ -268,7 +272,7 @@ class StructuralModel {
         zoom: this.canvasZoom,
       },
       calibration: {
-        isCalibrated: this.isCalibrated,
+        isCalibrated: true,
         pixelsPerMeter: this.calibrator.pixelsPerMeter,
       },
       hiddenElementIds: [...this.hiddenElementIds],
@@ -310,17 +314,38 @@ class StructuralModel {
       this.canvasViewOffsetY = data.view.offsetY ?? 0;
       this.canvasZoom = data.view.zoom ?? 1;
     }
-    if (data.calibration) {
-      this.isCalibrated = data.calibration.isCalibrated ?? false;
-      this.pixelsPerMeter = data.calibration.pixelsPerMeter ?? 100;
-      if (this.isCalibrated) {
-        this.setCalibrated();
+    if (data.calibration?.pixelsPerMeter) {
+      this.calibrator.pixelsPerMeter = data.calibration.pixelsPerMeter;
+    }
+    // Update global nextId to avoid ID conflicts with newly added elements
+    let maxId = 0;
+    const allIds = [
+      ...this.columns.map(c => c.id),
+      ...this.walls.map(w => w.id),
+      ...this.polylineWalls.map(pw => pw.id),
+      ...this.beams.map(b => b.id),
+      ...this.slabs.map(s => s.id),
+      ...this.dropPanels.map(dp => dp.id),
+      ...this.nonStructuralWalls.map(w => w.id),
+      ...this.polylineNonStructuralWalls.map(w => w.id)
+    ];
+    for (const idStr of allIds) {
+      const match = idStr.match(/\d+/);
+      if (match) {
+        const num = parseInt(match[0], 10);
+        if (num > maxId) maxId = num;
       }
     }
+    if (maxId > 0) nextId = maxId + 1;
+
     femState.clear();
-    uiState.femAutoCompute = false;
+    // Note: femAutoCompute is deliberately left untouched here. Forcing it to
+    // false meant that loading a saved project silently disabled FEM — the
+    // model would draw but analysis never ran until the user manually
+    // toggled "Live" back on. Stale results are already cleared above.
     this.history.reset();
     this._isRestoring = false;
+    this.saveToLocalStorage();
   }
 
   /** Download project as .9e file — uses native Save As dialog when available */
@@ -550,18 +575,102 @@ class StructuralModel {
     uiState.setStatusMessage(`Pasted ${total} element(s)`);
   }
 
+  getModelBoundingBox(): { minX: number; maxX: number; minY: number; maxY: number } | null {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+
+    for (const s of this.slabs) {
+      for (const v of s.vertices) {
+        if (v.x < minX) minX = v.x;
+        if (v.x > maxX) maxX = v.x;
+        if (v.y < minY) minY = v.y;
+        if (v.y > maxY) maxY = v.y;
+      }
+    }
+
+    for (const c of this.columns) {
+      const hw = (c.shape === 'circular' ? (c.diameter ?? c.width) : c.width) / 2;
+      const hd = (c.shape === 'circular' ? (c.diameter ?? c.depth) : c.depth) / 2;
+      minX = Math.min(minX, c.position.x - hw);
+      maxX = Math.max(maxX, c.position.x + hw);
+      minY = Math.min(minY, c.position.y - hd);
+      maxY = Math.max(maxY, c.position.y + hd);
+    }
+
+    for (const w of this.walls) {
+      minX = Math.min(minX, w.startPoint.x, w.endPoint.x);
+      maxX = Math.max(maxX, w.startPoint.x, w.endPoint.x);
+      minY = Math.min(minY, w.startPoint.y, w.endPoint.y);
+      maxY = Math.max(maxY, w.startPoint.y, w.endPoint.y);
+    }
+
+    for (const pw of this.polylineWalls) {
+      for (const v of pw.vertices) {
+        minX = Math.min(minX, v.x); maxX = Math.max(maxX, v.x);
+        minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y);
+      }
+    }
+
+    for (const b of this.beams) {
+      minX = Math.min(minX, b.startPoint.x, b.endPoint.x);
+      maxX = Math.max(maxX, b.startPoint.x, b.endPoint.x);
+      minY = Math.min(minY, b.startPoint.y, b.endPoint.y);
+      maxY = Math.max(maxY, b.startPoint.y, b.endPoint.y);
+    }
+
+    for (const dp of this.dropPanels) {
+      for (const v of dp.vertices) {
+        minX = Math.min(minX, v.x); maxX = Math.max(maxX, v.x);
+        minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y);
+      }
+    }
+
+    if (minX === Infinity || maxX === -Infinity || minY === Infinity || maxY === -Infinity) {
+      return null;
+    }
+
+    return { minX, maxX, minY, maxY };
+  }
+
   resetView(): void {
+    const activeWidth = (this.canvasWidth > 100)
+      ? this.canvasWidth
+      : ((typeof window !== 'undefined' && window.innerWidth > 200) ? window.innerWidth - 300 : 800);
+    const activeHeight = (this.canvasHeight > 100)
+      ? this.canvasHeight
+      : ((typeof window !== 'undefined' && window.innerHeight > 200) ? window.innerHeight - 100 : 600);
+
     if (this.planImage && this.imageNaturalWidth > 0 && this.imageNaturalHeight > 0) {
-      const zoomX = this.canvasWidth / this.imageNaturalWidth;
-      const zoomY = this.canvasHeight / this.imageNaturalHeight;
-      const fitZoom = Math.min(zoomX, zoomY) * 0.9;
+      const zoomX = activeWidth / this.imageNaturalWidth;
+      const zoomY = activeHeight / this.imageNaturalHeight;
+      const fitZoom = Math.min(zoomX, zoomY) * 0.85;
       this.canvasZoom = Math.max(0.05, Math.min(2.0, fitZoom));
-      this.canvasViewOffsetX = (this.canvasWidth - this.imageNaturalWidth * this.canvasZoom) / 2;
-      this.canvasViewOffsetY = (this.canvasHeight - this.imageNaturalHeight * this.canvasZoom) / 2;
+      this.canvasViewOffsetX = (activeWidth - this.imageNaturalWidth * this.canvasZoom) / 2;
+      this.canvasViewOffsetY = (activeHeight - this.imageNaturalHeight * this.canvasZoom) / 2;
     } else {
-      this.canvasZoom = 1;
-      this.canvasViewOffsetX = this.canvasWidth / 2;
-      this.canvasViewOffsetY = this.canvasHeight / 2;
+      const bbox = this.getModelBoundingBox();
+      if (bbox) {
+        const centerX = (bbox.minX + bbox.maxX) / 2;
+        const centerY = (bbox.minY + bbox.maxY) / 2;
+        const bboxWidth = bbox.maxX - bbox.minX;
+        const bboxHeight = bbox.maxY - bbox.minY;
+
+        const ppm = this.pixelsPerMeter || 40;
+        const targetPadding = 0.60;
+        if (bboxWidth > 0 && bboxHeight > 0 && activeWidth > 0 && activeHeight > 0) {
+          const requiredZoomX = (activeWidth * targetPadding) / (bboxWidth * ppm);
+          const requiredZoomY = (activeHeight * targetPadding) / (bboxHeight * ppm);
+          this.canvasZoom = Math.max(0.05, Math.min(3.0, Math.min(requiredZoomX, requiredZoomY)));
+        } else {
+          this.canvasZoom = 1.0;
+        }
+
+        this.canvasViewOffsetX = (activeWidth / 2) - (centerX * ppm * this.canvasZoom);
+        this.canvasViewOffsetY = (activeHeight / 2) + (centerY * ppm * this.canvasZoom);
+      } else {
+        this.canvasZoom = 1;
+        this.canvasViewOffsetX = activeWidth / 2;
+        this.canvasViewOffsetY = activeHeight / 2;
+      }
     }
     // Also reset 3D view preset and trigger 3D camera reset
     uiState.viewPreset = 'iso';
@@ -596,6 +705,222 @@ class StructuralModel {
     uiState.setSelectedElements([]);
     uiState.selectedHoleIndex = null;
     uiState.setTool('select');
+    uiState.showParametricLivePanel = false;
+    uiState.showParametricStudyDialog = false;
+    this.scheduleAutoSave();
+  }
+
+  generateParametricStudy(config: ParametricConfig): void {
+    this.beginAction();
+    this.slabs = [];
+    this.dropPanels = [];
+    this.columns = [];
+    this.walls = [];
+    this.polylineWalls = [];
+    this.beams = [];
+    this.dimensions = [];
+    this.nonStructuralWalls = [];
+    this.polylineNonStructuralWalls = [];
+    this.hiddenElementIds = [];
+    this.lockedElementIds = [];
+    femState.clear();
+    floorLayers.clearAll();
+
+    this.concreteGrade = config.concreteGrade;
+    this.rebarGrade = config.rebarGrade;
+
+    const totalWidth = config.spansX * config.spacingX;
+    const totalHeight = config.spansY * config.spacingY;
+
+    // 1. Outer Slab Boundary
+    const xMin = -config.overhangX;
+    const xMax = totalWidth + config.overhangX;
+    const yMin = -config.overhangY;
+    const yMax = totalHeight + config.overhangY;
+
+    const slabVerts: Point2D[] = [
+      { x: xMin, y: yMin },
+      { x: xMax, y: yMin },
+      { x: xMax, y: yMax },
+      { x: xMin, y: yMax },
+    ];
+
+    const slabProps = materialForGrade(config.concreteGrade);
+    const sdl = config.deadLoad ?? 2.0;
+    const ll = config.liveLoad ?? 3.0;
+    const totalLoad = sdl + ll;
+    const slabThicknessM = config.slabThickness / 1000;
+
+    const mainSlab: SlabPolygon = {
+      id: 'S-01',
+      label: 'S-01',
+      vertices: slabVerts,
+      holes: [],
+      thickness: slabThicknessM,
+      deadLoad: sdl,
+      liveLoad: ll,
+      uniformLoad: totalLoad > 0 ? totalLoad : 5.0,
+      partitionLoad: 0,
+      concreteGrade: config.concreteGrade,
+      ...slabProps,
+      crackingModifier: uiState.deflectionType === 'cracked' ? uiState.crackedModifierValue : 1.0,
+    };
+    this.slabs = [mainSlab];
+
+    // 2. Grid Columns & Drop Panels
+    let colIndex = 1;
+    let dpIndex = 1;
+    const newCols: ColumnElement[] = [];
+    const newDropPanels: DropPanelElement[] = [];
+    const colWidthM = config.columnWidth / 1000;
+    const colDepthM = config.columnDepth / 1000;
+    const colHeightM = config.columnHeight / 1000;
+    const colDiaM = config.columnDiameter / 1000;
+    const dropDropM = config.dropDrop / 1000;
+
+    for (let ix = 0; ix <= config.spansX; ix++) {
+      const xPos = ix * config.spacingX;
+      for (let iy = 0; iy <= config.spansY; iy++) {
+        const yPos = iy * config.spacingY;
+        const colId = `C-${String(colIndex++).padStart(2, '0')}`;
+
+        const colObj: ColumnElement = {
+          id: colId,
+          label: colId,
+          position: { x: xPos, y: yPos },
+          width: colWidthM,
+          depth: colDepthM,
+          height: colHeightM,
+          rotation: 0,
+          boundaryCondition: config.columnBoundary,
+          shape: config.columnShape,
+          diameter: colDiaM,
+          concreteGrade: config.concreteGrade,
+          ...materialForGrade(config.concreteGrade),
+        };
+        newCols.push(colObj);
+
+        if (config.hasDropPanels) {
+          const dpId = `DP-${String(dpIndex++).padStart(2, '0')}`;
+          const xDiv = config.dropDivisor ?? 3;
+          const calculatedDropWidth = config.dropWidth || (config.spacingX / xDiv);
+          const calculatedDropDepth = config.dropDepth || (config.spacingY / xDiv);
+          const dpVerts = computeDropPanelVerts({ x: xPos, y: yPos }, calculatedDropWidth, calculatedDropDepth, 0);
+          newDropPanels.push({
+            id: dpId,
+            label: dpId,
+            vertices: dpVerts,
+            center: { x: xPos, y: yPos },
+            width: calculatedDropWidth,
+            depth: calculatedDropDepth,
+            rotation: 0,
+            drop: dropDropM,
+            parentColumnId: colId,
+            concreteGrade: config.concreteGrade,
+            ...materialForGrade(config.concreteGrade),
+          });
+        }
+      }
+    }
+    this.columns = newCols;
+    this.dropPanels = newDropPanels;
+
+    // 3. Grid Beams (if enabled)
+    if (config.hasGridBeams) {
+      const newBeams: BeamElement[] = [];
+      let beamIndex = 1;
+      const bwM = config.beamWidth / 1000;
+      const bdM = config.beamDepth / 1000;
+
+      for (let iy = 0; iy <= config.spansY; iy++) {
+        const yPos = iy * config.spacingY;
+        for (let ix = 0; ix < config.spansX; ix++) {
+          const xStart = ix * config.spacingX;
+          const xEnd = (ix + 1) * config.spacingX;
+          const beamId = `B-${String(beamIndex++).padStart(2, '0')}`;
+          newBeams.push({
+            id: beamId,
+            label: beamId,
+            startPoint: { x: xStart, y: yPos },
+            endPoint: { x: xEnd, y: yPos },
+            width: bwM,
+            depth: bdM,
+            height: colHeightM,
+            concreteGrade: config.concreteGrade,
+            ...materialForGrade(config.concreteGrade),
+          });
+        }
+      }
+
+      for (let ix = 0; ix <= config.spansX; ix++) {
+        const xPos = ix * config.spacingX;
+        for (let iy = 0; iy < config.spansY; iy++) {
+          const yStart = iy * config.spacingY;
+          const yEnd = (iy + 1) * config.spacingY;
+          const beamId = `B-${String(beamIndex++).padStart(2, '0')}`;
+          newBeams.push({
+            id: beamId,
+            label: beamId,
+            startPoint: { x: xPos, y: yStart },
+            endPoint: { x: xPos, y: yEnd },
+            width: bwM,
+            depth: bdM,
+            height: colHeightM,
+            concreteGrade: config.concreteGrade,
+            ...materialForGrade(config.concreteGrade),
+          });
+        }
+      }
+      this.beams = newBeams;
+    }
+
+    // 4. Generate Dimension Line Annotations matching preview grid
+    const newDims: Dimension[] = [];
+    let dimIdx = 1;
+    for (let ix = 0; ix < config.spansX; ix++) {
+      const xStart = ix * config.spacingX;
+      const xEnd = (ix + 1) * config.spacingX;
+      newDims.push({
+        id: `DIM-${dimIdx++}`,
+        startPoint: { x: xStart, y: -1.8 },
+        endPoint: { x: xEnd, y: -1.8 },
+        distance: config.spacingX,
+      });
+    }
+    if (config.spansX > 1) {
+      newDims.push({
+        id: `DIM-${dimIdx++}`,
+        startPoint: { x: 0, y: -2.8 },
+        endPoint: { x: totalWidth, y: -2.8 },
+        distance: totalWidth,
+      });
+    }
+    for (let iy = 0; iy < config.spansY; iy++) {
+      const yStart = iy * config.spacingY;
+      const yEnd = (iy + 1) * config.spacingY;
+      newDims.push({
+        id: `DIM-${dimIdx++}`,
+        startPoint: { x: -1.8, y: yStart },
+        endPoint: { x: -1.8, y: yEnd },
+        distance: config.spacingY,
+      });
+    }
+    if (config.spansY > 1) {
+      newDims.push({
+        id: `DIM-${dimIdx++}`,
+        startPoint: { x: -2.8, y: 0 },
+        endPoint: { x: -2.8, y: totalHeight },
+        distance: totalHeight,
+      });
+    }
+    this.dimensions = newDims;
+
+    if (!this.isCalibrated) {
+      this.isCalibrated = true;
+      this.pixelsPerMeter = 40;
+      this.calibratedLabel = '✓ Calibrated (1m = 40px)';
+    }
+
     this.scheduleAutoSave();
   }
 
@@ -693,7 +1018,7 @@ class StructuralModel {
       id: genId('W'), startPoint: { ...start }, endPoint: { ...end },
       thickness: t, height: 3.0,
       label: getNextLabelSuffix('W', this.walls.map(w => w.label)),
-      boundaryCondition: 'fixed-free', concreteGrade: g, poissonRatio: 0.2, ...props,
+      boundaryCondition: 'fixed-fixed', concreteGrade: g, poissonRatio: 0.2, ...props,
     }];
   }
 
@@ -707,7 +1032,7 @@ class StructuralModel {
       id: genId('PW'), vertices: vertices.map(v => ({ ...v })),
       thickness: t, height: 3.0,
       label: getNextLabelSuffix('PW', this.polylineWalls.map(w => w.label)),
-      boundaryCondition: 'fixed-free', concreteGrade: g, poissonRatio: 0.2, ...props,
+      boundaryCondition: 'fixed-fixed', concreteGrade: g, poissonRatio: 0.2, ...props,
     }];
   }
 

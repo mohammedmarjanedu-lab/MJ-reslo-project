@@ -13,6 +13,8 @@ Author: Structural Engineering Audit
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 import numpy as np
 import math

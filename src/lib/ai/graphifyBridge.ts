@@ -182,3 +182,17 @@ export async function getSubgraph(nodeIds: string[], includeEdges = true): Promi
   }
   return { nodes, edges };
 }
+
+if (typeof window !== 'undefined') {
+  (window as any).__GRAPHIFY__ = {
+    getGraph,
+    getNode,
+    getNeighbors,
+    findHotspots,
+    findByKind,
+    findByFile,
+    searchNodes,
+    getSubgraph,
+    clearCache
+  };
+}

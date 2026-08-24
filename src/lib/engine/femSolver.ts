@@ -736,7 +736,7 @@ export function analyzeAllSlabs(
   // Sort nodes along the X-axis to group coincident nodes together
   allNodes.sort((a, b) => a.x - b.x);
 
-  const mergeTol = Math.max(0.12, meshSize * 0.35);
+  const mergeTol = Math.max(0.05, Math.min(0.20, meshSize * 0.25));
   const mergeTolSq = mergeTol * mergeTol;
   interface UniqueNodeRef extends FEMNode {
     slabId: string;
@@ -760,10 +760,12 @@ export function analyzeAllSlabs(
         if (cell) {
           for (const ui of cell) {
             const un = uniqueNodes[ui];
-            const distSq = (node.x - un.x) ** 2 + (node.y - un.y) ** 2;
-            if (distSq < mergeTolSq) {
-              foundIdx = ui;
-              break;
+            if (node.slabId !== un.slabId) {
+              const distSq = (node.x - un.x) ** 2 + (node.y - un.y) ** 2;
+              if (distSq < mergeTolSq) {
+                foundIdx = ui;
+                break;
+              }
             }
           }
         }
@@ -934,6 +936,177 @@ export function analyzeAllSlabs(
     }
   }
 
+  // 4b. Assemble 1D elastic beam flexural & torsional stiffness into global matrix
+  for (const beam of beams) {
+    const bw_b = beam.width || 0.3;
+    const bd_b = beam.depth || 0.45;
+    let bE = beam.elasticModulus || 25e6; // kPa
+    if (bE > 1e8) bE /= 1000.0;
+    const G_b = bE / (2.0 * (1.0 + poissonRatio));
+
+    const crackMod = (slabMeshes.length > 0 && slabMeshes[0].slab.crackingModifier !== undefined)
+      ? slabMeshes[0].slab.crackingModifier
+      : 1.0;
+
+    const w_side = Math.min(bw_b, bd_b);
+    const h_side = Math.max(bw_b, bd_b);
+    const r_side = h_side > 0 ? w_side / h_side : 1.0;
+    const J_saint_venant = h_side * Math.pow(w_side, 3) * (1 / 3 - 0.21 * r_side * (1 - Math.pow(r_side, 4) / 12.0));
+
+    // Gross beam inertia scaled by cracked section modifier (ACI 318 Table 6.6.3.1.1 / IS 456)
+    const I_gross = (bw_b * Math.pow(bd_b, 3)) / 12.0;
+    const I_eff = I_gross * crackMod;
+    const J_b = Math.max(1e-6, J_saint_venant) * crackMod;
+
+    const dx_b = beam.endPoint.x - beam.startPoint.x;
+    const dy_b = beam.endPoint.y - beam.startPoint.y;
+    const L_beam2 = dx_b * dx_b + dy_b * dy_b;
+    if (L_beam2 < 1e-12) continue;
+    const L_beam = Math.sqrt(L_beam2);
+
+    const t_slab = slabMeshes.length > 0 ? slabMeshes[0].slab.thickness : 0.2;
+    const w_beam_self = 25.0 * bw_b * Math.max(0, bd_b - t_slab);
+
+    // Kinematic Beam Discretization: step size ~ meshSize * 0.5
+    const stepSize = Math.max(0.10, meshSize * 0.5);
+    const numSubSegs = Math.max(1, Math.ceil(L_beam / stepSize));
+    const dt = 1.0 / numSubSegs;
+
+    // Helper: find 4 nearest slab nodes to point (px, py) and compute Inverse Distance Weights
+    function getKinematicWeights(px: number, py: number): { gIdx: number; w: number }[] {
+      const searchRadius = Math.max(0.35, meshSize * 1.5);
+      const searchRadiusSq = searchRadius * searchRadius;
+      const candidates: { gIdx: number; d2: number }[] = [];
+
+      for (let i = 0; i < globalNodes.length; i++) {
+        const nd = globalNodes[i];
+        const d2 = (nd.x - px) ** 2 + (nd.y - py) ** 2;
+        if (d2 <= searchRadiusSq) {
+          candidates.push({ gIdx: i, d2 });
+        }
+      }
+
+      if (candidates.length === 0) {
+        let bestIdx = 0, minD2 = Infinity;
+        for (let i = 0; i < globalNodes.length; i++) {
+          const d2 = (globalNodes[i].x - px) ** 2 + (globalNodes[i].y - py) ** 2;
+          if (d2 < minD2) { minD2 = d2; bestIdx = i; }
+        }
+        return [{ gIdx: bestIdx, w: 1.0 }];
+      }
+
+      candidates.sort((a, b) => a.d2 - b.d2);
+      const topN = candidates.slice(0, 4);
+
+      if (topN[0].d2 < 1e-8) {
+        return [{ gIdx: topN[0].gIdx, w: 1.0 }];
+      }
+
+      let sumInvD = 0;
+      const rawWeights = topN.map(c => {
+        const invD = 1.0 / Math.pow(Math.sqrt(c.d2) + 1e-4, 2);
+        sumInvD += invD;
+        return { gIdx: c.gIdx, invD };
+      });
+
+      return rawWeights.map(rw => ({ gIdx: rw.gIdx, w: rw.invD / sumInvD }));
+    }
+
+    // Assemble 1D Beam Elements along discretized beam line points
+    for (let k = 0; k < numSubSegs; k++) {
+      const tA = k * dt;
+      const tB = (k + 1) * dt;
+      const ptAx = beam.startPoint.x + tA * dx_b;
+      const ptAy = beam.startPoint.y + tA * dy_b;
+      const ptBx = beam.startPoint.x + tB * dx_b;
+      const ptBy = beam.startPoint.y + tB * dy_b;
+
+      const segDx = ptBx - ptAx;
+      const segDy = ptBy - ptAy;
+      const L_seg = Math.hypot(segDx, segDy);
+      if (L_seg < 1e-6) continue;
+
+      const c = segDx / L_seg, s = segDy / L_seg;
+
+      // Beam self-weight line load distribution
+      const beamSelfForce = (w_beam_self * L_seg) / 2.0;
+      const weightsA = getKinematicWeights(ptAx, ptAy);
+      const weightsB = getKinematicWeights(ptBx, ptBy);
+
+      for (const { gIdx, w } of weightsA) {
+        f_global[gIdx * 3] += w * beamSelfForce;
+      }
+      for (const { gIdx, w } of weightsB) {
+        f_global[gIdx * 3] += w * beamSelfForce;
+      }
+
+      const k1 = 12.0 * bE * I_eff / Math.pow(L_seg, 3);
+      const k2 = 6.0 * bE * I_eff / Math.pow(L_seg, 2);
+      const k3 = 4.0 * bE * I_eff / L_seg;
+      const k4 = 2.0 * bE * I_eff / L_seg;
+      const kt = G_b * J_b / L_seg;
+
+      // 6x6 Local Beam Stiffness Matrix: DOFs [w1, rx1', ry1', w2, rx2', ry2']
+      const K_loc_11 = [[k1, 0, -k2], [0, kt, 0], [-k2, 0, k3]];
+      const K_loc_12 = [[-k1, 0, -k2], [0, -kt, 0], [k2, 0, k4]];
+      const K_loc_21 = [[-k1, 0, k2], [0, -kt, 0], [-k2, 0, k4]];
+      const K_loc_22 = [[k1, 0, k2], [0, kt, 0], [k2, 0, k3]];
+
+      function transformSubBlock(Sub: number[][]): number[][] {
+        const M: number[][] = Array.from({ length: 3 }, () => [0, 0, 0]);
+        for (let i = 0; i < 3; i++) {
+          M[i][0] = Sub[i][0];
+          M[i][1] = Sub[i][1] * c - Sub[i][2] * s;
+          M[i][2] = Sub[i][1] * s + Sub[i][2] * c;
+        }
+        const Res: number[][] = Array.from({ length: 3 }, () => [0, 0, 0]);
+        for (let j = 0; j < 3; j++) {
+          Res[0][j] = M[0][j];
+          Res[1][j] = c * M[1][j] - s * M[2][j];
+          Res[2][j] = s * M[1][j] + c * M[2][j];
+        }
+        return Res;
+      }
+
+      const Kg_11 = transformSubBlock(K_loc_11);
+      const Kg_12 = transformSubBlock(K_loc_12);
+      const Kg_21 = transformSubBlock(K_loc_21);
+      const Kg_22 = transformSubBlock(K_loc_22);
+
+      // Assemble 6x6 beam sub-blocks directly into K_band via Kinematic Coupling weights
+      const blocks: { rowW: { gIdx: number; w: number }[]; colW: { gIdx: number; w: number }[]; sub: number[][] }[] = [
+        { rowW: weightsA, colW: weightsA, sub: Kg_11 },
+        { rowW: weightsA, colW: weightsB, sub: Kg_12 },
+        { rowW: weightsB, colW: weightsA, sub: Kg_21 },
+        { rowW: weightsB, colW: weightsB, sub: Kg_22 },
+      ];
+
+      for (const { rowW, colW, sub } of blocks) {
+        for (const rItem of rowW) {
+          for (const cItem of colW) {
+            const weightMult = rItem.w * cItem.w;
+            if (weightMult < 1e-8) continue;
+
+            const rNodeIdx = rItem.gIdx;
+            const cNodeIdx = cItem.gIdx;
+
+            for (let dofR = 0; dofR < 3; dofR++) {
+              for (let dofC = 0; dofC < 3; dofC++) {
+                const r_dof = rNodeIdx * 3 + dofR;
+                const c_dof = cNodeIdx * 3 + dofC;
+                const k_val = weightMult * sub[dofR][dofC];
+
+                if (r_dof <= c_dof && (c_dof - r_dof) < bw) {
+                  K_band[r_dof][c_dof - r_dof] += k_val;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   onProgress?.(0.35);
 
   // 5. Partition wall loads globally
@@ -1009,8 +1182,8 @@ export function analyzeAllSlabs(
 
   // 6. Support conditions (applied to global nodes)
   const bc = new Array(ndof).fill(false);
-  const searchTol = meshSize * 0.6;
-  const colTol = meshSize * 1.2;
+  const searchTol = Math.max(0.05, meshSize * 0.6);
+  const colTol = Math.max(0.15, meshSize * 0.5);
 
   // Point supports (columns) — Model as elastic column springs matching Kratos Multiphysics & ETABS
   const columnPunchingMap = new Map<string, { K_z: number; col: ColumnElement; nodeIdx: number }>();
@@ -1024,44 +1197,15 @@ export function analyzeAllSlabs(
       }
     }
     if (nearSlab) {
-      let matchedCount = 0;
+      const matchedNodeIndices: number[] = [];
       for (let i = 0; i < globalNodes.length; i++) {
         const d = distance(col.position, globalNodes[i]);
         if (d < colTol) {
-          matchedCount++;
-          const wcol = col.width || 0.3;
-          const dcol = col.depth || 0.3;
-          const Hcol = col.height || 3.0;
-          let E_col = col.elasticModulus || 25e6; // kPa
-          if (E_col > 1e8) E_col /= 1000.0;
-
-          let A_col = wcol * dcol;
-          let Ix = wcol * Math.pow(dcol, 3) / 12.0;
-          let Iy = dcol * Math.pow(wcol, 3) / 12.0;
-          if (col.shape === 'circular') {
-            const diam = col.diameter || 0.5;
-            A_col = Math.PI * Math.pow(diam, 2) / 4.0;
-            Ix = Math.PI * Math.pow(diam, 4) / 64.0;
-            Iy = Ix;
-          }
-
-          const K_z = E_col * A_col / Hcol;
-          const K_rx = 4.0 * E_col * Ix / Hcol;
-          const K_ry = 4.0 * E_col * Iy / Hcol;
-
-          const r_w = i * 3;
-          const r_rx = i * 3 + 1;
-          const r_ry = i * 3 + 2;
-
-          K_band[r_w][0] += K_z;
-          K_band[r_rx][0] += K_rx;
-          K_band[r_ry][0] += K_ry;
-
-          columnPunchingMap.set(col.id, { K_z, col, nodeIdx: i });
+          matchedNodeIndices.push(i);
         }
       }
 
-      if (matchedCount === 0 && globalNodes.length > 0) {
+      if (matchedNodeIndices.length === 0 && globalNodes.length > 0) {
         let minD = Infinity;
         let bestIdx = 0;
         for (let i = 0; i < globalNodes.length; i++) {
@@ -1069,87 +1213,130 @@ export function analyzeAllSlabs(
           if (d < minD) { minD = d; bestIdx = i; }
         }
         if (minD < Math.max(1.0, meshSize * 2.0)) {
-          const wcol = col.width || 0.3;
-          const dcol = col.depth || 0.3;
-          const Hcol = col.height || 3.0;
-          let E_col = col.elasticModulus || 25e6;
-          if (E_col > 1e8) E_col /= 1000.0;
-
-          let A_col = wcol * dcol;
-          let Ix = wcol * Math.pow(dcol, 3) / 12.0;
-          let Iy = dcol * Math.pow(wcol, 3) / 12.0;
-          if (col.shape === 'circular') {
-            const diam = col.diameter || 0.5;
-            A_col = Math.PI * Math.pow(diam, 2) / 4.0;
-            Ix = Math.PI * Math.pow(diam, 4) / 64.0;
-            Iy = Ix;
-          }
-
-          const K_z = E_col * A_col / Hcol;
-          const K_rx = 4.0 * E_col * Ix / Hcol;
-          const K_ry = 4.0 * E_col * Iy / Hcol;
-
-          const r_w = bestIdx * 3;
-          const r_rx = bestIdx * 3 + 1;
-          const r_ry = bestIdx * 3 + 2;
-
-          K_band[r_w][0] += K_z;
-          K_band[r_rx][0] += K_rx;
-          K_band[r_ry][0] += K_ry;
-
-          columnPunchingMap.set(col.id, { K_z, col, nodeIdx: bestIdx });
+          matchedNodeIndices.push(bestIdx);
         }
+      }
+
+      if (matchedNodeIndices.length > 0) {
+        const wcol = col.width || 0.3;
+        const dcol = col.depth || 0.3;
+        const Hcol = col.height || 3.0;
+        let E_col = col.elasticModulus || 25e6; // kPa
+        if (E_col > 1e8) E_col /= 1000.0;
+
+        let A_col = wcol * dcol;
+        let Ix = wcol * Math.pow(dcol, 3) / 12.0;
+        let Iy = dcol * Math.pow(wcol, 3) / 12.0;
+        if (col.shape === 'circular') {
+          const diam = col.diameter || 0.5;
+          A_col = Math.PI * Math.pow(diam, 2) / 4.0;
+          Ix = Math.PI * Math.pow(diam, 4) / 64.0;
+          Iy = Ix;
+        }
+
+        const colBc = col.boundaryCondition as string | undefined;
+        const colFactor = (colBc === 'pinned' || colBc === 'fixed-pinned') ? 3.0 : 4.0;
+        const K_z = E_col * A_col / Hcol;
+        const K_rx = colFactor * E_col * Ix / Hcol;
+        const K_ry = colFactor * E_col * Iy / Hcol;
+
+        const count = matchedNodeIndices.length;
+        for (const i of matchedNodeIndices) {
+          const r_w = i * 3;
+          const r_rx = i * 3 + 1;
+          const r_ry = i * 3 + 2;
+
+          K_band[r_w][0] += K_z / count;
+          K_band[r_rx][0] += K_rx / count;
+          K_band[r_ry][0] += K_ry / count;
+        }
+
+        columnPunchingMap.set(col.id, { K_z, col, nodeIdx: matchedNodeIndices[0] });
       }
     }
   }
 
-  function constrainGlobalSegment(a: Point2D, b: Point2D) {
-    let foundCollinear = false;
-    for (const { slab } of slabMeshes) {
-      const collinear = findCollinearSlabEdge(slab.vertices, a, b, searchTol);
-      if (collinear) {
-        foundCollinear = true;
-        for (let i = 0; i < globalNodes.length; i++) {
-          if (pointToSegmentDist(globalNodes[i], collinear.edgeA, collinear.edgeB) < searchTol) {
-            bc[i * 3] = true;
-          }
+  function constrainGlobalWallSegment(
+    a: Point2D, b: Point2D,
+    wallProps: { thickness?: number; height?: number; elasticModulus?: number; boundaryCondition?: string }
+  ) {
+    const wallBc = wallProps.boundaryCondition || 'fixed-pinned';
+    const isRigid = wallBc === 'rigid' || wallBc === 'rigid-fixed';
+    const isSimple = wallBc === 'simply-supported' || wallBc === 'pinned';
+
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const Lw = Math.hypot(dx, dy);
+    if (Lw < 1e-6) return;
+    const cos_a = dx / Lw;
+    const sin_a = dy / Lw;
+
+    const t = wallProps.thickness || 0.25;
+    const H = wallProps.height || 3.0;
+    const E_wall = wallProps.elasticModulus || 27.386e6 * 1000;
+    const colFactor = (wallBc === 'pinned' || wallBc === 'fixed-pinned' || wallBc === 'fixed-free') ? 0.75 : 1.0;
+    const k_line = (colFactor * 0.0109 * E_wall * (t ** 3)) / (0.75 * H);
+
+    const lineTol = Math.max(0.04, Math.min(0.20, meshSize * 0.25));
+    const matched: { idx: number; s: number }[] = [];
+
+    for (let i = 0; i < globalNodes.length; i++) {
+      const g = globalNodes[i];
+      const d_seg = pointToSegmentDist(g, a, b);
+      if (d_seg <= lineTol) {
+        const s = Math.max(0, Math.min(Lw, (g.x - a.x) * cos_a + (g.y - a.y) * sin_a));
+        matched.push({ idx: i, s });
+        bc[i * 3] = true; // Vertical constraint W = 0
+        if (isRigid) {
+          bc[i * 3 + 1] = true;
+          bc[i * 3 + 2] = true;
         }
       }
     }
-    if (foundCollinear) return;
 
-    for (const { slab } of slabMeshes) {
-      const intersectPts = findPolygonIntersectingSegments(slab.vertices, a, b);
-      if (intersectPts.length >= 2) {
-        for (let i = 0; i < globalNodes.length; i++) {
-          if (pointToSegmentDist(globalNodes[i], intersectPts[0], intersectPts[1]) < searchTol) {
-            bc[i * 3] = true;
-          }
+    if (matched.length === 0) {
+      const mx = (a.x + b.x) / 2.0;
+      const my = (a.y + b.y) / 2.0;
+      let minD = Infinity; let bestIdx = -1;
+      for (let i = 0; i < globalNodes.length; i++) {
+        const d = distance({ x: mx, y: my }, globalNodes[i]);
+        if (d < minD) { minD = d; bestIdx = i; }
+      }
+      if (bestIdx >= 0) {
+        matched.push({ idx: bestIdx, s: Lw / 2 });
+        bc[bestIdx * 3] = true;
+        if (isRigid) {
+          bc[bestIdx * 3 + 1] = true;
+          bc[bestIdx * 3 + 2] = true;
         }
-      } else {
-        for (const dp of [a, b]) {
-          if (pointInPolygon(dp, slab.vertices) || distance(dp, slab.vertices[0]) < searchTol) {
-            let minD = Infinity; let ni = -1;
-            for (let i = 0; i < globalNodes.length; i++) {
-              const d = distance(dp, globalNodes[i]);
-              if (d < minD) { minD = d; ni = i; }
-            }
-            if (ni >= 0 && minD < searchTol) {
-              bc[ni * 3] = true;
-            }
-          }
-        }
+      }
+    }
+
+    // Distribute rotational spring proportional to tributary segment length
+    if (!isRigid && !isSimple && matched.length > 0) {
+      matched.sort((p, q) => p.s - q.s);
+      const M = matched.length;
+      for (let k = 0; k < M; k++) {
+        const s_left = k > 0 ? (matched[k].s + matched[k - 1].s) / 2.0 : 0.0;
+        const s_right = k < M - 1 ? (matched[k].s + matched[k + 1].s) / 2.0 : Lw;
+        const L_trib = Math.max(0.01, s_right - s_left);
+        const k_node = k_line * L_trib;
+
+        const r_rx = matched[k].idx * 3 + 1;
+        const r_ry = matched[k].idx * 3 + 2;
+        K_band[r_rx][0] += k_node * (cos_a ** 2);
+        K_band[r_ry][0] += k_node * (sin_a ** 2);
       }
     }
   }
 
-  for (const wall of walls) constrainGlobalSegment(wall.startPoint, wall.endPoint);
+  for (const wall of walls) {
+    constrainGlobalWallSegment(wall.startPoint, wall.endPoint, wall);
+  }
   for (const pwall of polylineWalls) {
     for (let i = 0; i < pwall.vertices.length - 1; i++) {
-      constrainGlobalSegment(pwall.vertices[i], pwall.vertices[i + 1]);
+      constrainGlobalWallSegment(pwall.vertices[i], pwall.vertices[i + 1], pwall);
     }
   }
-  for (const beam of beams) constrainGlobalSegment(beam.startPoint, beam.endPoint);
 
   onProgress?.(0.50);
 
@@ -1187,7 +1374,7 @@ export function analyzeAllSlabs(
     const nodeDeflections = mesh.nodes.map(n => {
       const gIdx = localMap.get(n.id)!;
       const wz = u_global[gIdx * 3];
-      return { nodeId: n.id, wz: isFinite(wz) ? -wz : 0 };
+      return { nodeId: n.id, wz: isFinite(wz) ? wz * 1000 : 0 };
     });
 
     const momentMx: { elementId: number; value: number }[] = [];

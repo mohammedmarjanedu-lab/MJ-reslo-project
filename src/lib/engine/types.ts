@@ -12,6 +12,8 @@ export interface SlabPolygon {
   concreteDensity: number;
   uniformLoad: number;
   partitionLoad: number;
+  deadLoad?: number;
+  liveLoad?: number;
   elasticModulus: number;
   concreteGrade?: string;
   color?: string;
@@ -19,7 +21,7 @@ export interface SlabPolygon {
   discontinuousEdges?: { startPoint: Point2D; endPoint: Point2D }[];
 }
 
-export type BoundaryCondition = 'fixed-fixed' | 'fixed-free';
+export type BoundaryCondition = 'fixed-fixed' | 'fixed-free' | 'simply-supported' | 'pinned' | 'fixed';
 
 export interface ColumnElement {
   id: string;
@@ -447,3 +449,33 @@ export interface SharedNode {
   point: Point2D;
   connectedElements: string[];
 }
+
+export interface ParametricConfig {
+  preset: 'flatSlabDrops' | 'flatPlate' | 'gridBeams';
+  spansX: number;
+  spansY: number;
+  spacingX: number;
+  spacingY: number;
+  overhangX: number;
+  overhangY: number;
+  slabThickness: number;
+  hasDropPanels: boolean;
+  dropDivisor?: number;
+  dropWidth: number;
+  dropDepth: number;
+  dropDrop: number;
+  columnShape: 'rectangular' | 'circular';
+  columnWidth: number;
+  columnDepth: number;
+  columnDiameter: number;
+  columnHeight: number;
+  columnBoundary: BoundaryCondition;
+  concreteGrade: string;
+  rebarGrade: string;
+  deadLoad: number;
+  liveLoad: number;
+  hasGridBeams: boolean;
+  beamWidth: number;
+  beamDepth: number;
+}
+

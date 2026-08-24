@@ -1,5 +1,7 @@
-import type { Point2D, SlabPolygon, ColumnElement, ShearWallElement, PolylineWallElement, BeamElement, Dimension, DropPanelElement, NonStructuralWallElement, PolylineNonStructuralWallElement, FEMMesh, FEMStressResult, FEMShearResult, FEMMembraneResult, FEMResultType, ColumnPunchingResult, SlabFEMResult } from '../engine/types';
+import type { Point2D, SlabPolygon, ColumnElement, ShearWallElement, PolylineWallElement, BeamElement, Dimension, DropPanelElement, NonStructuralWallElement, PolylineNonStructuralWallElement, FEMMesh, FEMStressResult, FEMShearResult, FEMMembraneResult, FEMResultType, ColumnPunchingResult, SlabFEMResult, ColorRampName } from '../engine/types';
 import { uiState } from '../stores/uiState.svelte';
+import { sampleRamp } from '../engine/colorRamps';
+
 
 const COLORS_DARK = {
   grid: 'rgba(255,255,255,0.08)',
@@ -890,23 +892,20 @@ export function drawDimension(
     ctx.stroke();
   }
 
-  // Dimension text label (above the line)
+  // Dimension text label (centered on the line)
   const midX = (s1x + e1x) / 2;
   const midY = (s1y + e1y) / 2;
-  const label = `${distanceMeters.toFixed(3)} m`;
-  const labelOffX = nx * 18;
-  const labelOffY = ny * 18;
-  ctx.font = 'bold 13px "JetBrains Mono", monospace';
+  const label = `${distanceMeters.toFixed(2)} m`;
+  ctx.font = 'bold 11px "Inter", "Segoe UI", "JetBrains Mono", monospace';
   ctx.textAlign = 'center';
-  ctx.textBaseline = 'bottom';
-  const m = ctx.measureText(label);
-  const pad = 6;
-  const lx = midX + labelOffX;
-  const ly = midY + labelOffY;
-  ctx.fillStyle = 'rgba(0,0,0,0.75)';
-  ctx.fillRect(lx - m.width / 2 - pad, ly - 22 - pad, m.width + pad * 2, 22 + pad * 2);
-  ctx.fillStyle = selected ? '#10B981' : COLORS.dimNotSelected;
-  ctx.fillText(label, lx, ly - 4);
+  ctx.textBaseline = 'middle';
+  
+  // High-contrast stroke halo instead of ugly black box
+  ctx.strokeStyle = '#0f172a';
+  ctx.lineWidth = 3;
+  ctx.strokeText(label, midX, midY);
+  ctx.fillStyle = selected ? '#10B981' : '#38BDF8';
+  ctx.fillText(label, midX, midY);
 
   ctx.restore();
 }
@@ -927,6 +926,121 @@ export function drawDimensions(
     const ey = -d.endPoint.y * ppm * zoom + offsetY;
     drawDimension(ctx, { x: sx, y: sy }, { x: ex, y: ey }, d.distance, selectedIds.includes(d.id));
   }
+}
+
+export function drawStructuralGrids(
+  ctx: CanvasRenderingContext2D,
+  columns: { position: Point2D }[],
+  slabs: { vertices: Point2D[] }[],
+  ppm: number,
+  zoom: number,
+  offsetX: number,
+  offsetY: number
+): void {
+  if (columns.length === 0 && slabs.length === 0) return;
+
+  const rawX = columns.map(c => c.position.x);
+  const rawY = columns.map(c => c.position.y);
+  if (rawX.length === 0 || rawY.length === 0) return;
+
+  const sortUnique = (arr: number[]) => {
+    const sorted = [...arr].sort((a, b) => a - b);
+    const unique: number[] = [];
+    for (const v of sorted) {
+      if (!unique.some(u => Math.abs(u - v) < 0.05)) {
+        unique.push(v);
+      }
+    }
+    return unique;
+  };
+
+  const xCoords = sortUnique(rawX);
+  const yCoords = sortUnique(rawY);
+  if (xCoords.length === 0 || yCoords.length === 0) return;
+
+  const minX = xCoords[0];
+  const maxX = xCoords[xCoords.length - 1];
+  const minY = yCoords[0];
+  const maxY = yCoords[yCoords.length - 1];
+
+  const gridMargin = 1.0;
+  const yStartWorld = minY - gridMargin;
+  const yEndWorld = maxY + gridMargin;
+  const xStartWorld = minX - gridMargin;
+  const xEndWorld = maxX + gridMargin;
+
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+  const bubbleRadius = 11;
+
+  // 1. Draw Vertical Grid Lines (A, B, C...)
+  xCoords.forEach((xVal, idx) => {
+    const sx = xVal * ppm * zoom + offsetX;
+    const sy1 = -yStartWorld * ppm * zoom + offsetY;
+    const sy2 = -yEndWorld * ppm * zoom + offsetY;
+    const name = String.fromCharCode(65 + (idx % 26));
+
+    ctx.strokeStyle = '#64748B';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(sx, sy1);
+    ctx.lineTo(sx, sy2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    for (const sy of [sy1, sy2]) {
+      ctx.fillStyle = '#1E293B';
+      ctx.strokeStyle = '#94A3B8';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(sx, sy, bubbleRadius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 10px "Inter", "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(name, sx, sy);
+    }
+  });
+
+  // 2. Draw Horizontal Grid Lines (1, 2, 3...)
+  yCoords.forEach((yVal, idx) => {
+    const sy = -yVal * ppm * zoom + offsetY;
+    const sx1 = xStartWorld * ppm * zoom + offsetX;
+    const sx2 = xEndWorld * ppm * zoom + offsetX;
+    const name = String(idx + 1);
+
+    ctx.strokeStyle = '#64748B';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(sx1, sy);
+    ctx.lineTo(sx2, sy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    for (const sx of [sx1, sx2]) {
+      ctx.fillStyle = '#1E293B';
+      ctx.strokeStyle = '#94A3B8';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(sx, sy, bubbleRadius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 10px "Inter", "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(name, sx, sy);
+    }
+  });
+
+  ctx.restore();
 }
 
 let previewAlpha = 0;
@@ -1045,30 +1159,22 @@ function lerp(a: number, b: number, t: number): number { return a + (b - a) * t;
 
 function clamp(v: number, min: number, max: number): number { return Math.max(min, Math.min(max, v)); }
 
-// ── Pre-built Color Lookup Table (256 entries) ─────────────────────
-// Avoids creating CSS strings per sub-triangle — computed once at module load
 const COLOR_LUT_SIZE = 256;
-const _colorLUT: string[] = new Array(COLOR_LUT_SIZE);
-(function buildColorLUT() {
-  for (let i = 0; i < COLOR_LUT_SIZE; i++) {
-    const t = i / (COLOR_LUT_SIZE - 1);
-    let r: number, g: number, b: number;
-    if (t < 0.25) {
-      const s = t / 0.25;
-      r = lerp(30, 0, s); g = lerp(40, 180, s); b = lerp(200, 220, s);
-    } else if (t < 0.5) {
-      const s = (t - 0.25) / 0.25;
-      r = lerp(0, 34, s); g = lerp(180, 197, s); b = lerp(220, 94, s);
-    } else if (t < 0.75) {
-      const s = (t - 0.5) / 0.25;
-      r = lerp(34, 234, s); g = lerp(197, 179, s); b = lerp(94, 8, s);
-    } else {
-      const s = (t - 0.75) / 0.25;
-      r = lerp(234, 239, s); g = lerp(179, 68, s); b = lerp(8, 68, s);
+const _colorLUTs = new Map<ColorRampName, string[]>();
+
+export function getLUT(ramp: ColorRampName = 'jet'): string[] {
+  let lut = _colorLUTs.get(ramp);
+  if (!lut) {
+    lut = new Array<string>(COLOR_LUT_SIZE);
+    for (let i = 0; i < COLOR_LUT_SIZE; i++) {
+      const t = i / (COLOR_LUT_SIZE - 1);
+      const [r, g, b] = sampleRamp(ramp, t);
+      lut[i] = `rgb(${r},${g},${b})`;
     }
-    _colorLUT[i] = `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;
+    _colorLUTs.set(ramp, lut);
   }
-})();
+  return lut;
+}
 
 /** Fast color index from value — returns 0..255 index into the LUT */
 function colorIndex(value: number, min: number, range: number): number {
@@ -1077,14 +1183,16 @@ function colorIndex(value: number, min: number, range: number): number {
 }
 
 /**
- * Map a value in [min, max] to a color on a blue→cyan→green→yellow→red gradient.
- * Values below min → blue, above max → red.
+ * Map a value in [min, max] to a color on the active color ramp.
+ * Values below min → minColor, above max → maxColor.
  */
-function resultToColor(value: number, min: number, max: number): string {
+function resultToColor(value: number, min: number, max: number, ramp: ColorRampName = 'jet'): string {
   const range = max - min;
-  if (range < 1e-12) return _colorLUT[0];
-  return _colorLUT[colorIndex(value, min, range)];
+  const lut = getLUT(ramp);
+  if (range < 1e-12) return lut[0];
+  return lut[colorIndex(value, min, range)];
 }
+
 
 /** Bilinear interpolation on a quadrilateral: f(ξ,η) with ξ,η ∈ [0,1] */
 function bilerp(
@@ -1118,20 +1226,28 @@ function q4InterpPos(
  * PERFORMANCE: Batches all sub-triangles by color-LUT index into Path2D objects,
  * reducing canvas draw calls from O(elements × subdiv²) to O(256).
  */
-export function drawFEMContour(
-  ctx: CanvasRenderingContext2D,
-  mesh: { nodes: { id: number; x: number; y: number }[]; elements: { id: number; nodeIds: number[] }[] },
+type FEMContourMeshInput = {
+  nodes: { id: number; x: number; y: number }[];
+  elements: { id: number; nodeIds: number[] }[];
+};
+
+export interface FEMContourPathCache {
+  paths: Path2D[];
+}
+
+export function buildFEMContourPathCache(
+  mesh: FEMContourMeshInput,
   nodeValues: Map<number, number>,
   minVal: number,
   maxVal: number,
-  opacity: number,
   subdiv = 3,
-  invert = false
-): void {
-  if (nodeValues.size === 0) return;
-  if (!isFinite(minVal) || !isFinite(maxVal)) return;
+  invert = false,
+  ramp: ColorRampName = 'jet'
+): FEMContourPathCache | null {
+  if (nodeValues.size === 0) return null;
+  if (!isFinite(minVal) || !isFinite(maxVal)) return null;
   const range = maxVal - minVal;
-  if (range < 1e-15) return;
+  if (range < 1e-15) return null;
 
   // Build fast node position lookup: id → {x, y}
   const nodePos = new Map<number, { x: number; y: number }>();
@@ -1223,15 +1339,43 @@ export function drawFEMContour(
     }
   }
 
+  return { paths };
+}
+
+export function drawFEMContourPathCache(
+  ctx: CanvasRenderingContext2D,
+  cache: FEMContourPathCache,
+  opacity: number,
+  ramp: ColorRampName = 'jet'
+): void {
   // Flush: one fill() per color bucket (max 256 calls instead of 18000+)
+  const lut = getLUT(ramp);
   ctx.save();
   ctx.globalAlpha = opacity;
   for (let k = 0; k < COLOR_LUT_SIZE; k++) {
-    ctx.fillStyle = _colorLUT[k];
-    ctx.fill(paths[k]);
+    if (cache.paths[k]) {
+      ctx.fillStyle = lut[k];
+      ctx.fill(cache.paths[k]);
+    }
   }
   ctx.globalAlpha = 1;
   ctx.restore();
+}
+
+export function drawFEMContour(
+  ctx: CanvasRenderingContext2D,
+  mesh: FEMContourMeshInput,
+  nodeValues: Map<number, number>,
+  minVal: number,
+  maxVal: number,
+  opacity: number,
+  subdiv = 3,
+  invert = false,
+  ramp: ColorRampName = 'jet'
+): void {
+  const cache = buildFEMContourPathCache(mesh, nodeValues, minVal, maxVal, subdiv, invert, ramp);
+  if (!cache) return;
+  drawFEMContourPathCache(ctx, cache, opacity, ramp);
 }
 
 /**
@@ -1323,7 +1467,8 @@ export function drawColorLegend(
   maxVal: number,
   label: string,
   formatFn?: (v: number) => string,
-  invert = false
+  invert = false,
+  ramp: ColorRampName = 'jet'
 ): void {
   if (!isFinite(minVal) || !isFinite(maxVal)) return;
   if (Math.abs(maxVal - minVal) < 1e-15) return;
@@ -1331,6 +1476,7 @@ export function drawColorLegend(
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
 
+  const lut = getLUT(ramp);
   const fmt = formatFn ?? ((v: number) => isFinite(v) ? v.toFixed(2) : '—');
 
   // Draw horizontal gradient bar
@@ -1342,9 +1488,10 @@ export function drawColorLegend(
     const range = maxVal - minVal;
     const ct = invert ? (maxVal - val) / range : (val - minVal) / range;
     const ci = ct <= 0 ? 0 : ct >= 1 ? 255 : (ct * 255) | 0;
-    ctx.fillStyle = _colorLUT[ci];
+    ctx.fillStyle = lut[ci];
     ctx.fillRect(x + i * stepW, y, stepW + 0.5, h);
   }
+
 
   // Border
   ctx.strokeStyle = COLORS.legendBorder;
@@ -1360,6 +1507,9 @@ export function drawColorLegend(
   const nLabels = 5;
   for (let i = 0; i < nLabels; i++) {
     const t = i / (nLabels - 1);
+    // The gradient bar above already applies `invert` when choosing colors, so
+    // position t always corresponds to value minVal + t*range. Re-applying the
+    // inversion here would flip the labels a second time and mislabel the ramp.
     const val = minVal + t * (maxVal - minVal);
     const lx = x + t * w;
     ctx.fillText(fmt(val), lx, y + h + 4);

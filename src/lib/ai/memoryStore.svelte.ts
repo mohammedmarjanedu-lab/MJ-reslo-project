@@ -28,7 +28,7 @@ export interface EditPayload {
 }
 
 export interface SolvePayload {
-  solver: 'worker' | 'kratos' | 'dkt_backend';
+  solver: 'worker' | 'pynite' | 'kratos' | 'dkt_backend';
   slabCount: number;
   elementCount: number;
   durationMs: number;

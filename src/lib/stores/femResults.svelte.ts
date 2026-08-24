@@ -12,6 +12,8 @@ class FEMResultState {
   showFEMContour = $state(true);
   showFEMMesh = $state(false);
   activeSlabId = $state<string | null>(null);
+  backendConnected = $state(false);
+  solverName = $state<string>('Unknown');
 
   private _timeoutId: ReturnType<typeof setTimeout> | null = null;
 
@@ -107,19 +109,54 @@ class FEMResultState {
       return resultMap;
     }
 
+    function nodalToGlobalNodeValues(
+      dataExtractor: (r: SlabFEMResult) => { nodeId: number; value: number }[]
+    ): Map<string, Map<number, number>> {
+      const accum = new Map<string, number[]>();
+      function pKey(x: number, y: number): string {
+        return Math.round(x * 1000) + '_' + Math.round(y * 1000);
+      }
+
+      for (const r of slabs) {
+        const data = dataExtractor(r);
+        const nodeMap = new Map(r.mesh.nodes.map(n => [n.id, n]));
+        for (const item of data) {
+          const n = nodeMap.get(item.nodeId);
+          if (!n) continue;
+          const pk = pKey(n.x, n.y);
+          let arr = accum.get(pk);
+          if (!arr) { arr = []; accum.set(pk, arr); }
+          arr.push(item.value);
+        }
+      }
+
+      const avgMap = new Map<string, number>();
+      for (const [pk, vals] of accum) {
+        let sum = 0;
+        for (let i = 0; i < vals.length; i++) sum += vals[i];
+        avgMap.set(pk, sum / vals.length);
+      }
+
+      const resultMap = new Map<string, Map<number, number>>();
+      for (const r of slabs) {
+        const localMap = new Map<number, number>();
+        for (const n of r.mesh.nodes) {
+          const pk = pKey(n.x, n.y);
+          localMap.set(n.id, avgMap.get(pk) ?? 0);
+        }
+        resultMap.set(r.slabId, localMap);
+      }
+
+      return resultMap;
+    }
+
     const allVals: number[] = [];
     let resultMap: Map<string, Map<number, number>> | null = null;
 
     switch (rt) {
       case 'deflection': {
-        resultMap = new Map();
-        for (const r of slabs) {
-          const m = new Map<number, number>();
-          for (const d of r.nodeDeflections) {
-            m.set(d.nodeId, d.wz);
-          }
-          resultMap.set(r.slabId, m);
-        }
+        resultMap = nodalToGlobalNodeValues(r => r.nodeDeflections.map(d => ({ nodeId: d.nodeId, value: d.wz })));
+        for (const r of slabs) for (const d of r.nodeDeflections) allVals.push(d.wz);
         break;
       }
       case 'mx': {
@@ -212,7 +249,7 @@ class FEMResultState {
     }
 
     if (rt === 'punching') { globalMin = 0; globalMax = 1; }
-    else [globalMin, globalMax] = safeMinMax(allVals);
+    else[globalMin, globalMax] = safeMinMax(allVals);
 
     for (const r of slabs) {
       const nodeValues = resultMap?.get(r.slabId) ?? new Map();

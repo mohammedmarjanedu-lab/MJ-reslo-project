@@ -26,8 +26,11 @@ from models import (
     AnalysisRequest, FEMMesh, FEMNode, Triangle, ColumnSupport, Point2D,
     WallSupport, DropPanelDef, LineLoadSegment, SingleSlabPayload, MultiSlabAnalysisRequest
 )
-from kratos_solver import solve_reslo_structure, solve_multi_slab_structure
 from mesher import generate_mesh, MeshRequest, SlabGeometry
+try:
+    from kratos_solver import solve_reslo_structure, solve_multi_slab_structure
+except (ImportError, ModuleNotFoundError):
+    from pynite_solver import solve_reslo_structure, solve_multi_slab_structure
 
 # --- BENCHMARK 1: Simply Supported / Fixed 5x5m Rectangular Slab ---
 # Analytical Timoshenko / ETABS 21 Reference: Clamped w_max = 1.37 mm, Simply Supported w_max = 8.42 mm

@@ -3,12 +3,13 @@
   import { model } from '../stores/structuralModel.svelte';
   import { uiState } from '../stores/uiState.svelte';
   import { femState } from '../stores/femResults.svelte';
-  import { drawBackground, drawPlanImage, drawGrid, drawAxes, drawSlabs, drawColumn, drawColumnSelected, drawColumnDisconnected, drawShearWall, drawShearWallSelected, drawShearWallDisconnected, drawPolylineWall, drawPolylineWallSelected, drawNonStructuralWall, drawNonStructuralWallSelected, drawNonStructuralPolylineWall, drawNonStructuralPolylineWallSelected, drawNonStructuralWallPreview, drawBeam, drawBeamSelected, drawDropPanel, drawDropPanelSelected, drawDropPanelPreview, drawCMmarker, drawCRmarker, drawEccentricityVector, drawCalibrationLine, drawColumnPreview, drawWallPreview, drawBeamPreview, drawSelectionRect, drawDimensionLabel, drawMeasureLine, drawDimensions, drawFEMContour, drawFEMMesh, drawColorLegend, drawDeformedShape, sampleFEMResultAtPoint, drawPunchingMarkers, drawSnapCoordinateLabel, drawElementLabels, drawUnconnectedJointNode } from '../canvas/renderer';
+  import { drawBackground, drawPlanImage, drawGrid, drawAxes, drawSlabs, drawColumn, drawColumnSelected, drawColumnDisconnected, drawShearWall, drawShearWallSelected, drawShearWallDisconnected, drawPolylineWall, drawPolylineWallSelected, drawNonStructuralWall, drawNonStructuralWallSelected, drawNonStructuralPolylineWall, drawNonStructuralPolylineWallSelected, drawNonStructuralWallPreview, drawBeam, drawBeamSelected, drawDropPanel, drawDropPanelSelected, drawDropPanelPreview, drawCMmarker, drawCRmarker, drawEccentricityVector, drawCalibrationLine, drawColumnPreview, drawWallPreview, drawBeamPreview, drawSelectionRect, drawDimensionLabel, drawMeasureLine, drawDimensions, drawStructuralGrids, drawFEMMesh, drawColorLegend, drawDeformedShape, sampleFEMResultAtPoint, drawPunchingMarkers, drawSnapCoordinateLabel, drawElementLabels, drawUnconnectedJointNode, buildFEMContourPathCache, drawFEMContourPathCache } from '../canvas/renderer';
+  import type { FEMContourPathCache } from '../canvas/renderer';
   import { hitTestColumns, hitTestWalls, hitTestPolylineWalls, hitTestNonStructuralWalls, hitTestPolylineNonStructuralWalls, hitTestBeams, hitTestSlabs, hitTestDropPanels, hitTestDimensions } from '../canvas/hitTester';
   import { distance, pointInPolygon, pointToSegmentDistance, computeGlobalMetrics } from '../engine/mathEngine';
   import { floorLayers } from '../stores/floorLayers.svelte';
   import { loadPlanFile, loadPDFPages } from '../imageUploader';
-  import type { Point2D } from '../engine/types';
+  import type { Point2D, SlabPolygon } from '../engine/types';
 
   let canvasEl: HTMLCanvasElement;
   let ctx: CanvasRenderingContext2D;
@@ -127,6 +128,7 @@
     uiState.showDropPanels;
     uiState.showNonStructuralWalls;
     femState.slabResults;
+    femState.disconnectedIds;
     femState.resultType;
     femState.deformedScale;
     floorLayers.layers;
@@ -134,6 +136,13 @@
     model.planImage;
     model.pixelsPerMeter;
     bumpModelGen();
+    dirty = true;
+  });
+
+  $effect(() => {
+    femState.slabResults;
+    femState.resultType;
+    femContourPathCache.clear();
     dirty = true;
   });
 
@@ -254,6 +263,8 @@
 
   type LocalDragState =
     | { type: 'idle' }
+    | { type: 'pendingJoint'; point: Point2D; refs: JointRef[]; startScreen: Point2D }
+    | { type: 'draggingJoint'; point: Point2D; refs: JointRef[]; startPoint: Point2D; historyPushed: boolean }
     | { type: 'pendingColumn'; id: string; offset: Point2D; startScreen: Point2D }
     | { type: 'pendingWall'; id: string; hitType: 'wallStart' | 'wallEnd' | 'wallMid'; offset: Point2D; startScreen: Point2D }
     | { type: 'pendingBeam'; id: string; hitType: 'beamStart' | 'beamEnd' | 'beamMid'; offset: Point2D; startScreen: Point2D }
@@ -264,10 +275,10 @@
     | { type: 'pendingSlabHoleEdge'; id: string; holeIndex: number; edgeIndex: number; startMouse: Point2D; startHoleVerts: Point2D[]; startScreen: Point2D }
     | { type: 'pendingSlabHoleVertex'; id: string; holeIndex: number; vertexIndex: number; startMouse: Point2D; startHoleVerts: Point2D[]; startScreen: Point2D }
     | { type: 'draggingColumn'; id: string; offset: Point2D; historyPushed: boolean }
-    | { type: 'draggingWallBody'; id: string; offset: Point2D; historyPushed: boolean }
+    | { type: 'draggingWallBody'; id: string; offset: Point2D; startCenter?: Point2D; startWall?: { startPoint: Point2D; endPoint: Point2D }; historyPushed: boolean }
     | { type: 'draggingWallStart'; id: string; historyPushed: boolean }
     | { type: 'draggingWallEnd'; id: string; historyPushed: boolean }
-    | { type: 'draggingBeamBody'; id: string; offset: Point2D; historyPushed: boolean }
+    | { type: 'draggingBeamBody'; id: string; offset: Point2D; startCenter?: Point2D; startBeam?: { startPoint: Point2D; endPoint: Point2D }; historyPushed: boolean }
     | { type: 'draggingBeamStart'; id: string; historyPushed: boolean }
     | { type: 'draggingBeamEnd'; id: string; historyPushed: boolean }
     | { type: 'pendingPolylineWallVertex'; id: string; vertexIndex: number; startMouse: Point2D; startVerts: Point2D[]; startScreen: Point2D }
@@ -302,13 +313,32 @@
   let localDrag: LocalDragState = { type: 'idle' };
   let savedDrag: LocalDragState | null = null;
   let multiDragOriginals = new Map<string, any>();
+  type JointRef =
+    | { kind: 'column'; id: string; point: Point2D }
+    | { kind: 'wallStart' | 'wallEnd'; id: string; point: Point2D; structural: boolean }
+    | { kind: 'polylineWallVertex'; id: string; vertexIndex: number; point: Point2D; structural: boolean }
+    | { kind: 'beamStart' | 'beamEnd'; id: string; point: Point2D }
+    | { kind: 'slabVertex'; id: string; vertexIndex: number; point: Point2D };
+  let selectedJointPoint = $state<Point2D | null>(null);
+  let selectedJointRefs: JointRef[] = [];
   let mouseWorld = $state<Point2D>({ x: 0, y: 0 });
   let mouseScreen = $state<Point2D>({ x: 0, y: 0 });
   let selectionRectEnd = $state<Point2D | null>(null);
   let isSnapped = $state(false);
   let snapPoint = $state<Point2D | null>(null);
   let snapTypeName = $state<string | null>(null);
+  let lastViewportInteractionTs = 0;
+  let lastCursorSampleTs = 0;
+  let interactionIdleTimer: ReturnType<typeof setTimeout> | null = null;
   const DRAG_THRESHOLD_PX = 5;
+  type ContourPathCacheEntry = {
+    nodeValues: Map<number, number>;
+    minVal: number;
+    maxVal: number;
+    subdiv: number;
+    cache: FEMContourPathCache | null;
+  };
+  let femContourPathCache = new Map<string, ContourPathCacheEntry>();
   let hiddenIds = $derived(new Set(model.hiddenElementIds));
   let lockedIds = $derived(new Set(model.lockedElementIds));
   let blockedIds = $derived(new Set([...model.hiddenElementIds, ...model.lockedElementIds]));
@@ -359,6 +389,85 @@
 
   function isSelected(id: string): boolean {
     return uiState.isSelected(id);
+  }
+
+  function shouldUseFastFemDraw(now = performance.now()): boolean {
+    return localDrag.type !== 'idle' || now - lastViewportInteractionTs < 180;
+  }
+
+  function markCanvasInteracting(activeMs = 220): void {
+    uiState.isCanvasInteracting = true;
+    if (interactionIdleTimer) clearTimeout(interactionIdleTimer);
+    interactionIdleTimer = setTimeout(() => {
+      interactionIdleTimer = null;
+      if (localDrag.type === 'idle') uiState.isCanvasInteracting = false;
+      dirty = true;
+    }, activeMs);
+  }
+
+  function getCachedFEMContour(
+    slabId: string,
+    nodeValues: Map<number, number>,
+    mesh: { nodes: { id: number; x: number; y: number }[]; elements: { id: number; nodeIds: number[] }[] },
+    minVal: number,
+    maxVal: number,
+    subdiv: number
+  ): FEMContourPathCache | null {
+    const key = `${femState.resultType}:${slabId}:${uiState.colorRamp}`;
+    const existing = femContourPathCache.get(key);
+    if (
+      existing &&
+      existing.nodeValues === nodeValues &&
+      existing.minVal === minVal &&
+      existing.maxVal === maxVal &&
+      existing.subdiv === subdiv
+    ) {
+      return existing.cache;
+    }
+
+    const invert = femState.resultType === 'deflection' || femState.resultType === 'deflection_check';
+    const cache = buildFEMContourPathCache(mesh, nodeValues, minVal, maxVal, subdiv, invert, uiState.colorRamp);
+    femContourPathCache.set(key, { nodeValues, minVal, maxVal, subdiv, cache });
+    return cache;
+  }
+
+  function drawDisconnectedSlab(ctx2: CanvasRenderingContext2D, slab: SlabPolygon): void {
+    if (slab.vertices.length < 3) return;
+
+    ctx2.save();
+    ctx2.beginPath();
+    ctx2.moveTo(slab.vertices[0].x, slab.vertices[0].y);
+    for (let i = 1; i < slab.vertices.length; i++) ctx2.lineTo(slab.vertices[i].x, slab.vertices[i].y);
+    ctx2.closePath();
+    ctx2.fillStyle = 'rgba(239, 68, 68, 0.10)';
+    ctx2.fill();
+    ctx2.strokeStyle = '#EF4444';
+    ctx2.lineWidth = 0.06;
+    ctx2.setLineDash([0.18, 0.10]);
+    ctx2.stroke();
+    ctx2.setLineDash([]);
+    ctx2.restore();
+
+    const cx = slab.vertices.reduce((sum, v) => sum + v.x, 0) / slab.vertices.length;
+    const cy = slab.vertices.reduce((sum, v) => sum + v.y, 0) / slab.vertices.length;
+    const label = 'UNSUPPORTED';
+    const screen = worldToScreen(cx, cy);
+    ctx2.save();
+    ctx2.setTransform(1, 0, 0, 1, 0, 0);
+    ctx2.font = '700 10px Inter, sans-serif';
+    ctx2.textAlign = 'center';
+    ctx2.textBaseline = 'middle';
+    const tw = ctx2.measureText(label).width;
+    ctx2.fillStyle = 'rgba(15, 23, 42, 0.88)';
+    ctx2.strokeStyle = 'rgba(239, 68, 68, 0.85)';
+    ctx2.lineWidth = 1;
+    ctx2.beginPath();
+    ctx2.roundRect(screen.x - tw / 2 - 8, screen.y - 10, tw + 16, 20, 5);
+    ctx2.fill();
+    ctx2.stroke();
+    ctx2.fillStyle = '#FCA5A5';
+    ctx2.fillText(label, screen.x, screen.y + 0.5);
+    ctx2.restore();
   }
 
   let shiftHeld = $state(false);
@@ -578,6 +687,202 @@
     return bestSnap;
   }
 
+  function jointHitTolerance(): number {
+    const screenTol = 11 / Math.max(1, model.pixelsPerMeter * model.canvasZoom);
+    return Math.max(0.08, Math.min(0.35, screenTol));
+  }
+
+  function collectJointRefsAt(point: Point2D, tol = jointHitTolerance()): JointRef[] {
+    const refs: JointRef[] = [];
+    const near = (p: Point2D) => distance(point, p) <= tol;
+
+    for (const c of model.columns) {
+      if (!blockedIds.has(c.id) && near(c.position)) refs.push({ kind: 'column', id: c.id, point: { ...c.position } });
+    }
+    for (const w of model.walls) {
+      if (blockedIds.has(w.id)) continue;
+      if (near(w.startPoint)) refs.push({ kind: 'wallStart', id: w.id, point: { ...w.startPoint }, structural: true });
+      if (near(w.endPoint)) refs.push({ kind: 'wallEnd', id: w.id, point: { ...w.endPoint }, structural: true });
+    }
+    for (const w of model.nonStructuralWalls) {
+      if (blockedIds.has(w.id)) continue;
+      if (near(w.startPoint)) refs.push({ kind: 'wallStart', id: w.id, point: { ...w.startPoint }, structural: false });
+      if (near(w.endPoint)) refs.push({ kind: 'wallEnd', id: w.id, point: { ...w.endPoint }, structural: false });
+    }
+    for (const pw of model.polylineWalls) {
+      if (blockedIds.has(pw.id)) continue;
+      pw.vertices.forEach((v, vertexIndex) => {
+        if (near(v)) refs.push({ kind: 'polylineWallVertex', id: pw.id, vertexIndex, point: { ...v }, structural: true });
+      });
+    }
+    for (const pw of model.polylineNonStructuralWalls) {
+      if (blockedIds.has(pw.id)) continue;
+      pw.vertices.forEach((v, vertexIndex) => {
+        if (near(v)) refs.push({ kind: 'polylineWallVertex', id: pw.id, vertexIndex, point: { ...v }, structural: false });
+      });
+    }
+    for (const b of model.beams) {
+      if (blockedIds.has(b.id)) continue;
+      if (near(b.startPoint)) refs.push({ kind: 'beamStart', id: b.id, point: { ...b.startPoint } });
+      if (near(b.endPoint)) refs.push({ kind: 'beamEnd', id: b.id, point: { ...b.endPoint } });
+    }
+    for (const s of model.slabs) {
+      if (blockedIds.has(s.id)) continue;
+      s.vertices.forEach((v, vertexIndex) => {
+        if (near(v)) refs.push({ kind: 'slabVertex', id: s.id, vertexIndex, point: { ...v } });
+      });
+    }
+    return refs;
+  }
+
+  function findJointAt(point: Point2D): { point: Point2D; refs: JointRef[] } | null {
+    ensureSnapCache();
+    const tol = jointHitTolerance();
+    let best: Point2D | null = null;
+    let bestDist = tol;
+    for (const p of _cachedEndpoints) {
+      const d = distance(point, p);
+      if (d <= bestDist) {
+        bestDist = d;
+        best = p;
+      }
+    }
+    if (!best) return null;
+    const refs = collectJointRefsAt(best, Math.max(tol, 0.06));
+    return refs.length > 0 ? { point: { ...best }, refs } : null;
+  }
+
+  function selectJoint(point: Point2D, refs: JointRef[]): void {
+    selectedJointPoint = { ...point };
+    selectedJointRefs = refs.map(r => ({ ...r, point: { ...r.point } } as JointRef));
+    uiState.setSelectedElements([]);
+    uiState.selectedElementId = null;
+    uiState.selectedElementType = null;
+    uiState.selectedHoleIndex = null;
+    uiState.showPropertiesPanel = false;
+  }
+
+  function clearJointSelection(): void {
+    selectedJointPoint = null;
+    selectedJointRefs = [];
+  }
+
+  function applyJointMove(refs: JointRef[], newPoint: Point2D): void {
+    const columnUpdates = new Map<string, Point2D>();
+    const wallUpdates = new Map<string, { startPoint?: Point2D; endPoint?: Point2D }>();
+    const nonStructuralWallUpdates = new Map<string, { startPoint?: Point2D; endPoint?: Point2D }>();
+    const polylineWallUpdates = new Map<string, Map<number, Point2D>>();
+    const polylineNonStructuralWallUpdates = new Map<string, Map<number, Point2D>>();
+    const beamUpdates = new Map<string, { startPoint?: Point2D; endPoint?: Point2D }>();
+    const slabUpdates = new Map<string, Map<number, Point2D>>();
+
+    for (const ref of refs) {
+      if (ref.kind === 'column') columnUpdates.set(ref.id, newPoint);
+      else if (ref.kind === 'wallStart' || ref.kind === 'wallEnd') {
+        const target = ref.structural ? wallUpdates : nonStructuralWallUpdates;
+        const update = target.get(ref.id) ?? {};
+        update[ref.kind === 'wallStart' ? 'startPoint' : 'endPoint'] = { ...newPoint };
+        target.set(ref.id, update);
+      } else if (ref.kind === 'polylineWallVertex') {
+        const target = ref.structural ? polylineWallUpdates : polylineNonStructuralWallUpdates;
+        const update = target.get(ref.id) ?? new Map<number, Point2D>();
+        update.set(ref.vertexIndex, { ...newPoint });
+        target.set(ref.id, update);
+      } else if (ref.kind === 'beamStart' || ref.kind === 'beamEnd') {
+        const update = beamUpdates.get(ref.id) ?? {};
+        update[ref.kind === 'beamStart' ? 'startPoint' : 'endPoint'] = { ...newPoint };
+        beamUpdates.set(ref.id, update);
+      } else if (ref.kind === 'slabVertex') {
+        const update = slabUpdates.get(ref.id) ?? new Map<number, Point2D>();
+        update.set(ref.vertexIndex, { ...newPoint });
+        slabUpdates.set(ref.id, update);
+      }
+    }
+
+    for (const [id, position] of columnUpdates) model.updateColumn(id, { position });
+    for (const [id, partial] of wallUpdates) model.updateWall(id, partial);
+    for (const [id, partial] of nonStructuralWallUpdates) model.updateNonStructuralWall(id, partial);
+    for (const [id, vertexUpdates] of polylineWallUpdates) {
+      const wall = model.polylineWalls.find(w => w.id === id);
+      if (wall) model.updatePolylineWall(id, { vertices: wall.vertices.map((v, i) => vertexUpdates.get(i) ?? { ...v }) });
+    }
+    for (const [id, vertexUpdates] of polylineNonStructuralWallUpdates) {
+      const wall = model.polylineNonStructuralWalls.find(w => w.id === id);
+      if (wall) model.updatePolylineNonStructuralWall(id, { vertices: wall.vertices.map((v, i) => vertexUpdates.get(i) ?? { ...v }) });
+    }
+    for (const [id, partial] of beamUpdates) model.updateBeam(id, partial);
+    for (const [id, vertexUpdates] of slabUpdates) {
+      const slab = model.slabs.find(s => s.id === id);
+      if (slab) model.updateSlab(id, { vertices: slab.vertices.map((v, i) => vertexUpdates.get(i) ?? { ...v }) });
+    }
+
+    selectedJointPoint = { ...newPoint };
+    selectedJointRefs = collectJointRefsAt(newPoint, Math.max(jointHitTolerance(), 0.06));
+  }
+
+  function deleteSelectedJoint(): boolean {
+    if (!selectedJointPoint || selectedJointRefs.length === 0) return false;
+    model.beginAction();
+
+    const columnIds = new Set<string>();
+    const beamIds = new Set<string>();
+    const wallIds = new Set<string>();
+    const nonStructuralWallIds = new Set<string>();
+    const polylineWallDelete = new Map<string, Set<number>>();
+    const polylineNonStructuralWallDelete = new Map<string, Set<number>>();
+    const slabVertexDelete = new Map<string, Set<number>>();
+
+    for (const ref of selectedJointRefs) {
+      if (ref.kind === 'column') columnIds.add(ref.id);
+      else if (ref.kind === 'beamStart' || ref.kind === 'beamEnd') beamIds.add(ref.id);
+      else if (ref.kind === 'wallStart' || ref.kind === 'wallEnd') (ref.structural ? wallIds : nonStructuralWallIds).add(ref.id);
+      else if (ref.kind === 'polylineWallVertex') {
+        const target = ref.structural ? polylineWallDelete : polylineNonStructuralWallDelete;
+        const set = target.get(ref.id) ?? new Set<number>();
+        set.add(ref.vertexIndex);
+        target.set(ref.id, set);
+      } else if (ref.kind === 'slabVertex') {
+        const set = slabVertexDelete.get(ref.id) ?? new Set<number>();
+        set.add(ref.vertexIndex);
+        slabVertexDelete.set(ref.id, set);
+      }
+    }
+
+    const wholeElementIds = new Set([...columnIds, ...beamIds, ...wallIds, ...nonStructuralWallIds]);
+    model.columns = model.columns.filter(c => !columnIds.has(c.id));
+    model.beams = model.beams.filter(b => !beamIds.has(b.id));
+    model.walls = model.walls.filter(w => !wallIds.has(w.id));
+    model.nonStructuralWalls = model.nonStructuralWalls.filter(w => !nonStructuralWallIds.has(w.id));
+    for (const [id, indices] of polylineWallDelete) {
+      const wall = model.polylineWalls.find(w => w.id === id);
+      if (!wall) continue;
+      const vertices = wall.vertices.filter((_, i) => !indices.has(i));
+      if (vertices.length >= 2) model.updatePolylineWall(id, { vertices });
+      else { wholeElementIds.add(id); model.polylineWalls = model.polylineWalls.filter(w => w.id !== id); }
+    }
+    for (const [id, indices] of polylineNonStructuralWallDelete) {
+      const wall = model.polylineNonStructuralWalls.find(w => w.id === id);
+      if (!wall) continue;
+      const vertices = wall.vertices.filter((_, i) => !indices.has(i));
+      if (vertices.length >= 2) model.updatePolylineNonStructuralWall(id, { vertices });
+      else { wholeElementIds.add(id); model.polylineNonStructuralWalls = model.polylineNonStructuralWalls.filter(w => w.id !== id); }
+    }
+    for (const [id, indices] of slabVertexDelete) {
+      const slab = model.slabs.find(s => s.id === id);
+      if (!slab) continue;
+      const vertices = slab.vertices.filter((_, i) => !indices.has(i));
+      if (vertices.length >= 3) model.updateSlab(id, { vertices });
+      else { wholeElementIds.add(id); model.slabs = model.slabs.filter(s => s.id !== id); }
+    }
+    model.hiddenElementIds = model.hiddenElementIds.filter(id => !wholeElementIds.has(id));
+    model.lockedElementIds = model.lockedElementIds.filter(id => !wholeElementIds.has(id));
+
+    clearJointSelection();
+    femState.clear();
+    uiState.setStatusMessage('Joint point deleted');
+    return true;
+  }
+
   function handleEscape(): void {
     if (localDrag.type === 'measuring') {
       localDrag = { type: 'idle' };
@@ -591,6 +896,7 @@
     }
     uiState.setSelectedElements([]);
     uiState.selectElement(null, null);
+    clearJointSelection();
     uiState.selectedHoleIndex = null;
     uiState.setTool('select');
     uiState.setCalibrationPoint1(null);
@@ -612,6 +918,9 @@
     const z = model.canvasZoom;
     const ox = model.canvasViewOffsetX;
     const oy = model.canvasViewOffsetY;
+    const now = performance.now();
+    const fastFemDraw = shouldUseFastFemDraw(now);
+    if (fastFemDraw) dirty = true;
 
     // Render base floor plan and overlays
     if (model.planImage) {
@@ -727,41 +1036,52 @@
         stress_s1: 'kPa', stress_s2: 'kPa', stress_vm: 'kPa',
       };
 
-      // Determine visibility set once to avoid repeated model.slabs.some() calls
-      const visibleSlabIds = new Set<string>();
-      for (const s of model.slabs) {
-        if (!model.isHidden(s.id)) visibleSlabIds.add(s.id);
+      // Determine visible slabs for rendering contours
+      const visibleSlabs: SlabPolygon[] = [];
+      for (const [slabId] of femState.slabResults) {
+        const s = model.slabs.find(sl => sl.id === slabId || sl.label === slabId);
+        if (s && !model.isHidden(s.id)) visibleSlabs.push(s);
       }
 
-      // 2. Render each active slab's contour using the unified global scale
-      for (const [slabId, result] of femState.slabResults) {
-        const slab = model.slabs.find(s => s.id === slabId || s.label === slabId);
-        if (!slab || (model.isHidden(slab.id))) continue;
-        const nodeValues = cache.perSlab.get(slabId)?.nodeValues ?? new Map<number, number>();
-
+      if (visibleSlabs.length > 0) {
         ctx.save();
+        // Single unified clipping path pass across all connected slabs for seamless contour flow
         ctx.beginPath();
-        if (slab.vertices.length >= 3) {
-          ctx.moveTo(slab.vertices[0].x, slab.vertices[0].y);
-          for (let i = 1; i < slab.vertices.length; i++) ctx.lineTo(slab.vertices[i].x, slab.vertices[i].y);
-          ctx.closePath();
-        }
-        for (const hole of slab.holes) {
-          if (hole.length >= 3) {
-            ctx.moveTo(hole[0].x, hole[0].y);
-            for (let i = 1; i < hole.length; i++) ctx.lineTo(hole[i].x, hole[i].y);
+        for (const slab of visibleSlabs) {
+          if (slab.vertices.length >= 3) {
+            ctx.moveTo(slab.vertices[0].x, slab.vertices[0].y);
+            for (let i = 1; i < slab.vertices.length; i++) ctx.lineTo(slab.vertices[i].x, slab.vertices[i].y);
             ctx.closePath();
+          }
+          for (const hole of slab.holes) {
+            if (hole.length >= 3) {
+              ctx.moveTo(hole[0].x, hole[0].y);
+              for (let i = 1; i < hole.length; i++) ctx.lineTo(hole[i].x, hole[i].y);
+              ctx.closePath();
+            }
           }
         }
         ctx.clip('evenodd');
 
-        if (globalMax !== globalMin) {
-          drawFEMContour(ctx, result.mesh, nodeValues, globalMin, globalMax, 0.75, 3, false);
+        // Render contours and mesh overlay for all slabs continuously
+        for (const slab of visibleSlabs) {
+          const slabId = slab.id;
+          const result = femState.slabResults.get(slabId) || femState.slabResults.get(slab.label);
+          if (!result) continue;
+          const nodeValues = cache.perSlab.get(slabId)?.nodeValues ?? cache.perSlab.get(slab.label)?.nodeValues ?? new Map<number, number>();
+
+          if (globalMax !== globalMin) {
+            const sub = result.mesh.elements.length > 12000 ? 1 : (result.mesh.elements.length > 5000 ? 2 : 3);
+            const contourCache = getCachedFEMContour(slabId, nodeValues, result.mesh, globalMin, globalMax, sub);
+            if (contourCache) drawFEMContourPathCache(ctx, contourCache, fastFemDraw ? 0.62 : 0.75, uiState.colorRamp);
+          }
+          if (femState.resultType === 'punching' && result.columnPunching && result.columnPunching.length > 0) {
+            drawPunchingMarkers(ctx, result.mesh, model.columns, result.columnPunching);
+          }
+          if (femState.showFEMMesh && !fastFemDraw) {
+            drawFEMMesh(ctx, result.mesh);
+          }
         }
-        if (femState.resultType === 'punching' && result.columnPunching && result.columnPunching.length > 0) {
-          drawPunchingMarkers(ctx, result.mesh, model.columns, result.columnPunching);
-        }
-        drawFEMMesh(ctx, result.mesh);
         ctx.restore();
       }
 
@@ -773,13 +1093,47 @@
         const legendX = (W - legendW) / 2;
         const legendY = H - 60;
 
-        const label = 'Deflection (mm)';
+        const labelMap: Record<string, string> = {
+          deflection: 'Deflection (mm)',
+          mx: 'Moment Mx (kN·m/m)',
+          my: 'Moment My (kN·m/m)',
+          mxy: 'Moment Mxy (kN·m/m)',
+          stress_s1: 'Principal σ₁ (kPa)',
+          stress_s2: 'Principal σ₂ (kPa)',
+          stress_vm: 'Von Mises σ (kPa)',
+          shear_vx: 'Shear Vx (kN/m)',
+          shear_vy: 'Shear Vy (kN/m)',
+          shear_v1: 'Shear V₁ (kN/m)',
+          membrane_nx: 'Membrane Nx (kN/m)',
+          membrane_ny: 'Membrane Ny (kN/m)',
+          membrane_nxy: 'Membrane Nxy (kN/m)',
+          membrane_n1: 'Membrane N₁ (kN/m)',
+          punching: 'Punching Ratio',
+          ast_x_top: 'Ast x top (mm²/m)',
+          ast_x_bot: 'Ast x bot (mm²/m)',
+          ast_y_top: 'Ast y top (mm²/m)',
+          ast_y_bot: 'Ast y bot (mm²/m)',
+          ast_max: 'Ast max (mm²/m)',
+          crack_width: 'Crack Width (mm)',
+          deflection_check: 'Deflection Check (mm)'
+        };
+        const label = labelMap[femState.resultType] ?? 'FEM Result';
 
         if (globalMax !== globalMin) {
-          drawColorLegend(ctx, legendX, legendY, legendW, legendH, globalMin, globalMax, label, undefined, false);
+          const invert = femState.resultType === 'deflection' || femState.resultType === 'deflection_check';
+          drawColorLegend(ctx, legendX, legendY, legendW, legendH, globalMin, globalMax, label, undefined, invert, uiState.colorRamp);
         }
 
         ctx.setTransform(ppm * z, 0, 0, -ppm * z, ox, oy);
+      }
+    }
+
+    if (femState.disconnectedIds.size > 0) {
+      for (const slab of model.slabs) {
+        if (model.isHidden(slab.id)) continue;
+        if (femState.disconnectedIds.has(slab.id) || femState.disconnectedIds.has(slab.label)) {
+          drawDisconnectedSlab(ctx, slab);
+        }
       }
     }
 
@@ -833,6 +1187,10 @@
     }
     }
 
+    if (uiState.showParametricLivePanel || uiState.showParametricStudyDialog) {
+      drawStructuralGrids(ctx, model.columns, model.slabs, ppm, z, ox, oy);
+    }
+
     if (model.dimensions.length > 0) {
       drawDimensions(ctx, model.dimensions, uiState.selectedElementIds, ppm, z, ox, oy);
     }
@@ -842,13 +1200,31 @@
     }
 
     // Permanent joint dots for snapping visibility — cached positions, drawn with theme color (P1)
-    buildJointData();
+    if (!fastFemDraw) buildJointData();
     drawJointCache(ctx);
 
+    if (selectedJointPoint) {
+      ctx.save();
+      ctx.lineWidth = 2 / (ppm * z);
+      ctx.strokeStyle = '#22c55e';
+      ctx.fillStyle = 'rgba(34, 197, 94, 0.18)';
+      ctx.beginPath();
+      ctx.arc(selectedJointPoint.x, selectedJointPoint.y, 0.16, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(selectedJointPoint.x, selectedJointPoint.y, 0.045, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.restore();
+    }
+
     // Draw unconnected joints warnings (cached — only recomputed when model changes)
-    const unconnectedJoints = getCachedUnconnectedJoints();
-    for (const joint of unconnectedJoints) {
-      drawUnconnectedJointNode(ctx, joint.x, joint.y);
+    if (!fastFemDraw) {
+      const unconnectedJoints = getCachedUnconnectedJoints();
+      for (const joint of unconnectedJoints) {
+        drawUnconnectedJointNode(ctx, joint.x, joint.y);
+      }
     }
 
     ctx.fillStyle = '';
@@ -1079,6 +1455,10 @@
       if (wall) { map.set(id, { type: 'wall', startPoint: { x: wall.startPoint.x, y: wall.startPoint.y }, endPoint: { x: wall.endPoint.x, y: wall.endPoint.y } }); continue; }
       const pwall = model.polylineWalls.find(w => w.id === id);
       if (pwall) { map.set(id, { type: 'polylineWall', vertices: pwall.vertices.map(v => ({ x: v.x, y: v.y })) }); continue; }
+      const nswall = model.nonStructuralWalls.find(w => w.id === id);
+      if (nswall) { map.set(id, { type: 'nonStructuralWall', startPoint: { x: nswall.startPoint.x, y: nswall.startPoint.y }, endPoint: { x: nswall.endPoint.x, y: nswall.endPoint.y } }); continue; }
+      const nspwall = model.polylineNonStructuralWalls.find(w => w.id === id);
+      if (nspwall) { map.set(id, { type: 'polylineNonStructuralWall', vertices: nspwall.vertices.map(v => ({ x: v.x, y: v.y })) }); continue; }
       const beam = model.beams.find(b => b.id === id);
       if (beam) { map.set(id, { type: 'beam', startPoint: { x: beam.startPoint.x, y: beam.startPoint.y }, endPoint: { x: beam.endPoint.x, y: beam.endPoint.y } }); continue; }
       const slab = model.slabs.find(s => s.id === id);
@@ -1131,6 +1511,7 @@
     }
 
     if (e.button === 2) {
+      clearJointSelection();
       const hitCol = hitTestColumns(world, model.columns, blockedIds);
       const hitWall = !hitCol ? hitTestWalls(world, model.walls, blockedIds) : null;
       const hitPW = !hitCol && !hitWall ? hitTestPolylineWalls(world, model.polylineWalls, blockedIds) : null;
@@ -1167,6 +1548,14 @@
     uiState.setContextMenu(null);
 
     if (uiState.tool === 'select') {
+      const hitJoint = findJointAt(world);
+      if (hitJoint) {
+        selectJoint(hitJoint.point, hitJoint.refs);
+        localDrag = { type: 'pendingJoint', point: hitJoint.point, refs: hitJoint.refs, startScreen: { x: sx, y: sy } };
+        uiState.setStatusMessage(`Joint selected (${hitJoint.refs.length} connected)`);
+        return;
+      }
+      clearJointSelection();
       const hitCol = hitTestColumns(world, model.columns, blockedIds);
       const hitWall = !hitCol ? hitTestWalls(world, model.walls, blockedIds) : null;
       const hitPW = !hitCol && !hitWall ? hitTestPolylineWalls(world, model.polylineWalls, blockedIds) : null;
@@ -1335,6 +1724,7 @@
     }
 
     if (uiState.tool === 'column') {
+      clearJointSelection();
       const snappedWorld = getSnappedPoint(world, undefined, false);
       const isCirc = uiState.columnShape === 'circular';
       const w = isCirc ? uiState.placementDiameter / 1000 : uiState.placementWidth / 1000;
@@ -1518,7 +1908,7 @@
           }
         } else {
           const snappedWorld = getSnappedPoint(world, undefined, false);
-          const hitSlabRes = hitTestSlabs(snappedWorld, model.slabs, blockedIds);
+          const hitSlabRes = hitTestSlabs(snappedWorld, model.slabs, hiddenIds);
           if (hitSlabRes) {
             uiState.selectElement(hitSlabRes.id, 'slab');
             localDrag = { type: 'drawingHoleRect', slabId: hitSlabRes.id, start: snappedWorld };
@@ -1544,7 +1934,7 @@
           }
         } else {
           const snappedWorld = getSnappedPoint(world, undefined, false);
-          const hitSlabRes = hitTestSlabs(snappedWorld, model.slabs, blockedIds);
+          const hitSlabRes = hitTestSlabs(snappedWorld, model.slabs, hiddenIds);
           if (hitSlabRes) {
             uiState.selectElement(hitSlabRes.id, 'slab');
             localDrag = { type: 'tracingHole', slabId: hitSlabRes.id, verts: [snappedWorld] };
@@ -1613,13 +2003,25 @@
     mouseScreen = { x: sx, y: sy };
     const world = screenToWorld(sx, sy);
     mouseWorld = world;
+    const now = performance.now();
+    if (localDrag.type !== 'idle') {
+      lastViewportInteractionTs = now;
+      markCanvasInteracting();
+    }
 
     // Cursor value tracking over FEM contour
-    if (femState.showFEMContour && femState.hasResults && localDrag.type === 'idle') {
+    if (
+      femState.showFEMContour &&
+      femState.hasResults &&
+      localDrag.type === 'idle' &&
+      !shouldUseFastFemDraw(now) &&
+      now - lastCursorSampleTs > 60
+    ) {
+      lastCursorSampleTs = now;
       const hit = sampleFEMResultAtPoint(femState.slabResults, femState.resultType, world);
       if (hit) cursorValue = { x: sx, y: sy, text: hit.label };
       else cursorValue = null;
-    } else {
+    } else if (localDrag.type !== 'idle' || shouldUseFastFemDraw(now)) {
       cursorValue = null;
     }
 
@@ -1628,11 +2030,15 @@
       return;
     }
 
-    if (localDrag.type === 'pendingColumn' || localDrag.type === 'pendingWall' || localDrag.type === 'pendingBeam' || localDrag.type === 'pendingSlab' || localDrag.type === 'pendingSlabVertex' || localDrag.type === 'pendingSlabEdge' || localDrag.type === 'pendingSlabHoleVertex' || localDrag.type === 'pendingSlabHole' || localDrag.type === 'pendingSlabHoleEdge' || localDrag.type === 'pendingPolylineWallVertex' || localDrag.type === 'pendingDropPanel' || localDrag.type === 'pendingDropPanelVertex' || localDrag.type === 'pendingDropPanelEdge' || localDrag.type === 'pendingMulti') {
+    if (localDrag.type === 'pendingJoint' || localDrag.type === 'pendingColumn' || localDrag.type === 'pendingWall' || localDrag.type === 'pendingBeam' || localDrag.type === 'pendingSlab' || localDrag.type === 'pendingSlabVertex' || localDrag.type === 'pendingSlabEdge' || localDrag.type === 'pendingSlabHoleVertex' || localDrag.type === 'pendingSlabHole' || localDrag.type === 'pendingSlabHoleEdge' || localDrag.type === 'pendingPolylineWallVertex' || localDrag.type === 'pendingDropPanel' || localDrag.type === 'pendingDropPanelVertex' || localDrag.type === 'pendingDropPanelEdge' || localDrag.type === 'pendingMulti') {
       const dx = sx - localDrag.startScreen.x;
       const dy = sy - localDrag.startScreen.y;
       if (Math.sqrt(dx * dx + dy * dy) > DRAG_THRESHOLD_PX) {
-        if (localDrag.type === 'pendingMulti') {
+        if (localDrag.type === 'pendingJoint') {
+          const p = localDrag;
+          model.beginAction();
+          localDrag = { type: 'draggingJoint', point: p.point, refs: p.refs, startPoint: p.point, historyPushed: true };
+        } else if (localDrag.type === 'pendingMulti') {
           model.beginAction();
           localDrag = { type: 'draggingMulti', startWorld: localDrag.startWorld, historyPushed: true };
         } else if (localDrag.type === 'pendingColumn') {
@@ -1644,13 +2050,40 @@
           model.beginAction();
           if (p.hitType === 'wallStart') localDrag = { type: 'draggingWallStart', id: p.id, historyPushed: true };
           else if (p.hitType === 'wallEnd') localDrag = { type: 'draggingWallEnd', id: p.id, historyPushed: true };
-          else localDrag = { type: 'draggingWallBody', id: p.id, offset: p.offset, historyPushed: true };
+          else {
+            const wall = model.walls.find(w => w.id === p.id);
+            const nsWall = wall ? null : model.nonStructuralWalls.find(w => w.id === p.id);
+            const initStart = wall ? { ...wall.startPoint } : (nsWall ? { ...nsWall.startPoint } : { x: 0, y: 0 });
+            const initEnd = wall ? { ...wall.endPoint } : (nsWall ? { ...nsWall.endPoint } : { x: 0, y: 0 });
+            const startCenter = { x: (initStart.x + initEnd.x) / 2, y: (initStart.y + initEnd.y) / 2 };
+            localDrag = {
+              type: 'draggingWallBody',
+              id: p.id,
+              offset: p.offset,
+              startCenter,
+              startWall: { startPoint: initStart, endPoint: initEnd },
+              historyPushed: true
+            };
+          }
         } else if (localDrag.type === 'pendingBeam') {
           const p = localDrag;
           model.beginAction();
           if (p.hitType === 'beamStart') localDrag = { type: 'draggingBeamStart', id: p.id, historyPushed: true };
           else if (p.hitType === 'beamEnd') localDrag = { type: 'draggingBeamEnd', id: p.id, historyPushed: true };
-          else localDrag = { type: 'draggingBeamBody', id: p.id, offset: p.offset, historyPushed: true };
+          else {
+            const beam = model.beams.find(b => b.id === p.id);
+            const initStart = beam ? { ...beam.startPoint } : { x: 0, y: 0 };
+            const initEnd = beam ? { ...beam.endPoint } : { x: 0, y: 0 };
+            const startCenter = { x: (initStart.x + initEnd.x) / 2, y: (initStart.y + initEnd.y) / 2 };
+            localDrag = {
+              type: 'draggingBeamBody',
+              id: p.id,
+              offset: p.offset,
+              startCenter,
+              startBeam: { startPoint: initStart, endPoint: initEnd },
+              historyPushed: true
+            };
+          }
         } else if (localDrag.type === 'pendingSlab') {
           const p = localDrag;
           model.beginAction();
@@ -1726,6 +2159,14 @@
       return;
     }
 
+    if (localDrag.type === 'draggingJoint') {
+      const drag = localDrag;
+      if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
+      const pt = getSnappedPoint(world, drag.startPoint, e.shiftKey || shiftHeld);
+      applyJointMove(drag.refs, pt);
+      return;
+    }
+
     if (localDrag.type === 'draggingColumn') {
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
@@ -1733,7 +2174,8 @@
       if (col) {
         const rawPos = { x: world.x - drag.offset.x, y: world.y - drag.offset.y };
         const snappedPos = getSnappedPoint(rawPos, col.position, e.shiftKey || shiftHeld);
-        model.updateColumn(drag.id, { position: snappedPos });
+        const refs = collectJointRefsAt(col.position, Math.max(jointHitTolerance(), 0.06));
+        applyJointMove(refs.length > 0 ? refs : [{ kind: 'column', id: drag.id, point: { ...col.position } }], snappedPos);
       }
       return;
     }
@@ -1743,21 +2185,24 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const wall = model.walls.find(w => w.id === drag.id);
       const nsWall = wall ? null : model.nonStructuralWalls.find(w => w.id === drag.id);
-      let dx = world.x - drag.offset.x - (wall ? (wall.startPoint.x + wall.endPoint.x) / 2 : (nsWall!.startPoint.x + nsWall!.endPoint.x) / 2);
-      let dy = world.y - drag.offset.y - (wall ? (wall.startPoint.y + wall.endPoint.y) / 2 : (nsWall!.startPoint.y + nsWall!.endPoint.y) / 2);
-      if (e.shiftKey || shiftHeld) {
-        if (Math.abs(dx) > Math.abs(dy)) dy = 0;
-        else dx = 0;
-      }
+      const initStart = drag.startWall?.startPoint ?? (wall ? wall.startPoint : nsWall!.startPoint);
+      const initEnd = drag.startWall?.endPoint ?? (wall ? wall.endPoint : nsWall!.endPoint);
+      const startCenter = drag.startCenter ?? { x: (initStart.x + initEnd.x) / 2, y: (initStart.y + initEnd.y) / 2 };
+
+      const targetCenter = { x: world.x - drag.offset.x, y: world.y - drag.offset.y };
+      const snappedCenter = getSnappedPoint(targetCenter, startCenter, e.shiftKey || shiftHeld);
+      const dx = snappedCenter.x - startCenter.x;
+      const dy = snappedCenter.y - startCenter.y;
+
       if (wall) {
         model.updateWall(drag.id, {
-          startPoint: { x: wall.startPoint.x + dx, y: wall.startPoint.y + dy },
-          endPoint: { x: wall.endPoint.x + dx, y: wall.endPoint.y + dy },
+          startPoint: { x: initStart.x + dx, y: initStart.y + dy },
+          endPoint: { x: initEnd.x + dx, y: initEnd.y + dy },
         });
       } else if (nsWall) {
         model.updateNonStructuralWall(drag.id, {
-          startPoint: { x: nsWall.startPoint.x + dx, y: nsWall.startPoint.y + dy },
-          endPoint: { x: nsWall.endPoint.x + dx, y: nsWall.endPoint.y + dy },
+          startPoint: { x: initStart.x + dx, y: initStart.y + dy },
+          endPoint: { x: initEnd.x + dx, y: initEnd.y + dy },
         });
       }
       return;
@@ -1768,8 +2213,16 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const wall = model.walls.find(w => w.id === drag.id);
       const nsWall = wall ? null : model.nonStructuralWalls.find(w => w.id === drag.id);
-      if (wall) { const pt = getSnappedPoint(world, wall.endPoint, e.shiftKey || shiftHeld); model.updateWall(drag.id, { startPoint: pt }); }
-      else if (nsWall) { const pt = getSnappedPoint(world, nsWall.endPoint, e.shiftKey || shiftHeld); model.updateNonStructuralWall(drag.id, { startPoint: pt }); }
+      if (wall) {
+        const pt = getSnappedPoint(world, wall.endPoint, e.shiftKey || shiftHeld);
+        const refs = collectJointRefsAt(wall.startPoint, Math.max(jointHitTolerance(), 0.06));
+        applyJointMove(refs.length > 0 ? refs : [{ kind: 'wallStart', id: drag.id, point: { ...wall.startPoint }, structural: true }], pt);
+      }
+      else if (nsWall) {
+        const pt = getSnappedPoint(world, nsWall.endPoint, e.shiftKey || shiftHeld);
+        const refs = collectJointRefsAt(nsWall.startPoint, Math.max(jointHitTolerance(), 0.06));
+        applyJointMove(refs.length > 0 ? refs : [{ kind: 'wallStart', id: drag.id, point: { ...nsWall.startPoint }, structural: false }], pt);
+      }
       return;
     }
 
@@ -1778,8 +2231,16 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const wall = model.walls.find(w => w.id === drag.id);
       const nsWall = wall ? null : model.nonStructuralWalls.find(w => w.id === drag.id);
-      if (wall) { const pt = getSnappedPoint(world, wall.startPoint, e.shiftKey || shiftHeld); model.updateWall(drag.id, { endPoint: pt }); }
-      else if (nsWall) { const pt = getSnappedPoint(world, nsWall.startPoint, e.shiftKey || shiftHeld); model.updateNonStructuralWall(drag.id, { endPoint: pt }); }
+      if (wall) {
+        const pt = getSnappedPoint(world, wall.startPoint, e.shiftKey || shiftHeld);
+        const refs = collectJointRefsAt(wall.endPoint, Math.max(jointHitTolerance(), 0.06));
+        applyJointMove(refs.length > 0 ? refs : [{ kind: 'wallEnd', id: drag.id, point: { ...wall.endPoint }, structural: true }], pt);
+      }
+      else if (nsWall) {
+        const pt = getSnappedPoint(world, nsWall.startPoint, e.shiftKey || shiftHeld);
+        const refs = collectJointRefsAt(nsWall.endPoint, Math.max(jointHitTolerance(), 0.06));
+        applyJointMove(refs.length > 0 ? refs : [{ kind: 'wallEnd', id: drag.id, point: { ...nsWall.endPoint }, structural: false }], pt);
+      }
       return;
     }
 
@@ -1787,18 +2248,21 @@
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const pwall = model.polylineWalls.find(w => w.id === drag.id);
+      const nspwall = pwall ? null : model.polylineNonStructuralWalls.find(w => w.id === drag.id);
       if (pwall && drag.vertexIndex < pwall.vertices.length) {
         const origV = drag.startVerts[drag.vertexIndex];
-        let dx = world.x - origV.x;
-        let dy = world.y - origV.y;
-        if (e.shiftKey || shiftHeld) {
-          if (Math.abs(dx) > Math.abs(dy)) dy = 0;
-          else dx = 0;
-        }
-        const newVerts = drag.startVerts.map((v, i) =>
-          i === drag.vertexIndex ? { x: origV.x + dx, y: origV.y + dy } : { ...v }
-        );
-        model.updatePolylineWall(drag.id, { vertices: newVerts });
+        const vec = orthoVector(world.x - origV.x, world.y - origV.y, e.shiftKey || shiftHeld);
+        const pt = { x: origV.x + vec.dx, y: origV.y + vec.dy };
+        const current = pwall.vertices[drag.vertexIndex];
+        const refs = collectJointRefsAt(current, Math.max(jointHitTolerance(), 0.06));
+        applyJointMove(refs.length > 0 ? refs : [{ kind: 'polylineWallVertex', id: drag.id, vertexIndex: drag.vertexIndex, point: { ...current }, structural: true }], pt);
+      } else if (nspwall && drag.vertexIndex < nspwall.vertices.length) {
+        const origV = drag.startVerts[drag.vertexIndex];
+        const vec = orthoVector(world.x - origV.x, world.y - origV.y, e.shiftKey || shiftHeld);
+        const pt = { x: origV.x + vec.dx, y: origV.y + vec.dy };
+        const current = nspwall.vertices[drag.vertexIndex];
+        const refs = collectJointRefsAt(current, Math.max(jointHitTolerance(), 0.06));
+        applyJointMove(refs.length > 0 ? refs : [{ kind: 'polylineWallVertex', id: drag.id, vertexIndex: drag.vertexIndex, point: { ...current }, structural: false }], pt);
       }
       return;
     }
@@ -1808,15 +2272,16 @@
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const beam = model.beams.find(b => b.id === drag.id);
       if (beam) {
-        let dx = world.x - drag.offset.x - (beam.startPoint.x + beam.endPoint.x) / 2;
-        let dy = world.y - drag.offset.y - (beam.startPoint.y + beam.endPoint.y) / 2;
-        if (e.shiftKey || shiftHeld) {
-          if (Math.abs(dx) > Math.abs(dy)) dy = 0;
-          else dx = 0;
-        }
+        const initStart = drag.startBeam?.startPoint ?? beam.startPoint;
+        const initEnd = drag.startBeam?.endPoint ?? beam.endPoint;
+        const startCenter = drag.startCenter ?? { x: (initStart.x + initEnd.x) / 2, y: (initStart.y + initEnd.y) / 2 };
+        const targetCenter = { x: world.x - drag.offset.x, y: world.y - drag.offset.y };
+        const snappedCenter = getSnappedPoint(targetCenter, startCenter, e.shiftKey || shiftHeld);
+        const dx = snappedCenter.x - startCenter.x;
+        const dy = snappedCenter.y - startCenter.y;
         model.updateBeam(drag.id, {
-          startPoint: { x: beam.startPoint.x + dx, y: beam.startPoint.y + dy },
-          endPoint: { x: beam.endPoint.x + dx, y: beam.endPoint.y + dy },
+          startPoint: { x: initStart.x + dx, y: initStart.y + dy },
+          endPoint: { x: initEnd.x + dx, y: initEnd.y + dy },
         });
       }
       return;
@@ -1826,7 +2291,11 @@
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const beam = model.beams.find(b => b.id === drag.id);
-      if (beam) { const pt = getSnappedPoint(world, beam.endPoint, e.shiftKey || shiftHeld); model.updateBeam(drag.id, { startPoint: pt }); }
+      if (beam) {
+        const pt = getSnappedPoint(world, beam.endPoint, e.shiftKey || shiftHeld);
+        const refs = collectJointRefsAt(beam.startPoint, Math.max(jointHitTolerance(), 0.06));
+        applyJointMove(refs.length > 0 ? refs : [{ kind: 'beamStart', id: drag.id, point: { ...beam.startPoint } }], pt);
+      }
       return;
     }
 
@@ -1834,7 +2303,11 @@
       const drag = localDrag;
       if (!drag.historyPushed) { model.beginAction(); drag.historyPushed = true; }
       const beam = model.beams.find(b => b.id === drag.id);
-      if (beam) { const pt = getSnappedPoint(world, beam.startPoint, e.shiftKey || shiftHeld); model.updateBeam(drag.id, { endPoint: pt }); }
+      if (beam) {
+        const pt = getSnappedPoint(world, beam.startPoint, e.shiftKey || shiftHeld);
+        const refs = collectJointRefsAt(beam.endPoint, Math.max(jointHitTolerance(), 0.06));
+        applyJointMove(refs.length > 0 ? refs : [{ kind: 'beamEnd', id: drag.id, point: { ...beam.endPoint } }], pt);
+      }
       return;
     }
 
@@ -1858,8 +2331,10 @@
       const verts = [...drag.startVerts];
       const startRef = drag.startVerts[drag.vertexIndex];
       const pt = getSnappedPoint(world, startRef, e.shiftKey || shiftHeld);
-      verts[drag.vertexIndex] = pt;
-      model.updateSlab(drag.id, { vertices: verts });
+      const slab = model.slabs.find(s => s.id === drag.id);
+      const current = slab?.vertices[drag.vertexIndex] ?? startRef;
+      const refs = collectJointRefsAt(current, Math.max(jointHitTolerance(), 0.06));
+      applyJointMove(refs.length > 0 ? refs : [{ kind: 'slabVertex', id: drag.id, vertexIndex: drag.vertexIndex, point: { ...current } }], pt);
       return;
     }
 
@@ -1870,8 +2345,10 @@
       const verts = [...drag.startVerts];
       const startRef = drag.startVerts[drag.vertexIndex];
       const pt = getSnappedPoint(world, startRef, e.shiftKey || shiftHeld);
-      verts[drag.vertexIndex] = pt;
-      model.updateSlab(drag.id, { vertices: verts });
+      const slab = model.slabs.find(s => s.id === drag.id);
+      const current = slab?.vertices[drag.vertexIndex] ?? startRef;
+      const refs = collectJointRefsAt(current, Math.max(jointHitTolerance(), 0.06));
+      applyJointMove(refs.length > 0 ? refs : [{ kind: 'slabVertex', id: drag.id, vertexIndex: drag.vertexIndex, point: { ...current } }], pt);
       return;
     }
 
@@ -1953,8 +2430,9 @@
       let dx = world.x - drag.startWorld.x;
       let dy = world.y - drag.startWorld.y;
       if (e.shiftKey || shiftHeld) {
-        if (Math.abs(dx) > Math.abs(dy)) dy = 0;
-        else dx = 0;
+        const vec = orthoVector(dx, dy, true);
+        dx = vec.dx;
+        dy = vec.dy;
       }
       for (const [id, orig] of multiDragOriginals) {
         if (orig.type === 'column') {
@@ -1964,6 +2442,10 @@
           if (model.walls.find(w => w.id === id)) model.updateWall(id, { startPoint: { x: orig.startPoint.x + dx, y: orig.startPoint.y + dy }, endPoint: { x: orig.endPoint.x + dx, y: orig.endPoint.y + dy } });
         } else if (orig.type === 'polylineWall') {
           if (model.polylineWalls.find(w => w.id === id)) model.updatePolylineWall(id, { vertices: orig.vertices.map((v: Point2D) => ({ x: v.x + dx, y: v.y + dy })) });
+        } else if (orig.type === 'nonStructuralWall') {
+          if (model.nonStructuralWalls.find(w => w.id === id)) model.updateNonStructuralWall(id, { startPoint: { x: orig.startPoint.x + dx, y: orig.startPoint.y + dy }, endPoint: { x: orig.endPoint.x + dx, y: orig.endPoint.y + dy } });
+        } else if (orig.type === 'polylineNonStructuralWall') {
+          if (model.polylineNonStructuralWalls.find(w => w.id === id)) model.updatePolylineNonStructuralWall(id, { vertices: orig.vertices.map((v: Point2D) => ({ x: v.x + dx, y: v.y + dy })) });
         } else if (orig.type === 'beam') {
           if (model.beams.find(b => b.id === id)) model.updateBeam(id, { startPoint: { x: orig.startPoint.x + dx, y: orig.startPoint.y + dy }, endPoint: { x: orig.endPoint.x + dx, y: orig.endPoint.y + dy } });
         } else if (orig.type === 'slab') {
@@ -1976,6 +2458,8 @@
     }
 
     if (localDrag.type === 'panning') {
+      lastViewportInteractionTs = performance.now();
+      markCanvasInteracting();
       model.canvasViewOffsetX += sx - localDrag.last.x;
       model.canvasViewOffsetY += sy - localDrag.last.y;
       localDrag = { type: 'panning', last: { x: sx, y: sy } };
@@ -2065,6 +2549,21 @@
       else { if (pw.vertices.some(v => v.x >= minX && v.x <= maxX && v.y >= minY && v.y <= maxY)) selectedIds.push(pw.id); }
     }
 
+    for (const nswall of model.nonStructuralWalls) {
+      const startIn = nswall.startPoint.x >= minX && nswall.startPoint.x <= maxX &&
+                      nswall.startPoint.y >= minY && nswall.startPoint.y <= maxY;
+      const endIn = nswall.endPoint.x >= minX && nswall.endPoint.x <= maxX &&
+                    nswall.endPoint.y >= minY && nswall.endPoint.y <= maxY;
+      if (isLTR) { if (startIn && endIn) selectedIds.push(nswall.id); }
+      else { if (startIn || endIn) selectedIds.push(nswall.id); }
+    }
+
+    for (const nspw of model.polylineNonStructuralWalls) {
+      const allIn = nspw.vertices.every(v => v.x >= minX && v.x <= maxX && v.y >= minY && v.y <= maxY);
+      if (isLTR) { if (allIn) selectedIds.push(nspw.id); }
+      else { if (nspw.vertices.some(v => v.x >= minX && v.x <= maxX && v.y >= minY && v.y <= maxY)) selectedIds.push(nspw.id); }
+    }
+
     for (const beam of model.beams) {
       const startIn = beam.startPoint.x >= minX && beam.startPoint.x <= maxX &&
                       beam.startPoint.y >= minY && beam.startPoint.y <= maxY;
@@ -2147,6 +2646,7 @@
 
   function handleMouseUp(_e: MouseEvent): void {
     dirty = true;
+    markCanvasInteracting(120);
     if (localDrag.type === 'selectingRect') { finishSelectionRect(); return; }
     if (localDrag.type === 'panning') {
       canvasEl.style.cursor = uiState.tool === 'pan' ? 'grab' : 'default';
@@ -2154,7 +2654,7 @@
       savedDrag = null;
       return;
     }
-    if (localDrag.type === 'pendingColumn' || localDrag.type === 'pendingWall' || localDrag.type === 'pendingBeam' || localDrag.type === 'pendingSlab' || localDrag.type === 'pendingSlabVertex' || localDrag.type === 'pendingSlabHoleVertex' || localDrag.type === 'pendingSlabHole' || localDrag.type === 'pendingPolylineWallVertex' || localDrag.type === 'pendingDropPanel' || localDrag.type === 'pendingDropPanelVertex' || localDrag.type === 'pendingMulti') {
+    if (localDrag.type === 'pendingJoint' || localDrag.type === 'pendingColumn' || localDrag.type === 'pendingWall' || localDrag.type === 'pendingBeam' || localDrag.type === 'pendingSlab' || localDrag.type === 'pendingSlabVertex' || localDrag.type === 'pendingSlabHoleVertex' || localDrag.type === 'pendingSlabHole' || localDrag.type === 'pendingPolylineWallVertex' || localDrag.type === 'pendingDropPanel' || localDrag.type === 'pendingDropPanelVertex' || localDrag.type === 'pendingMulti') {
       localDrag = { type: 'idle' };
       return;
     }
@@ -2206,7 +2706,7 @@
       localDrag = { type: 'idle' };
       return;
     }
-    if (localDrag.type === 'draggingColumn' || localDrag.type === 'draggingWallBody' || localDrag.type === 'draggingWallStart' || localDrag.type === 'draggingWallEnd' || localDrag.type === 'draggingBeamBody' || localDrag.type === 'draggingBeamStart' || localDrag.type === 'draggingBeamEnd' || localDrag.type === 'draggingPolylineWallVertex' || localDrag.type === 'draggingSlab' || localDrag.type === 'draggingSlabVertex' || localDrag.type === 'draggingSlabEdge' || localDrag.type === 'draggingSlabHoleVertex' || localDrag.type === 'draggingSlabHoleEdge' || localDrag.type === 'draggingSlabHole' || localDrag.type === 'draggingDropPanel' || localDrag.type === 'draggingDropPanelVertex' || localDrag.type === 'draggingDropPanelEdge' || localDrag.type === 'draggingMulti') {
+    if (localDrag.type === 'draggingJoint' || localDrag.type === 'draggingColumn' || localDrag.type === 'draggingWallBody' || localDrag.type === 'draggingWallStart' || localDrag.type === 'draggingWallEnd' || localDrag.type === 'draggingBeamBody' || localDrag.type === 'draggingBeamStart' || localDrag.type === 'draggingBeamEnd' || localDrag.type === 'draggingPolylineWallVertex' || localDrag.type === 'draggingSlab' || localDrag.type === 'draggingSlabVertex' || localDrag.type === 'draggingSlabEdge' || localDrag.type === 'draggingSlabHoleVertex' || localDrag.type === 'draggingSlabHoleEdge' || localDrag.type === 'draggingSlabHole' || localDrag.type === 'draggingDropPanel' || localDrag.type === 'draggingDropPanelVertex' || localDrag.type === 'draggingDropPanelEdge' || localDrag.type === 'draggingMulti') {
       localDrag = { type: 'idle' };
       return;
     }
@@ -2306,6 +2806,8 @@
 
   function handleWheel(e: WheelEvent): void {
     dirty = true;
+    lastViewportInteractionTs = performance.now();
+    markCanvasInteracting();
     e.preventDefault();
     const rect = canvasEl.getBoundingClientRect();
     const mx = e.clientX - rect.left;
@@ -2360,8 +2862,10 @@
     if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
       e.preventDefault();
       const allIds = [...model.columns.map(c => c.id), ...model.walls.map(w => w.id),
-        ...model.polylineWalls.map(w => w.id), ...model.beams.map(b => b.id),
-        ...model.slabs.map(s => s.id), ...model.dropPanels.map(d => d.id)];
+        ...model.polylineWalls.map(w => w.id), ...model.nonStructuralWalls.map(w => w.id),
+        ...model.polylineNonStructuralWalls.map(w => w.id), ...model.beams.map(b => b.id),
+        ...model.slabs.map(s => s.id), ...model.dropPanels.map(d => d.id),
+        ...model.dimensions.map(d => d.id)];
       if (allIds.length > 0) {
         uiState.setSelectedElements(allIds);
         uiState.setStatusMessage(`Selected ${allIds.length} element(s)`);
@@ -2418,6 +2922,11 @@
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) return;
 
     if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (selectedJointPoint && selectedJointRefs.length > 0) {
+        e.preventDefault();
+        deleteSelectedJoint();
+        return;
+      }
       if (uiState.selectedElementType === 'opening' && uiState.selectedElementId && uiState.selectedHoleIndex !== null) {
         e.preventDefault();
         model.deleteSlabHole(uiState.selectedElementId, uiState.selectedHoleIndex);
@@ -2509,6 +3018,8 @@
 
   onDestroy(() => {
     cancelAnimationFrame(animId);
+    if (interactionIdleTimer) clearTimeout(interactionIdleTimer);
+    uiState.isCanvasInteracting = false;
     window.removeEventListener('resize', handleResize);
     window.removeEventListener('keydown', onWindowKeyDown);
     window.removeEventListener('keyup', onWindowKeyUp);
@@ -2532,7 +3043,7 @@
     onmousedown={handleMouseDown}
     onmousemove={handleMouseMove}
     onmouseup={handleMouseUp}
-    onmouseleave={() => cursorValue = null}
+    onmouseleave={() => { cursorValue = null; markCanvasInteracting(120); }}
     ondblclick={handleDblClick}
     oncontextmenu={(e) => e.preventDefault()}
   ></canvas>

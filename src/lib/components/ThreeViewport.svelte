@@ -54,6 +54,7 @@
 
   // ─── FEM meshes ───
   let femMesh: THREE.Mesh | null = null;
+  let femWireframeMesh: THREE.LineSegments | null = null;
   let gridHelper: THREE.GridHelper | null = null;
   let slabGroup: THREE.Group;
   let femGroup: THREE.Group;
@@ -81,14 +82,18 @@
 
   function rebuildGrid(): void {
     if (!group) return;
-    if (gridHelper) { group.remove(gridHelper); gridHelper.geometry.dispose(); }
+    if (gridHelper) { group.remove(gridHelper); gridHelper.geometry.dispose(); gridHelper = null; }
+    if (!uiState.showGrid3D) return;
     const bounds = computeModelBounds();
     const sizeX = Math.max(bounds.maxX - bounds.minX, 50);
     const sizeY = Math.max(bounds.maxY - bounds.minY, 50);
     const maxExtent = Math.max(sizeX, sizeY);
     const gridSize = Math.max(maxExtent * 5, 200);
     const divisions = Math.max(40, Math.min(1000, Math.round(gridSize)));
-    gridHelper = new THREE.GridHelper(gridSize, divisions, 0x333333, 0x1a1a1a);
+    const isLight = uiState.theme === 'light';
+    const gridColor1 = isLight ? 0x64748b : 0x475569;
+    const gridColor2 = isLight ? 0xcbd5e1 : 0x1e293b;
+    gridHelper = new THREE.GridHelper(gridSize, divisions, gridColor1, gridColor2);
     const cx = (bounds.minX + bounds.maxX) / 2;
     const cy = (bounds.minY + bounds.maxY) / 2;
     gridHelper.position.set(cx, -0.01, cy);
@@ -373,9 +378,7 @@
       }
     }
 
-    if (uiState.showNodeNumbers || uiState.showElementNumbers) {
-      // Render node/element numbers via sprites (simplified: only on FEM mesh if available)
-    }
+
   }
 
   function resultValueForType(rt: string, nodeValues: Map<number, number>, nodeId: number): number {
@@ -450,15 +453,15 @@
         const elemNodes = nids.map(nid => {
           const n = nodeMap.get(nid);
           const rawWz = deflMap.get(nid) || 0;
-          // Downward displacement magnitude (sagging downward)
-          const sag = rawWz * deflScale;
+          // Vertical displacement in meters (rawWz is in mm, negative = downward sagging, positive = upward hogging)
+          const vertDisplacement = (rawWz / 1000.0) * deflScale;
 
           const x = n ? n.x : 0;
           const z = n ? n.y : 0;
           return {
             nid,
-            top: { x, y: topYBase - sag, z },
-            bot: { x, y: botYBase - sag, z },
+            top: { x, y: topYBase + vertDisplacement, z },
+            bot: { x, y: botYBase + vertDisplacement, z },
           };
         });
 
@@ -478,8 +481,6 @@
             const [r, g, b] = sampleRamp(ramp, norm);
             allColors.push(r / 255, g / 255, b / 255);
           }
-
-
 
           // --- Top Surface Mesh Wireframe Overlay ---
           for (let eIdx = 0; eIdx < 3; eIdx++) {
@@ -519,8 +520,8 @@
         transparent: true,
         opacity: 0.3,
       });
-      const lines = new THREE.LineSegments(lineGeo, lineMat);
-      femGroup.add(lines);
+      femWireframeMesh = new THREE.LineSegments(lineGeo, lineMat);
+      femGroup.add(femWireframeMesh);
     }
   }
 
@@ -584,6 +585,7 @@
       ? femState.deformedScale * (1 + 0.3 * Math.sin(animationTime * 2))
       : femState.deformedScale;
     const allVerts: number[] = [];
+    const lineVerts: number[] = [];
 
     for (const result of results) {
       const slab = model.slabs.find(s => s.id === result.slabId || s.label === result.slabId);
@@ -600,17 +602,22 @@
         const elemNodes = nids.map(nid => {
           const n = nodeMap.get(nid);
           const rawWz = deflMap.get(nid) || 0;
-          const sag = rawWz * deflScale;
+          const vertDisplacement = (rawWz / 1000.0) * deflScale;
           return {
-            top: { x: n ? n.x : 0, y: topYBase - sag, z: n ? n.y : 0 },
-            bot: { x: n ? n.x : 0, y: botYBase - sag, z: n ? n.y : 0 },
+            top: { x: n ? n.x : 0, y: topYBase + vertDisplacement, z: n ? n.y : 0 },
+            bot: { x: n ? n.x : 0, y: botYBase + vertDisplacement, z: n ? n.y : 0 },
           };
         });
         for (let k = 0; k < nids.length - 2; k++) {
           const triIndices = [0, k + 1, k + 2];
-          for (const idx of triIndices) {
-            const cn = elemNodes[idx];
+          const triNodes = triIndices.map(idx => elemNodes[idx]);
+          for (const cn of triNodes) {
             allVerts.push(cn.top.x, cn.top.y, cn.top.z);
+          }
+          for (let eIdx = 0; eIdx < 3; eIdx++) {
+            const c1 = triNodes[eIdx].top;
+            const c2 = triNodes[(eIdx + 1) % 3].top;
+            lineVerts.push(c1.x, c1.y + 0.001, c1.z, c2.x, c2.y + 0.001, c2.z);
           }
         }
       }
@@ -623,6 +630,14 @@
         posAttr.needsUpdate = true;
       }
       femMesh.geometry.computeVertexNormals();
+    }
+
+    if (lineVerts.length > 0 && femWireframeMesh && femWireframeMesh.geometry) {
+      const linePosAttr = femWireframeMesh.geometry.attributes.position;
+      if (linePosAttr) {
+        (linePosAttr.array as Float32Array).set(lineVerts);
+        linePosAttr.needsUpdate = true;
+      }
     }
   }
 
@@ -854,6 +869,16 @@
     uiState.resetViewTrigger;
     if (mounted) {
       if (uiState.viewPreset !== 'perspective') applyViewPreset();
+      markRender();
+    }
+  });
+
+  // 3D Grid Visibility & Theme changes
+  $effect(() => {
+    uiState.showGrid3D;
+    uiState.theme;
+    if (mounted && group) {
+      rebuildGrid();
       markRender();
     }
   });

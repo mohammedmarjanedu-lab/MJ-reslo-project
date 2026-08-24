@@ -84,8 +84,14 @@
   <!-- Parametric Study Button -->
   <button
     class="w-full flex items-center gap-1.5 rounded-md px-2 py-1 text-xs transition-colors text-[#ffffff] bg-[#333333]/50 hover:bg-[#D62430] hover:text-white cursor-pointer select-none mb-1 border border-[#444444]/30"
-    onclick={() => uiState.setStatusMessage('Parametric Study mode selected (Not implemented)')}
-    title="Parametric Study"
+    onclick={() => {
+      model.resetModel();
+      uiState.femAutoCompute = false;
+      uiState.showParametricLivePanel = false;
+      uiState.showParametricStudyDialog = true;
+      uiState.setStatusMessage('Canvas cleared for Parametric Study');
+    }}
+    title="Parametric Study & Quick Grid Template Generator"
   >
     <span class="w-5 text-center text-base">📊</span>
     <span class="flex-1 text-left text-xs font-medium">Parametric Study</span>

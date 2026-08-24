@@ -36,9 +36,7 @@
   }
 
   function getCurrentMinMax(): { min: number; max: number } {
-    const a = Math.abs(femState.globalMinWz);
-    const b = Math.abs(femState.globalMaxWz);
-    return { min: Math.min(a, b), max: Math.max(a, b) };
+    return { min: femState.globalMinWz, max: femState.globalMaxWz };
   }
 
   const mmRange = $derived(getCurrentMinMax());
@@ -53,11 +51,9 @@
     return total;
   });
   function copyShareLink() {
-    const currentUrl = uiState.apiUrl;
-    let shareUrl = 'https://reslo-eosin.vercel.app/';
-    if (currentUrl && currentUrl.startsWith('https://')) {
-      shareUrl += `?api=${encodeURIComponent(currentUrl)}`;
-    }
+    const currentUrl = uiState.apiUrl || (typeof window !== 'undefined' ? window.location.origin : '');
+    const baseUrl = typeof window !== 'undefined' ? window.location.origin : '';
+    const shareUrl = currentUrl ? `${baseUrl}/?api=${encodeURIComponent(currentUrl)}` : baseUrl;
     navigator.clipboard.writeText(shareUrl).then(() => {
       uiState.setStatusMessage(`Share link copied to clipboard! 🔗`);
     }).catch(() => {
@@ -103,7 +99,7 @@
         class="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1 text-white text-[11px] focus:outline-none focus:border-indigo-500"
       >
         <option value="ts_local">⚡ TypeScript In-Browser Solver (Local Web Worker)</option>
-        <option value="python_backend">🐍 Python Direct DKT Solver (Backend)</option>
+        <option value="python_backend">🐍 Python DKT / PyNite Solver (Backend)</option>
       </select>
     </div>
 
@@ -154,15 +150,16 @@
     <!-- Mesh Size Slider -->
     <div>
       <label class="block text-[10px] text-slate-500 mb-0.5">
-        Mesh Size: <span class="text-white font-mono">{uiState.femMeshSize.toFixed(1)}m</span>
+        Mesh Size: <span class="text-white font-mono">{uiState.femMeshSize.toFixed(2)}m</span>
       </label>
       <input
         type="range"
-        min="0.2"
+        min="0.05"
         max="2.0"
-        step="0.1"
+        step="0.05"
         value={uiState.femMeshSize}
         oninput={handleMeshSizeChange}
+        onchange={() => onrunFem?.()}
         class="reslo-slider"
       />
     </div>

@@ -155,9 +155,9 @@ class ElementMoment(BaseModel):
     mx: float
     my: float
     mxy: float
-    m1: float
-    m2: float
-    angle: float
+    m1: float = 0.0
+    m2: float = 0.0
+    angle: float = 0.0
     mxd_pos: Optional[float] = 0.0
     myd_pos: Optional[float] = 0.0
     mxd_neg: Optional[float] = 0.0
@@ -184,8 +184,8 @@ class ElementShear(BaseModel):
     elementId: int
     vx: float
     vy: float
-    v1: float  # principal shear magnitude
-    angle: float  # principal shear direction (degrees)
+    v1: float = 0.0  # principal shear magnitude
+    angle: float = 0.0  # principal shear direction (degrees)
 
 class ElementMembraneForce(BaseModel):
     elementId: int

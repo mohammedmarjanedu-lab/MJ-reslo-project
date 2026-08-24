@@ -19,19 +19,27 @@ Frontend (run from `reslo/`):
 
 Backend (run from `reslo/backend/`):
 - `uvicorn main:app --host 0.0.0.0 --port 8000` — start the FastAPI FEA server (frontend expects it at `http://127.0.0.1:8000`)
-- `pip install -r requirements.txt` — installs FastAPI, numpy, scipy, gmsh, and **KratosMultiphysics** (the primary solver)
+- `pip install -r requirements.txt` — installs FastAPI, numpy, scipy, gmsh, and **Pynite** (the primary solver, pure-Python FEM library)
+- `SOLVER_BACKEND=pynite uvicorn main:app` — use Pynite (default); `SOLVER_BACKEND=dkt` → pure Python DKT; `SOLVER_BACKEND=kratos` → KratosMultiphysics
 - `pytest` — backend tests (`test_*.py` and `tests/etabs_parity/`); parity tests validate solver output against ETABS benchmarks
 
-## Two-solver architecture (critical to understand)
+## Three-solver architecture (critical to understand)
 
-FEM analysis has two independent implementations, and the frontend picks between them at runtime:
+FEM analysis has three independent implementations:
 
-1. **Python backend (primary)** — `backend/kratos_solver.py` via FastAPI (`backend/main.py`). Uses Gmsh for meshing and KratosMultiphysics StructuralMechanics for the solve. More accurate; supports adaptive refinement, SPR recovery, Wood-Armer, advanced punching shear, cracked-section analysis (the extra `backend/*.py` modules). Endpoints: `/api/health`, `/api/mesh`, `/api/analyze`, `/api/analyze_multi`.
-2. **In-browser Web Worker (fallback)** — `src/lib/engine/femSolver.ts` running in `src/workers/fem.worker.ts`. A self-contained TypeScript Mindlin-Reissner plate solver (Q4/Q8/T3 elements, banded LDLᵀ factorization). Runs with zero install so the app works as a pure static site.
+1. **Python backend (primary: Pynite)** — `backend/pynite_solver.py` via FastAPI (`backend/main.py`). Uses Gmsh for meshing and **Pynite** (JWock82/Pynite, pure-Python) for the FEM solve. Shell elements use Mindlin-Reissner (thick plate) formulation; beams use 3D Euler-Bernoulli elements. Spring-type column supports, penalty-method column-footprint rigid links, and wall rotational springs replicate ETABS-like behavior. Endpoints: `/api/health`, `/api/mesh`, `/api/analyze`, `/api/analyze_multi`.
+2. **Python backend (fallback: DKT)** — `backend/solver.py`. A pure-Python Discrete Kirchhoff Triangle (DKT) + Constant Strain Triangle (CST) flat-shell solver with direct sparse matrix solve (scipy). Used when Pynite is unavailable (e.g., fresh install).
+3. **In-browser Web Worker (zero-install fallback)** — `src/lib/engine/femSolver.ts` running in `src/workers/fem.worker.ts`. A self-contained TypeScript Mindlin-Reissner plate solver (Q4/Q8/T3 elements, banded LDLᵀ factorization). Runs with zero install so the app works as a pure static site.
+
+The solver backend is selected automatically at server startup:
+```
+Pynite (pip install Pynite) → Pure Python DKT (always available) → Kratos (legacy)
+```
+Set `SOLVER_BACKEND=pynite`, `SOLVER_BACKEND=dkt`, or `SOLVER_BACKEND=kratos` to pin a specific backend.
 
 The orchestration lives in `App.svelte` → `triggerFEMAnalysis()`. It polls `/api/health` every 15s (`checkBackend`); if the backend is reachable it uses `pyApi.ts` (`meshAndAnalyzeAllSlabs`), otherwise it falls back to the worker. Both paths converge to the same `SlabFEMResult[]` shape (see `src/lib/engine/types.ts`), so **when you change analysis inputs/outputs you almost always need to update both `femSolver.ts` and `pyApi.ts` (and the Python side) to keep them in sync.**
 
-Key numerical conventions shared across both solvers: elastic modulus is stored in kPa-ish units and normalized (`E > 1e8 ⇒ E /= 1000`); columns are modeled as elastic springs (Kz, Krx, Kry) rather than rigid supports; walls/beams constrain the `w` DOF along their length; coincident nodes at slab boundaries are merged (spatial-grid dedup) so adjacent slabs act continuously; discontinuous slab edges get unmerged rotational DOFs to model hinges.
+Key numerical conventions shared across all solvers: elastic modulus is stored in kPa-ish units and normalized (`E > 1e8 ⇒ E /= 1000`); columns are modeled as elastic springs (Kz, Krx, Kry) rather than rigid supports; walls/beams constrain the `w` DOF along their length; coincident nodes at slab boundaries are merged (spatial-grid dedup) so adjacent slabs act continuously; discontinuous slab edges get unmerged rotational DOFs to model hinges.
 
 ## Frontend architecture
 

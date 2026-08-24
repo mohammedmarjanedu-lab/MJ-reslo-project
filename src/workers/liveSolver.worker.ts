@@ -1,4 +1,4 @@
-import type { SlabPolygon, ColumnElement, ShearWallElement, PolylineWallElement } from '../lib/engine/types';
+import type { SlabPolygon, ColumnElement, ShearWallElement, PolylineWallElement, BeamElement, DropPanelElement, NonStructuralWallElement, PolylineNonStructuralWallElement } from '../lib/engine/types';
 import { analyzeAllSlabs } from '../lib/engine/femSolver';
 
 export interface LiveSolveInput {
@@ -6,16 +6,21 @@ export interface LiveSolveInput {
   columns: ColumnElement[];
   walls: ShearWallElement[];
   polylineWalls: PolylineWallElement[];
+  beams?: BeamElement[];
+  dropPanels?: DropPanelElement[];
+  nonStructuralWalls?: NonStructuralWallElement[];
+  polylineNonStructuralWalls?: PolylineNonStructuralWallElement[];
   meshSize: number;
   poissonRatio: number;
 }
 
 self.onmessage = (event: MessageEvent<LiveSolveInput>) => {
-  const { slabs, columns, walls, polylineWalls, meshSize, poissonRatio } = event.data;
+  const { slabs, columns, walls, polylineWalls, beams, dropPanels, nonStructuralWalls, polylineNonStructuralWalls, meshSize, poissonRatio } = event.data;
   try {
     const { results } = analyzeAllSlabs(
       slabs, columns, walls, polylineWalls,
-      [], [], [], [],
+      beams || [], dropPanels || [],
+      nonStructuralWalls || [], polylineNonStructuralWalls || [],
       meshSize, poissonRatio,
       false
     );

@@ -1,4 +1,33 @@
-import type { CanvasMode, ToolType, ElementType } from '../engine/types';
+import type { CanvasMode, ToolType, ElementType, ParametricConfig } from '../engine/types';
+
+export const DEFAULT_PARAMETRIC_CONFIG: ParametricConfig = {
+  preset: 'flatSlabDrops',
+  spansX: 3,
+  spansY: 3,
+  spacingX: 6.0,
+  spacingY: 6.0,
+  overhangX: 0.5,
+  overhangY: 0.5,
+  slabThickness: 200,
+  hasDropPanels: true,
+  dropDivisor: 3,
+  dropWidth: 2.0,
+  dropDepth: 2.0,
+  dropDrop: 150,
+  columnShape: 'rectangular',
+  columnWidth: 450,
+  columnDepth: 450,
+  columnDiameter: 500,
+  columnHeight: 3000,
+  columnBoundary: 'fixed-fixed',
+  concreteGrade: 'M25',
+  rebarGrade: 'Fe500',
+  deadLoad: 1.5,
+  liveLoad: 3.0,
+  hasGridBeams: false,
+  beamWidth: 300,
+  beamDepth: 450,
+};
 
 function getSavedApiUrl(): string {
   // 1. Check URL query parameters first (e.g. ?api=https://...) to make shared links foolproof
@@ -6,30 +35,43 @@ function getSavedApiUrl(): string {
     const params = new URLSearchParams(window.location.search);
     const apiParam = params.get('api') || params.get('apiUrl');
     if (apiParam && apiParam.startsWith('http')) {
+      const cleanParam = apiParam.replace(/localhost:8000/g, '127.0.0.1:8000').replace(/\/$/, '');
       try {
-        localStorage.setItem('reslo_api_url', apiParam);
+        localStorage.setItem('reslo_api_url', cleanParam);
       } catch {}
-      return apiParam;
+      return cleanParam;
+    }
+
+    // 2. Check localStorage if valid for current protocol
+    try {
+      const saved = localStorage.getItem('reslo_api_url');
+      if (saved && saved.startsWith('http')) {
+        if (window.location.protocol === 'https:' && saved.startsWith('http://')) {
+          localStorage.removeItem('reslo_api_url');
+        } else {
+          return saved.replace(/localhost:8000/g, '127.0.0.1:8000').replace(/\/$/, '');
+        }
+      }
+    } catch {}
+
+    // 3. If running on unified server (port 8000 or any Cloudflare tunnel / remote host), default to window.location.origin
+    if (window.location.origin && !window.location.origin.includes(':5173')) {
+      return window.location.origin.replace(/\/$/, '');
     }
   }
 
-  const envUrl = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) || 'http://127.0.0.1:8000';
-  try {
-    const saved = localStorage.getItem('reslo_api_url');
-    // Reject stale ephemeral Cloudflare/ngrok tunnels stored in localStorage unless explicitly passed via ?api=...
-    if (saved && saved.startsWith('http') && !saved.includes('trycloudflare.com') && !saved.includes('ngrok') && !saved.includes('glass-worm-supervision-mercury')) {
-      return saved;
-    }
-    return envUrl;
-  }
-  catch { return envUrl; }
+  const envUrl = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) ? import.meta.env.VITE_API_URL.replace(/localhost:8000/g, '127.0.0.1:8000') : '';
+  if (envUrl) return envUrl.replace(/\/$/, '');
+
+  return 'http://127.0.0.1:8000';
 }
 
 
 class UIState {
-  solverEngine = $state<'ts_local' | 'python_backend'>('ts_local');
+  solverEngine = $state<'ts_local' | 'python_backend'>('python_backend');
   mode = $state<CanvasMode>('select');
   tool = $state<ToolType>('select');
+  isCanvasInteracting = $state(false);
   selectedElementId = $state<string | null>(null);
   selectedElementType = $state<ElementType | null>(null);
   selectedElementIds = $state<string[]>([]);
@@ -39,13 +81,14 @@ class UIState {
   wallDrawMode = $state<'single' | 'polyline'>('single');
   partitionDrawMode = $state<'single' | 'polyline'>('single');
   showGrid = $state(true);
+  showGrid3D = $state(true);
   snapToGrid = $state(false);
   showLabels = $state(false);
   gridSize = $state(1);
   edgeNodeInsertionEnabled = $state(true);
   contextMenu = $state<{ x: number; y: number } | null>(null);
   showPropertiesPanel = $state(true);
-  showFEMResults = $state(false);
+  showFEMResults = $state(true);
   viewMode = $state<'2d' | '3d'>('2d');
   isFEMComputing = $state(false);
   femAutoCompute = $state(false);
@@ -53,6 +96,7 @@ class UIState {
   femUseQ8 = $state(false); // Q8 deferred — needs MITC formulation
   deflectionType = $state<'cracked' | 'uncracked'>('uncracked');
   crackedModifierValue = $state(0.25);
+  showDeflectionPanel = $state(true);
   calibrationPoint1 = $state<{ x: number; y: number } | null>(null);
   showCalibrationDialog = $state(false);
   calibrationPendingData = $state<{ p1Screen: { x: number; y: number }; p2Screen: { x: number; y: number } } | null>(null);
@@ -70,6 +114,11 @@ class UIState {
   // Backend API URL (persisted in localStorage)
   apiUrl = $state<string>(getSavedApiUrl());
   backendConnected = $state(false);
+
+  // Parametric Study State
+  showParametricStudyDialog = $state(false);
+  showParametricLivePanel = $state(false);
+  parametricConfig = $state<ParametricConfig>({ ...DEFAULT_PARAMETRIC_CONFIG });
 
   // New 3D / result visualization state
   colorRamp = $state<'jet' | 'viridis' | 'diverging' | 'thermal' | 'cool_warm'>('jet');
@@ -94,7 +143,7 @@ class UIState {
   placementHeight = $state(3000);
   columnShape = $state<'rectangular' | 'circular'>('rectangular');
   placementDiameter = $state(500);
-  wallThickness = $state(200); // mm
+  wallThickness = $state(250); // mm
   beamWidth = $state(300); // mm
   beamDepth = $state(450); // mm
   dropPanelWidth = $state(1500); // mm
@@ -218,19 +267,23 @@ class UIState {
   }
 
   // Draggable and Resizable Panels positioning
-  layersPanel = $state({ x: 0, y: 0, w: 260, h: 320, initialized: false });
+  layersPanel = $state({ x: 0, y: 12, w: 260, h: 380, initialized: false });
   propertiesPanel = $state({ x: 0, y: 0, w: 340, h: 420, initialized: false });
 
   initPanels(windowWidth: number, windowHeight: number): void {
-    if (!this.layersPanel.initialized && windowWidth > 100) {
-      this.layersPanel.x = windowWidth - 280;
-      this.layersPanel.y = 80;
-      this.layersPanel.initialized = true;
-    }
-    if (!this.propertiesPanel.initialized && windowWidth > 100) {
-      this.propertiesPanel.x = windowWidth - this.propertiesPanel.w - 20;
-      this.propertiesPanel.y = 440;
-      this.propertiesPanel.initialized = true;
+    if (windowWidth > 100) {
+      if (!this.layersPanel.initialized || this.layersPanel.x <= 0) {
+        this.layersPanel.w = 260;
+        this.layersPanel.h = 380;
+        this.layersPanel.x = Math.max(10, windowWidth - 220 - 12 - this.layersPanel.w - 12);
+        this.layersPanel.y = 12;
+        this.layersPanel.initialized = true;
+      }
+      if (!this.propertiesPanel.initialized) {
+        this.propertiesPanel.x = windowWidth - this.propertiesPanel.w - 20;
+        this.propertiesPanel.y = 440;
+        this.propertiesPanel.initialized = true;
+      }
     }
   }
 }

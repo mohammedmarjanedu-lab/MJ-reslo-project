@@ -2,7 +2,7 @@
 
 Write-Host "Stopping all hosting processes..." -ForegroundColor Cyan
 
-# 1. Stop python process on port 8000 and node/npm processes on port 5173
+# 1. Stop processes on port 8000 and 5173
 $ports = @(8000, 5173)
 foreach ($port in $ports) {
     $existingConn = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
@@ -18,4 +18,8 @@ foreach ($port in $ports) {
 # 2. Stop cloudflared
 Stop-Process -Name "cloudflared" -Force -ErrorAction SilentlyContinue
 
+# 3. Stop localtunnel node processes
+Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*localtunnel*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+
 Write-Host "Successfully stopped all hosting processes." -ForegroundColor Green
+

@@ -1,7 +1,14 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { floorLayers } from '../stores/floorLayers.svelte';
   import { model } from '../stores/structuralModel.svelte';
   import { uiState } from '../stores/uiState.svelte';
+
+  onMount(() => {
+    if (typeof window !== 'undefined') {
+      uiState.initPanels(window.innerWidth, window.innerHeight);
+    }
+  });
 
   function handleSetActive(layerId: string) {
     floorLayers.activeLayerId = layerId;

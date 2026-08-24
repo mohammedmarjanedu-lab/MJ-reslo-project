@@ -10,6 +10,8 @@
   import GraphViewer from './lib/components/GraphViewer.svelte';
   import ColumnPlacementPanel from './lib/components/ColumnPlacementPanel.svelte';
   import ExportDialog from './lib/components/ExportDialog.svelte';
+  import ParametricStudyDialog from './lib/components/ParametricStudyDialog.svelte';
+  import ParametricLivePanel from './lib/components/ParametricLivePanel.svelte';
   import FEMControlPanel from './lib/components/FEMControlPanel.svelte';
   import ThreeViewport from './lib/components/ThreeViewport.svelte';
   import ColorLegend from './lib/components/ColorLegend.svelte';
@@ -24,7 +26,8 @@
   import { graphStore } from './lib/stores/graphStore.svelte';
   import { floorLayers } from './lib/stores/floorLayers.svelte';
   import type { SlabFEMResult, SlabPolygon, ColumnElement, ShearWallElement, FEMWorkerInput, FEMWorkerOutput } from './lib/engine/types';
-  import { meshAndAnalyze, meshAndAnalyzeAllSlabs, healthCheck, setApiBase, PyApiError } from './lib/engine/pyApi';
+  import { meshAndAnalyze, meshAndAnalyzeAllSlabs, healthCheck, setApiBase, getApiBase, PyApiError } from './lib/engine/pyApi';
+  import { checkGeometryConnections } from './lib/engine/geometryChecker';
   import { computeScaleLabel } from './lib/engine/scaleCalibrator';
 
   let worker: Worker | null = null;
@@ -115,36 +118,30 @@
     return () => { perfProbeStop(); };
   });
 
-  const FALLBACK_LIVE_URL = 'http://127.0.0.1:8000';
+  const FALLBACK_LIVE_URL = (typeof window !== 'undefined' && window.location.protocol === 'https:') ? window.location.origin : 'http://127.0.0.1:8000';
   let isCheckingBackend = false;
 
-  function checkBackend(url: string) {
+  function checkBackend(url?: string) {
     if (isCheckingBackend) return;
     isCheckingBackend = true;
-    setApiBase(url);
+    const targetUrl = url || uiState.apiUrl || getApiBase() || FALLBACK_LIVE_URL;
+    if (targetUrl) setApiBase(targetUrl);
+
     healthCheck().then(ok => {
-      if (!ok && url !== FALLBACK_LIVE_URL) {
-        setApiBase(FALLBACK_LIVE_URL);
-        healthCheck().then(fallbackOk => {
-          isCheckingBackend = false;
-          if (fallbackOk) {
-            uiState.setApiUrl(FALLBACK_LIVE_URL);
-            uiState.backendConnected = true;
-            apiAvailable = true;
-            uiState.setStatusMessage('Python backend connected (Pure Python DKT Solver)');
-          } else {
-            uiState.backendConnected = false;
-            apiAvailable = false;
-          }
-        });
-        return;
-      }
       isCheckingBackend = false;
       uiState.backendConnected = ok;
+      femState.backendConnected = ok;
       apiAvailable = ok;
       if (ok) {
-        uiState.setStatusMessage('Python backend connected (Pure Python DKT Solver)');
+        uiState.setStatusMessage(`🟢 ${femState.solverName} Backend Connected`);
+      } else {
+        uiState.setStatusMessage(`🔴 Solver Backend Disconnected`);
       }
+    }).catch(() => {
+      isCheckingBackend = false;
+      uiState.backendConnected = false;
+      femState.backendConnected = false;
+      apiAvailable = false;
     });
   }
 
@@ -189,6 +186,46 @@
     }
   });
 
+  let lastSolvedFingerprint = $state<string>('');
+
+  $effect(() => {
+    if (!femState.hasResults && femState.slabResults.size === 0) {
+      lastSolvedFingerprint = '';
+    }
+  });
+
+  function computeModelFingerprint(): string {
+    const slabsStr = model.slabs.map(s =>
+      `${s.id}:${s.vertices.map(v => `${v.x.toFixed(3)},${v.y.toFixed(3)}`).join(';')}:${s.thickness}:${s.uniformLoad}:${s.crackingModifier}:${s.concreteGrade}`
+    ).join('|');
+
+    const wallsStr = model.walls.map(w =>
+      `${w.id}:${w.startPoint.x.toFixed(3)},${w.startPoint.y.toFixed(3)}->${w.endPoint.x.toFixed(3)},${w.endPoint.y.toFixed(3)}:${w.thickness}:${w.height}`
+    ).join('|');
+
+    const polyWallsStr = model.polylineWalls.map(pw =>
+      `${pw.id}:${pw.vertices.map(v => `${v.x.toFixed(3)},${v.y.toFixed(3)}`).join(';')}:${pw.thickness}:${pw.height}`
+    ).join('|');
+
+    const colsStr = model.columns.map(c =>
+      `${c.id}:${c.position.x.toFixed(3)},${c.position.y.toFixed(3)}:${c.width}:${c.depth}:${c.height}:${c.rotation}`
+    ).join('|');
+
+    const beamsStr = model.beams.map(b =>
+      `${b.id}:${b.startPoint.x.toFixed(3)},${b.startPoint.y.toFixed(3)}->${b.endPoint.x.toFixed(3)},${b.endPoint.y.toFixed(3)}:${b.width}:${b.depth}`
+    ).join('|');
+
+    const dropPanelsStr = model.dropPanels.map(dp =>
+      `${dp.id}:${dp.vertices.map(v => `${v.x.toFixed(3)},${v.y.toFixed(3)}`).join(';')}:${dp.drop}`
+    ).join('|');
+
+    const nonStructWallsStr = model.nonStructuralWalls.map(w =>
+      `${w.id}:${w.startPoint.x.toFixed(3)},${w.startPoint.y.toFixed(3)}->${w.endPoint.x.toFixed(3)},${w.endPoint.y.toFixed(3)}:${w.partitionUnitWeight}`
+    ).join('|');
+
+    return `${slabsStr}#${wallsStr}#${polyWallsStr}#${colsStr}#${beamsStr}#${dropPanelsStr}#${nonStructWallsStr}#ms:${uiState.femMeshSize}#dt:${uiState.deflectionType}#cm:${uiState.crackedModifierValue}`;
+  }
+
   $effect(() => {
     // Monitor deep properties to trigger debounced analysis on drags and edits
     model.columns.forEach(c => { c.position.x; c.position.y; c.width; c.depth; c.height; c.rotation; });
@@ -199,10 +236,28 @@
     model.dropPanels.forEach(dp => { dp.vertices.forEach(v => { v.x; v.y; }); dp.width; dp.depth; dp.drop; dp.rotation; });
     model.nonStructuralWalls.forEach(w => { w.startPoint.x; w.startPoint.y; w.endPoint.x; w.endPoint.y; w.thickness; w.height; w.partitionUnitWeight; });
     model.polylineNonStructuralWalls.forEach(pw => { pw.vertices.forEach(v => { v.x; v.y; }); pw.thickness; pw.height; pw.partitionUnitWeight; });
+    uiState.femMeshSize;
 
     if (femTimer) clearTimeout(femTimer);
+
+    // Suppress auto-triggering while loading/restoring a project
+    if (model.isRestoring) return;
+
     if (uiState.femAutoCompute && model.slabs.length > 0) {
-      femTimer = setTimeout(() => { triggerFEMAnalysis(); }, 400);
+      const currentFingerprint = computeModelFingerprint();
+      // Only schedule analysis if model geometry or parameters actually changed or no results exist
+      if (currentFingerprint !== lastSolvedFingerprint || !femState.hasResults) {
+        // Dynamic debounce based on canvas interaction and model scale
+        const totalSlabArea = model.slabs.reduce((acc, s) => {
+          if (s.vertices.length < 3) return acc;
+          const xs = s.vertices.map(v => v.x);
+          const ys = s.vertices.map(v => v.y);
+          return acc + (Math.max(...xs) - Math.min(...xs)) * (Math.max(...ys) - Math.min(...ys));
+        }, 0);
+        const isLargeModel = totalSlabArea > 400 || (model.columns.length + model.walls.length + model.beams.length) > 25;
+        const debounceMs = uiState.isCanvasInteracting ? 1500 : (isLargeModel ? 900 : 400);
+        femTimer = setTimeout(() => { triggerFEMAnalysis(); }, debounceMs);
+      }
     }
   });
 
@@ -296,9 +351,18 @@
     return new Set(model.slabs.filter(s => s.vertices.length >= 3).map(s => s.id));
   }
 
-  async function triggerFEMAnalysis(): Promise<void> {
+  async function triggerFEMAnalysis(force: boolean = false): Promise<void> {
     const validSlabs = model.slabs.filter((s: SlabPolygon) => s.vertices.length >= 3);
     if (validSlabs.length === 0) return;
+
+    const currentFingerprint = computeModelFingerprint();
+    if (!force && currentFingerprint === lastSolvedFingerprint && femState.hasResults) {
+      // Model unchanged and already solved: display results without re-running FEM
+      uiState.setShowFEMResults(true);
+      femState.showFEMContour = true;
+      return;
+    }
+
     const gen = ++femGen;
     const slabIdsAtStart = currentSlabIds();
 
@@ -323,7 +387,7 @@
     let meshSize = uiState.femMeshSize;
 
     // Adaptive Node/Mesh Guard: clamp mesh size based on slab area to prevent solver timeouts
-    const maxNodes = apiAvailable ? 5000 : 1000;
+    const maxNodes = apiAvailable ? 15000 : 3500;
     for (const slab of validSlabs) {
       if (slab.vertices.length >= 3) {
         const xs = slab.vertices.map(v => v.x);
@@ -339,52 +403,65 @@
       }
     }
 
-    // ── TypeScript In-Browser Web Worker Solver (Default / Kratos Independent) ──
-    if (uiState.solverEngine === 'ts_local' || !apiAvailable) {
+    // Always check PyNite backend health dynamically before solving
+    const isBackendReady = await healthCheck();
+    apiAvailable = isBackendReady;
+    femState.backendConnected = isBackendReady;
+    uiState.backendConnected = isBackendReady;
+
+    if (isBackendReady) {
+      uiState.solverEngine = 'python_backend';
+      femState.solverName = 'PyNite FEModel3D';
+    }
+
+    // ── Python PyNite FEModel3D Backend Solver (Primary) ──
+    if (isBackendReady) {
       try {
-        await runWorkerSolver(validSlabs, columns, allWalls, meshSize, gen, slabIdsAtStart);
+        await runBackendSolver(validSlabs, allWalls, columns, meshSize, gen, slabIdsAtStart, currentFingerprint);
         if (gen !== femGen) return;
         return;
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        femState.setError(`Solver failed: ${msg}`);
-        uiState.setStatusMessage(`Solver error: ${msg}`);
-        return;
+        console.warn(`[Reslo] PyNite backend attempt failed, falling back to Web Worker solver:`, e);
       }
     }
 
-    // ── Python DKT Backend Solver (Optional) ──
-    if (apiAvailable) {
-      try {
-        await meshAndAnalyzeBackend(validSlabs, allWalls, columns, meshSize, gen, slabIdsAtStart);
-        if (gen !== femGen) return;
-        return;
-      } catch (e) {
-        console.warn(`[Reslo] Python backend attempt failed, falling back to Web Worker solver:`, e);
-        try {
-          await runWorkerSolver(validSlabs, columns, allWalls, meshSize, gen, slabIdsAtStart);
-          if (gen !== femGen) return;
-        } catch (e2) {
-          const msg = e2 instanceof Error ? e2.message : String(e2);
-          femState.setError(`Solver failed: ${msg}`);
-          uiState.setStatusMessage(`Solver error: ${msg}`);
-        }
-      }
+    // ── TypeScript In-Browser Web Worker Solver (Fallback only) ──
+    try {
+      await runWorkerSolver(validSlabs, columns, allWalls, meshSize, gen, slabIdsAtStart, currentFingerprint);
+      if (gen !== femGen) return;
+      return;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      femState.setError(`Solver failed: ${msg}`);
+      uiState.setStatusMessage(`Solver error: ${msg}`);
+      return;
     }
   }
 
   // Non-blocking backend upgrade: refines results with Kratos Multiphysics (kratos_solver.py) when available/fast.
-  async function meshAndAnalyzeBackend(
+  async function runBackendSolver(
     validSlabs: SlabPolygon[], allWalls: ShearWallElement[], columns: ColumnElement[],
-    meshSize: number, gen: number, slabIdsAtStart: Set<string>
+    meshSize: number, gen: number, slabIdsAtStart: Set<string>, solvedFingerprint: string
   ): Promise<void> {
+    // Step 1: Pre-Analysis Geometry Connection Check (< 2ms)
+    femState.setProgress(0.05);
+    uiState.setStatusMessage('Checking geometry connections...');
+    const geoAudit = checkGeometryConnections(
+      validSlabs, columns, allWalls, model.polylineWalls, model.beams, model.dropPanels
+    );
+    femState.disconnectedIds = new Set(geoAudit.disconnectedIds);
+    if (geoAudit.warnings.length > 0) {
+      console.warn('[Reslo Geometry Audit]\n' + geoAudit.warnings.join('\n'));
+    }
+
+    // Step 2: FEM Mesh & Analysis Execution
     femState.setProgress(0.1);
     femState.refreshTimeout();
     const primarySlab = validSlabs[0];
-    const poissonRatio = (primarySlab?.concreteGrade === 'M30' || (primarySlab?.elasticModulus && primarySlab.elasticModulus > 26e6)) ? 0.16 : 0.2;
+    const poissonRatio = 0.2;
     const res = await meshAndAnalyzeAllSlabs(
       validSlabs, allWalls, columns, meshSize, poissonRatio, model.beams, model.dropPanels,
-      model.nonStructuralWalls, model.polylineNonStructuralWalls
+      model.nonStructuralWalls, model.polylineNonStructuralWalls, []
     );
     femState.setProgress(1);
     if (gen !== femGen) return; // a newer analysis superseded this one
@@ -393,17 +470,22 @@
       (slabIdsAtStart.has(r.slabId) || slabLabelsAtStart.has(r.slabId)) &&
       model.slabs.some(s => s.id === r.slabId || s.label === r.slabId)
     );
-    if (stillValid.length === 0) return;
+    if (stillValid.length === 0) throw new Error('No valid slab results returned from backend solver');
     femState.setResults(stillValid);
-    femState.warnings = res.warnings;
-    femState.disconnectedIds = new Set(res.disconnectedIds);
+    lastSolvedFingerprint = solvedFingerprint;
+
+    // Merge pre-analysis geometry warnings with backend warnings (non-blocking)
+    const combinedWarnings = Array.from(new Set([...geoAudit.warnings, ...res.warnings]));
+    femState.warnings = combinedWarnings;
+    femState.disconnectedIds = new Set([...geoAudit.disconnectedIds, ...res.disconnectedIds]);
+
     const elemCount = stillValid.reduce((s, r) => s + r.mesh.elements.length, 0);
-    uiState.setStatusMessage(`FEM (Kratos): ${stillValid.length} slab(s), ${elemCount} elements`);
-    memoryStore.pushSolve({ solver: 'kratos', slabCount: stillValid.length, elementCount: elemCount, durationMs: 0, success: true, warnings: res.warnings });
+    uiState.setStatusMessage(`FEM (PyNite FEModel3D): ${stillValid.length} slab(s), ${elemCount} elements`);
+    memoryStore.pushSolve({ solver: 'pynite', slabCount: stillValid.length, elementCount: elemCount, durationMs: 0, success: true, warnings: combinedWarnings });
   }
 
 
-  function runWorkerSolver(validSlabs: SlabPolygon[], columns: ColumnElement[], walls: ShearWallElement[], meshSize: number, gen: number, slabIdsAtStart: Set<string>): Promise<void> {
+  function runWorkerSolver(validSlabs: SlabPolygon[], columns: ColumnElement[], walls: ShearWallElement[], meshSize: number, gen: number, slabIdsAtStart: Set<string>, solvedFingerprint: string): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
         if (!worker) {
@@ -428,6 +510,7 @@
               return;
             }
             femState.setResults(results);
+            lastSolvedFingerprint = solvedFingerprint;
             const count = results.length;
             const elems = results.reduce((s, r) => s + r.mesh.elements.length, 0);
             uiState.setStatusMessage(`FEM (TS): ${count} slab(s), ${elems} elements`);
@@ -594,7 +677,12 @@
           title="Reset view zoom/pan"
         >Reset View</button>
         <button
-          onclick={() => { model.resetModel(); uiState.setStatusMessage('Model cleared'); }}
+          onclick={() => {
+            model.resetModel();
+            uiState.showParametricLivePanel = false;
+            uiState.showParametricStudyDialog = false;
+            uiState.setStatusMessage('Model cleared');
+          }}
           class="flex-1 rounded bg-[#1a1a1a] py-1 text-[9px] text-[#ffffff] hover:bg-[#D62430] transition-colors cursor-pointer"
           title="Clear all elements"
         >Clear All</button>
@@ -671,25 +759,38 @@
   </div>
 
   {#if uiState.viewMode === '3d'}
+    {@const isLight = uiState.theme === 'light'}
     <div class="flex flex-1 flex-col min-w-0">
-      <div class="relative flex-1 min-h-0 overflow-hidden rounded bg-[#1a1a1a]">
+      <div class="relative flex-1 min-h-0 overflow-hidden rounded transition-colors {isLight ? 'bg-[#f0f2f5]' : 'bg-[#1a1a1a]'}">
         <ThreeViewport />
         <!-- 3D View Controls Overlay -->
         <div class="absolute top-3 left-3 z-20 flex flex-col gap-2">
-          <div class="flex gap-1 p-1.5 rounded-lg border border-[#333333] bg-[#141414]/90 backdrop-blur-md">
+          <div class="flex gap-1 items-center p-1.5 rounded-lg border backdrop-blur-md transition-colors {isLight ? 'border-slate-300 bg-white/90 text-slate-800 shadow-md' : 'border-slate-700/60 bg-slate-900/90 text-slate-200 shadow-xl'}">
             {#each [['top','Top'],['iso','Iso'],['front','Front'],['side','Side']] as [preset,label]}
-              <button class="px-2 py-1 text-[10px] rounded {uiState.viewPreset === preset ? 'bg-[#D62430] text-white' : 'bg-[#2b2b2b] text-[#ccc] hover:bg-[#3a3a3a]'}" onclick={() => uiState.viewPreset = preset as any}>{label}</button>
+              <button
+                class="px-2 py-1 text-[10px] font-medium rounded transition-colors cursor-pointer {uiState.viewPreset === preset ? 'bg-[#D62430] text-white font-bold' : isLight ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-slate-700/70 text-slate-200 hover:bg-slate-600'}"
+                onclick={() => uiState.viewPreset = preset as any}
+              >{label}</button>
             {/each}
+            <div class="h-3 w-px mx-0.5 {isLight ? 'bg-slate-300' : 'bg-slate-700/80'}"></div>
+            <button
+              class="px-2 py-1 text-[10px] font-semibold rounded transition-colors cursor-pointer flex items-center gap-1 border {uiState.showGrid3D ? 'bg-[#D62430] text-white border-[#D62430]' : isLight ? 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200' : 'bg-slate-700/70 text-slate-200 border-slate-600 hover:bg-slate-600'}"
+              onclick={() => uiState.showGrid3D = !uiState.showGrid3D}
+              title="Toggle 3D Grid visibility"
+            >
+              <span>Grid</span>
+              <span class="text-[9px] uppercase opacity-90">{uiState.showGrid3D ? 'ON' : 'OFF'}</span>
+            </button>
           </div>
-          <div class="flex flex-col gap-1 p-1.5 rounded-lg border border-[#333333] bg-[#141414]/90 backdrop-blur-md text-[10px] text-[#ccc]">
-            <label class="flex items-center gap-1.5 cursor-pointer">
+          <div class="flex items-center justify-between gap-3 p-1.5 rounded-lg border backdrop-blur-md text-[10px] transition-colors {isLight ? 'border-slate-300 bg-white/90 text-slate-800 shadow-md' : 'border-slate-700/60 bg-slate-900/90 text-slate-200 shadow-xl'}">
+            <label class="flex items-center gap-1.5 cursor-pointer select-none">
               <input type="checkbox" bind:checked={uiState.femAnimationEnabled} class="accent-[#D62430]" /> Animate
             </label>
           </div>
-          <div class="flex items-center gap-1.5 p-1.5 rounded-lg border border-[#333333] bg-[#141414]/90 backdrop-blur-md text-[10px] text-[#ccc]">
-            <span>Def. scale</span>
-            <input type="range" min="5" max="300" bind:value={femState.deformedScale} class="w-20 accent-[#D62430]" />
-            <span class="font-mono text-[#fff]">{femState.deformedScale}×</span>
+          <div class="flex items-center gap-1.5 p-1.5 rounded-lg border backdrop-blur-md text-[10px] transition-colors {isLight ? 'border-slate-300 bg-white/90 text-slate-800 shadow-md' : 'border-slate-700/60 bg-slate-900/90 text-slate-200 shadow-xl'}">
+            <span class={isLight ? 'text-slate-600 font-medium' : 'text-slate-300'}>Def. scale</span>
+            <input type="range" min="5" max="300" bind:value={femState.deformedScale} class="w-20 accent-[#D62430] cursor-pointer" />
+            <span class="font-mono font-bold {isLight ? 'text-slate-900' : 'text-white'}">{femState.deformedScale}×</span>
           </div>
         </div>
         {#if femState.showFEMContour}
@@ -701,12 +802,12 @@
           />
         {/if}
       </div>
-      <div class="flex items-center justify-between px-4 py-1.5 bg-[#1a1a1a] border-t border-[#333333] text-[11px] text-[#ffffff]">
+      <div class="flex items-center justify-between px-4 py-1.5 border-t text-[11px] transition-colors {isLight ? 'bg-white border-slate-200 text-slate-800' : 'bg-[#1a1a1a] border-[#333333] text-[#ffffff]'}">
         <span>{uiState.statusMessage}</span>
         <span class="flex items-center gap-3 font-mono">
-          <span class="text-[#D62430]">3D View</span>
+          <span class="text-[#D62430] font-bold">3D View</span>
           {#if femState.hasResults}
-            <span>Max defl: <span class="text-[#D62430]">{Math.max(Math.abs(femState.globalMinWz), Math.abs(femState.globalMaxWz)).toFixed(2)} mm</span></span>
+            <span>Max defl: <span class="text-[#D62430] font-bold">{Math.max(Math.abs(femState.globalMinWz), Math.abs(femState.globalMaxWz)).toFixed(2)} mm</span></span>
           {/if}
         </span>
       </div>
@@ -714,99 +815,6 @@
   {:else}
     <div class="flex flex-1 flex-col relative">
       <WorkspaceCanvas />
-
-      <!-- Deflection Settings POP-UP overlay next to the top left of the grid (when Live is ON) -->
-      {#if uiState.femAutoCompute && uiState.viewMode === '2d'}
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div
-          class="deflection-settings-panel absolute left-[236px] top-3 pointer-events-auto z-10 rounded-lg bg-slate-800/95 p-3 border border-slate-700 text-xs font-mono w-[220px] shadow-lg flex flex-col gap-2.5 cursor-move select-none"
-          style={deflectionPosX !== null && deflectionPosY !== null ? `left: ${deflectionPosX}px; top: ${deflectionPosY}px; position: fixed; transform: none;` : ''}
-          onmousedown={handleDeflectionDragStart}
-        >
-          <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Deflection Settings</div>
-          
-          <div class="flex flex-col gap-2">
-            <label class="flex items-center gap-2 text-slate-200 cursor-pointer select-none">
-              <input
-                type="radio"
-                name="deflectionType"
-                value="uncracked"
-                checked={uiState.deflectionType === 'uncracked'}
-                onchange={() => { uiState.deflectionType = 'uncracked'; }}
-                class="accent-[#D62430]"
-              />
-              <span>Uncracked Deflection</span>
-            </label>
-            
-            <label class="flex items-center gap-2 text-slate-200 cursor-pointer select-none">
-              <input
-                type="radio"
-                name="deflectionType"
-                value="cracked"
-                checked={uiState.deflectionType === 'cracked'}
-                onchange={() => { uiState.deflectionType = 'cracked'; }}
-                class="accent-[#D62430]"
-              />
-              <span>Cracked Deflection</span>
-            </label>
-          </div>
-
-          {#if uiState.deflectionType === 'cracked'}
-            <div class="flex flex-col gap-1.5 border-t border-slate-700/50 pt-2">
-              <div class="flex items-center justify-between text-[10px] text-slate-400">
-                <span>Crack Modifier:</span>
-                <span class="font-bold text-indigo-400 font-mono">{uiState.crackedModifierValue.toFixed(2)}</span>
-              </div>
-              <div class="flex gap-1">
-                <button
-                  class="flex-1 py-0.5 rounded text-[9px] font-semibold transition-colors border cursor-pointer text-center {uiState.crackedModifierValue === 0.25 ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700'}"
-                  onclick={() => { uiState.crackedModifierValue = 0.25; }}
-                >0.25</button>
-                <button
-                  class="flex-1 py-0.5 rounded text-[9px] font-semibold transition-colors border cursor-pointer text-center {uiState.crackedModifierValue === 0.50 ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700'}"
-                  onclick={() => { uiState.crackedModifierValue = 0.50; }}
-                >0.50</button>
-              </div>
-              <div class="flex items-center gap-1.5 mt-0.5">
-                <input
-                  type="range"
-                  min="0.10"
-                  max="0.90"
-                  step="0.05"
-                  bind:value={uiState.crackedModifierValue}
-                  class="w-full accent-indigo-500 cursor-pointer h-1 bg-slate-700 rounded-lg appearance-none"
-                />
-              </div>
-            </div>
-          {:else}
-            <div class="text-[9px] text-slate-500 border-t border-slate-700/50 pt-2">
-              Effective inertia is uncracked (I = Ig, modifier = 1.0).
-            </div>
-          {/if}
-        </div>
-      {/if}
-
-      {#if femState.hasResults}
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div
-          class="display-toolbar absolute bottom-[80px] left-1/2 -translate-x-1/2 z-20 pointer-events-auto flex items-center gap-1.5 p-1.5 rounded-lg border border-[#2b2b2b] bg-[#141414]/90 backdrop-blur-md shadow-2xl cursor-move select-none"
-          style={displayPosX !== null && displayPosY !== null ? `left: ${displayPosX}px; top: ${displayPosY}px; bottom: auto; transform: none; position: fixed;` : ''}
-          onmousedown={handleDisplayDragStart}
-        >
-          <button
-            class="px-3 py-1.5 rounded text-[10px] uppercase font-bold tracking-wider transition-all duration-200 cursor-pointer text-center border border-transparent
-              {femState.showFEMContour
-                ? 'bg-[#D62430] text-white shadow-[0_0_8px_rgba(214,36,48,0.4)] border-[#D62430]'
-                : 'bg-[#1e1e1e]/85 text-[#b3b3b3] border-[#2b2b2b] hover:bg-[#333333] hover:text-white'}"
-            onclick={() => {
-              femState.resultType = 'deflection';
-              femState.showFEMContour = !femState.showFEMContour;
-            }}
-          >
-            Deflection (mm)
-          </button>
-        </div>
-      {/if}
 
       <div class="flex items-center justify-between px-4 py-1.5 bg-[#1a1a1a] border-t border-[#333333] text-[11px] text-[#ffffff] z-10">
         <span>{uiState.statusMessage}</span>
@@ -837,9 +845,74 @@
 
   <div class="absolute right-3 top-3 flex flex-col gap-3 pointer-events-none z-10">
     <div class="pointer-events-auto"><MetricsHUD /></div>
-    {#if femState.hasResults && uiState.viewMode === '2d'}
-      <div class="pointer-events-auto w-80 max-h-[60vh] overflow-hidden rounded-lg border border-[#333333] bg-[#141414]/95 backdrop-blur-md shadow-xl">
-        <ResultsTable />
+
+    {#if uiState.femAutoCompute && uiState.viewMode === '2d'}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="deflection-settings-panel pointer-events-auto rounded-lg bg-slate-800/95 p-3 border border-slate-700 text-xs font-mono w-[220px] shadow-lg flex flex-col gap-2.5 cursor-move select-none"
+        style={deflectionPosX !== null && deflectionPosY !== null ? `left: ${deflectionPosX}px; top: ${deflectionPosY}px; position: fixed; transform: none; z-index: 50;` : ''}
+        onmousedown={handleDeflectionDragStart}
+      >
+        <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Deflection Settings</div>
+        
+        <div class="flex flex-col gap-2">
+          <label class="flex items-center gap-2 text-slate-200 cursor-pointer select-none">
+            <input
+              type="radio"
+              name="deflectionType"
+              value="uncracked"
+              checked={uiState.deflectionType === 'uncracked'}
+              onchange={() => { uiState.deflectionType = 'uncracked'; }}
+              class="accent-[#D62430]"
+            />
+            <span>Uncracked Deflection</span>
+          </label>
+          
+          <label class="flex items-center gap-2 text-slate-200 cursor-pointer select-none">
+            <input
+              type="radio"
+              name="deflectionType"
+              value="cracked"
+              checked={uiState.deflectionType === 'cracked'}
+              onchange={() => { uiState.deflectionType = 'cracked'; }}
+              class="accent-[#D62430]"
+            />
+            <span>Cracked Deflection</span>
+          </label>
+        </div>
+
+        {#if uiState.deflectionType === 'cracked'}
+          <div class="flex flex-col gap-1.5 border-t border-slate-700/50 pt-2">
+            <div class="flex items-center justify-between text-[10px] text-slate-400">
+              <span>Crack Modifier:</span>
+              <span class="font-bold text-indigo-400 font-mono">{uiState.crackedModifierValue.toFixed(2)}</span>
+            </div>
+            <div class="flex gap-1">
+              <button
+                class="flex-1 py-0.5 rounded text-[9px] font-semibold transition-colors border cursor-pointer text-center {uiState.crackedModifierValue === 0.25 ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700'}"
+                onclick={() => { uiState.crackedModifierValue = 0.25; }}
+              >0.25</button>
+              <button
+                class="flex-1 py-0.5 rounded text-[9px] font-semibold transition-colors border cursor-pointer text-center {uiState.crackedModifierValue === 0.50 ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700'}"
+                onclick={() => { uiState.crackedModifierValue = 0.50; }}
+              >0.50</button>
+            </div>
+            <div class="flex items-center gap-1.5 mt-0.5">
+              <input
+                type="range"
+                min="0.10"
+                max="0.90"
+                step="0.05"
+                bind:value={uiState.crackedModifierValue}
+                class="w-full accent-indigo-500 cursor-pointer h-1 bg-slate-700 rounded-lg appearance-none"
+              />
+            </div>
+          </div>
+        {:else}
+          <div class="text-[9px] text-slate-500 border-t border-slate-700/50 pt-2">
+            Effective inertia is uncracked (I = Ig, modifier = 1.0).
+          </div>
+        {/if}
       </div>
     {/if}
   </div>
@@ -860,6 +933,27 @@
       >3D</button>
     </div>
 
+    {#if femState.hasResults}
+      <div class="pointer-events-auto flex rounded-lg overflow-hidden border border-[#333333] shadow-lg">
+        <button
+          class="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider transition-all duration-200 cursor-pointer text-center
+            {femState.showFEMContour && femState.resultType === 'deflection'
+              ? 'bg-[#D62430] text-white'
+              : 'bg-[#1a1a1a] text-[#ffffff] hover:bg-[#333333]'}"
+          onclick={() => {
+            if (femState.resultType === 'deflection') {
+              femState.showFEMContour = !femState.showFEMContour;
+            } else {
+              femState.resultType = 'deflection';
+              femState.showFEMContour = true;
+            }
+          }}
+        >
+          Deflection (mm)
+        </button>
+      </div>
+    {/if}
+
     {#if uiState.viewMode === '3d' && model.planImage}
       <div class="pointer-events-auto flex rounded-lg overflow-hidden border border-[#333333] shadow-lg">
         <button
@@ -874,7 +968,13 @@
 </div>
 
 <svelte:window 
-  onkeydown={(e) => { if (e.key === 'Escape' && uiState.showExportDialog) uiState.showExportDialog = false; if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); model.saveToFile(); } }} 
+  onkeydown={(e) => { 
+    if (e.key === 'Escape') {
+      if (uiState.showExportDialog) uiState.showExportDialog = false;
+      if (uiState.showParametricStudyDialog) uiState.showParametricStudyDialog = false;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); model.saveToFile(); } 
+  }} 
   onresize={handleResize}
 />
 
@@ -917,6 +1017,14 @@
 
 {#if uiState.showExportDialog}
   <ExportDialog />
+{/if}
+
+{#if uiState.showParametricStudyDialog}
+  <ParametricStudyDialog />
+{/if}
+
+{#if uiState.showParametricLivePanel}
+  <ParametricLivePanel />
 {/if}
 
 {#if femState.isComputing}

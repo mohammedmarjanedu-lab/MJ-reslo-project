@@ -1,6 +1,7 @@
 <script lang="ts">
   import { model } from '../stores/structuralModel.svelte';
   import { uiState } from '../stores/uiState.svelte';
+  import type { BoundaryCondition } from '../engine/types';
   import { computeColumnStiffness, computeShearWallStiffness, computePolylineWallStiffness, polygonSignedArea } from '../engine/mathEngine';
 
   let selectedColumn = $derived(uiState.selectedElementType === 'column' && uiState.selectedElementId ? model.columns.find(c => c.id === uiState.selectedElementId) ?? null : null);
@@ -19,6 +20,8 @@
   let selectedColumns = $derived(model.columns.filter(c => uiState.selectedElementIds.includes(c.id)));
   let selectedWalls = $derived(model.walls.filter(w => uiState.selectedElementIds.includes(w.id)));
   let selectedPolylineWalls = $derived(model.polylineWalls.filter(pw => uiState.selectedElementIds.includes(pw.id)));
+  let selectedNonStructuralWalls = $derived(model.nonStructuralWalls.filter(w => uiState.selectedElementIds.includes(w.id)));
+  let selectedPolylineNonStructuralWalls = $derived(model.polylineNonStructuralWalls.filter(pw => uiState.selectedElementIds.includes(pw.id)));
   let selectedBeams = $derived(model.beams.filter(b => uiState.selectedElementIds.includes(b.id)));
   let selectedSlabs = $derived(model.slabs.filter(s => uiState.selectedElementIds.includes(s.id)));
   let selectedDropPanels = $derived(model.dropPanels.filter(dp => uiState.selectedElementIds.includes(dp.id)));
@@ -226,18 +229,41 @@
                   </select>
                 </div>
               </div>
-              <div>
-                <label class="block text-slate-500 mb-0.5 text-[10px]">Uniform Load (kN/m²)</label>
-                <input type="number" step="0.5" placeholder="Keep original"
-                  onchange={(e) => {
-                    const v = parseFloat(e.currentTarget.value);
-                    if (!isNaN(v)) {
-                      model.beginAction();
-                      for (const s of selectedSlabs) model.updateSlab(s.id, { uniformLoad: v });
-                      uiState.setStatusMessage(`Updated uniform load to ${v} kN/m² for ${selectedSlabs.length} slabs`);
-                    }
-                  }}
-                  class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-blue-500 focus:outline-none" />
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Superimposed DL (kN/m²)</label>
+                  <input type="number" step="0.5" min="0" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (!isNaN(v)) {
+                        model.beginAction();
+                        for (const s of selectedSlabs) {
+                          const newSdl = Math.max(0, v);
+                          const ll = s.liveLoad ?? (s.uniformLoad - (s.deadLoad ?? 0));
+                          model.updateSlab(s.id, { deadLoad: newSdl, liveLoad: ll, uniformLoad: newSdl + ll });
+                        }
+                        uiState.setStatusMessage(`Updated Superimposed DL to ${v} kN/m² for ${selectedSlabs.length} slabs`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-blue-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Live Load LL (kN/m²)</label>
+                  <input type="number" step="0.5" min="0" placeholder="Keep original"
+                    onchange={(e) => {
+                      const v = parseFloat(e.currentTarget.value);
+                      if (!isNaN(v)) {
+                        model.beginAction();
+                        for (const s of selectedSlabs) {
+                          const newLl = Math.max(0, v);
+                          const sdl = s.deadLoad ?? 0;
+                          model.updateSlab(s.id, { liveLoad: newLl, deadLoad: sdl, uniformLoad: sdl + newLl });
+                        }
+                        uiState.setStatusMessage(`Updated Live Load to ${v} kN/m² for ${selectedSlabs.length} slabs`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-blue-500 focus:outline-none" />
+                </div>
               </div>
             </div>
           {/if}
@@ -488,31 +514,54 @@
                     class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-purple-500 focus:outline-none" />
                 </div>
               </div>
-              <div>
-                <label class="block text-slate-500 mb-0.5 text-[10px]">Concrete Grade</label>
-                <select
-                  onchange={(e) => {
-                    const g = e.currentTarget.value;
-                    if (g) {
-                      model.beginAction();
-                      for (const w of selectedWalls) model.updateWall(w.id, { concreteGrade: g });
-                      for (const pw of selectedPolylineWalls) model.updatePolylineWall(pw.id, { concreteGrade: g });
-                      uiState.setStatusMessage(`Updated concrete grade to ${g} for selected walls`);
-                    }
-                  }}
-                  class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-purple-500 focus:outline-none"
-                >
-                  <option value="">Keep original</option>
-                  <option value="M20">M20</option>
-                  <option value="M25">M25</option>
-                  <option value="M30">M30</option>
-                  <option value="M35">M35</option>
-                  <option value="M40">M40</option>
-                  <option value="M45">M45</option>
-                  <option value="M50">M50</option>
-                  <option value="M55">M55</option>
-                  <option value="M60">M60</option>
-                </select>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Concrete Grade</label>
+                  <select
+                    onchange={(e) => {
+                      const g = e.currentTarget.value;
+                      if (g) {
+                        model.beginAction();
+                        for (const w of selectedWalls) model.updateWall(w.id, { concreteGrade: g });
+                        for (const pw of selectedPolylineWalls) model.updatePolylineWall(pw.id, { concreteGrade: g });
+                        uiState.setStatusMessage(`Updated concrete grade to ${g} for selected walls`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-purple-500 focus:outline-none"
+                  >
+                    <option value="">Keep original</option>
+                    <option value="M20">M20</option>
+                    <option value="M25">M25</option>
+                    <option value="M30">M30</option>
+                    <option value="M35">M35</option>
+                    <option value="M40">M40</option>
+                    <option value="M45">M45</option>
+                    <option value="M50">M50</option>
+                    <option value="M55">M55</option>
+                    <option value="M60">M60</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-slate-500 mb-0.5 text-[10px]">Wall Fixity</label>
+                  <select
+                    onchange={(e) => {
+                      const bc = e.currentTarget.value as BoundaryCondition;
+                      if (bc) {
+                        model.beginAction();
+                        for (const w of selectedWalls) model.updateWall(w.id, { boundaryCondition: bc });
+                        for (const pw of selectedPolylineWalls) model.updatePolylineWall(pw.id, { boundaryCondition: bc });
+                        uiState.setStatusMessage(`Updated wall fixity to ${bc} for selected walls`);
+                      }
+                    }}
+                    class="w-full rounded bg-slate-700/80 px-2 py-1 text-white border border-slate-600 focus:border-purple-500 focus:outline-none"
+                  >
+                    <option value="">Keep original</option>
+                    <option value="fixed-fixed">Fixed-Fixed (Continuous / Fixed Base)</option>
+                    <option value="fixed-pinned">Fixed-Pinned (Standard Base / Pin Base)</option>
+                    <option value="simply-supported">Simply-Supported (Pinned / Line Support)</option>
+                    <option value="fixed-free">Fixed-Free (Cantilever)</option>
+                  </select>
+                </div>
               </div>
             </div>
           {/if}
@@ -805,15 +854,17 @@
           </div>
         </div>
         <div>
-          <label class="block text-slate-500 mb-0.5">Boundary Condition</label>
+          <label class="block text-slate-500 mb-0.5">Wall Fixity</label>
           <select
-            value={wall.boundaryCondition || 'fixed-free'}
+            value={wall.boundaryCondition || 'fixed-fixed'}
             onfocus={beginEdit}
-            onchange={(e) => model.updateWall(wall.id, { boundaryCondition: e.currentTarget.value as 'fixed-fixed' | 'fixed-free' })}
+            onchange={(e) => model.updateWall(wall.id, { boundaryCondition: e.currentTarget.value as BoundaryCondition })}
             class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600"
           >
-            <option value="fixed-free">Fixed-Free (3EI/H³)</option>
-            <option value="fixed-fixed">Fixed-Fixed (12EI/H³)</option>
+            <option value="fixed-fixed">Fixed-Fixed (Continuous / Fixed Base)</option>
+            <option value="fixed-pinned">Fixed-Pinned (Standard Base / Pin Base)</option>
+            <option value="simply-supported">Simply-Supported (Pinned / Line Support)</option>
+            <option value="fixed-free">Fixed-Free (Cantilever)</option>
           </select>
         </div>
         <div class="grid grid-cols-2 gap-2">
@@ -945,15 +996,17 @@
           </div>
         </div>
         <div>
-          <label class="block text-slate-500 mb-0.5">Boundary Condition</label>
+          <label class="block text-slate-500 mb-0.5">Wall Fixity</label>
           <select
-            value={pwall.boundaryCondition || 'fixed-free'}
+            value={pwall.boundaryCondition || 'fixed-fixed'}
             onfocus={beginEdit}
-            onchange={(e) => model.updatePolylineWall(pwall.id, { boundaryCondition: e.currentTarget.value as 'fixed-fixed' | 'fixed-free' })}
+            onchange={(e) => model.updatePolylineWall(pwall.id, { boundaryCondition: e.currentTarget.value as BoundaryCondition })}
             class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600"
           >
-            <option value="fixed-free">Fixed-Free (3EI/H³)</option>
-            <option value="fixed-fixed">Fixed-Fixed (12EI/H³)</option>
+            <option value="fixed-fixed">Fixed-Fixed (Continuous / Fixed Base)</option>
+            <option value="fixed-pinned">Fixed-Pinned (Standard Base / Pin Base)</option>
+            <option value="simply-supported">Simply-Supported (Pinned / Line Support)</option>
+            <option value="fixed-free">Fixed-Free (Cantilever)</option>
           </select>
         </div>
         <div class="grid grid-cols-2 gap-2">
@@ -1154,6 +1207,7 @@
               <div class="text-white font-mono">{slabArea.toFixed(2)}</div>
             </div>
           </div>
+
           <div class="grid grid-cols-2 gap-2">
             <div>
               <label class="block text-slate-500 mb-0.5">Thickness (m)</label>
@@ -1163,42 +1217,61 @@
                 class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600" />
             </div>
             <div>
-              <label class="block text-slate-500 mb-0.5">Live Load (kN/m²)</label>
-              <input type="number" step="0.5" value={slab.uniformLoad}
+              <label class="block text-slate-500 mb-0.5">Grade</label>
+              <select
+                value={slab.concreteGrade || model.concreteGrade}
                 onfocus={beginEdit}
-              oninput={(e) => { const v = parseNum(e.currentTarget.value); if (v !== null) model.updateSlab(slab.id, { uniformLoad: v }); }}
-              class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600" />
-          </div>
-          <div>
-              <label class="block text-slate-500 mb-0.5">SuperImposed Dead Load (kN/m²)</label>
-              <input type="number" step="0.5" min="0" value={slab.partitionLoad ?? 0}
-                onfocus={beginEdit}
-              oninput={(e) => { const v = parseNum(e.currentTarget.value); if (v !== null) model.updateSlab(slab.id, { partitionLoad: Math.max(0, v) }); }}
-              class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600" />
-          </div>
-        </div>
-        <div class="grid grid-cols-2 gap-2">
-          <div>
-            <label class="block text-slate-500 mb-0.5">Grade</label>
-            <select
-              value={slab.concreteGrade || model.concreteGrade}
-              onfocus={beginEdit}
-              onchange={(e) => model.updateSlab(slab.id, { concreteGrade: e.currentTarget.value })}
-              class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600"
-            >
-              <option value="M20">M20</option>
-              <option value="M25">M25</option>
-              <option value="M30">M30</option>
-              <option value="M35">M35</option>
-              <option value="M40">M40</option>
-              <option value="M45">M45</option>
-              <option value="M50">M50</option>
-              <option value="M55">M55</option>
-              <option value="M60">M60</option>
-            </select>
+                onchange={(e) => model.updateSlab(slab.id, { concreteGrade: e.currentTarget.value })}
+                class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600"
+              >
+                <option value="M20">M20</option>
+                <option value="M25">M25</option>
+                <option value="M30">M30</option>
+                <option value="M35">M35</option>
+                <option value="M40">M40</option>
+                <option value="M45">M45</option>
+                <option value="M50">M50</option>
+                <option value="M55">M55</option>
+                <option value="M60">M60</option>
+              </select>
+            </div>
           </div>
 
-        </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-slate-500 mb-0.5">SuperImposed Dead Load (kN/m²)</label>
+              <input type="number" step="0.5" min="0" value={slab.deadLoad ?? 0}
+                onfocus={beginEdit}
+                oninput={(e) => {
+                  const v = parseNum(e.currentTarget.value);
+                  if (v !== null) {
+                    const newSdl = Math.max(0, v);
+                    const currentLl = slab.liveLoad ?? (slab.uniformLoad - (slab.deadLoad ?? 0));
+                    model.updateSlab(slab.id, { deadLoad: newSdl, liveLoad: currentLl, uniformLoad: newSdl + currentLl });
+                  }
+                }}
+                class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600" />
+            </div>
+            <div>
+              <label class="block text-slate-500 mb-0.5">Live Load LL (kN/m²)</label>
+              <input type="number" step="0.5" min="0" value={slab.liveLoad ?? (slab.uniformLoad - (slab.deadLoad ?? 0))}
+                onfocus={beginEdit}
+                oninput={(e) => {
+                  const v = parseNum(e.currentTarget.value);
+                  if (v !== null) {
+                    const newLl = Math.max(0, v);
+                    const currentSdl = slab.deadLoad ?? 0;
+                    model.updateSlab(slab.id, { liveLoad: newLl, deadLoad: currentSdl, uniformLoad: currentSdl + newLl });
+                  }
+                }}
+                class="w-full rounded bg-slate-700 px-2 py-1 text-white border border-slate-600" />
+            </div>
+          </div>
+
+          <div class="text-[10px] text-slate-400 bg-slate-800/80 px-2 py-1 rounded border border-slate-700/50 flex justify-between items-center">
+            <span>Total Applied Surface Load (SDL + LL):</span>
+            <span class="font-mono font-bold text-sky-400">{((slab.deadLoad ?? 0) + (slab.liveLoad ?? (slab.uniformLoad - (slab.deadLoad ?? 0)))).toFixed(2)} kN/m²</span>
+          </div>
         <div>
           <label class="block text-slate-500 mb-0.5">Vertex Coordinates</label>
             <div class="max-h-32 overflow-y-auto space-y-1">
@@ -1223,7 +1296,7 @@
             </div>
           </div>
           <button
-            onclick={() => uiState.setTool('slab')}
+            onclick={() => uiState.setTool('opening')}
             class="w-full rounded bg-indigo-700 py-1.5 text-xs text-indigo-200 hover:bg-indigo-600 transition-colors mt-2"
           >Add Opening (trace on slab)</button>
         </div>

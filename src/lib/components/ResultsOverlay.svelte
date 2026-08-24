@@ -5,7 +5,13 @@
 
 {#if uiState.showFEMResults && (femState.hasResults || femState.isComputing || femState.error)}
   <div class="rounded-lg bg-slate-800/95 p-3 border border-slate-700 text-xs shadow-lg">
-    <div class="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-2">FEM Results</div>
+    <div class="flex items-center justify-between gap-2 mb-2">
+      <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">FEM Results</div>
+      <div class="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium {femState.backendConnected ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-600/40' : 'bg-amber-950/80 text-amber-300 border border-amber-600/40'}">
+        <span class="h-2 w-2 rounded-full {femState.backendConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}"></span>
+        <span>{femState.backendConnected ? 'PyNite FEModel3D Active' : 'Web Worker Fallback'}</span>
+      </div>
+    </div>
 
     {#if femState.isComputing}
       <div class="space-y-2">

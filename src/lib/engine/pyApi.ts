@@ -2,12 +2,23 @@ import { generateSlabMesh } from './meshGenerator';
 import { pointInPolygon } from './mathEngine';
 
 function getInitialApiBase(): string {
-  if (typeof window !== 'undefined') {
+  if (typeof window !== 'undefined' && window.location) {
     try {
       const params = new URLSearchParams(window.location.search);
-      const apiParam = params.get('api');
+      const apiParam = params.get('api') || params.get('apiUrl');
       if (apiParam) return apiParam.replace(/\/$/, '');
       if ((window as any).__RESLO_API__) return (window as any).__RESLO_API__;
+
+      const saved = localStorage.getItem('reslo_api_url');
+      if (saved && saved.startsWith('http')) {
+        if (!(window.location.protocol === 'https:' && saved.startsWith('http://'))) {
+          return saved.replace(/\/$/, '');
+        }
+      }
+
+      if (window.location.origin && !window.location.origin.includes(':5173')) {
+        return window.location.origin.replace(/\/$/, '');
+      }
     } catch (_) {}
   }
   if (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) {
@@ -18,62 +29,126 @@ function getInitialApiBase(): string {
 
 let API_BASE = getInitialApiBase();
 
-function tsMeshToPyMesh(tsMesh: import('./types').FEMMesh): PyMesh {
-  return {
-    nodeCount: tsMesh.nodes.length,
-    elementCount: tsMesh.elements.length,
-    nodes: tsMesh.nodes.map(n => ({ id: n.id, x: n.x, y: n.y })),
-    elements: tsMesh.elements.map(e => ({ id: e.id, nodeIds: e.nodeIds, area: e.area })),
-    minAngle: 30,
-    maxAspectRatio: 1.5,
-    meshQuality: 'good',
-    unconnectedNodeIds: tsMesh.unconnectedNodeIds
-  };
+function isNgrokUrl(url: string): boolean {
+  return url ? url.includes('ngrok') : false;
 }
 
-export function setApiBase(url: string) { API_BASE = url; }
+export function setApiBase(url: string) {
+  if (!url) return;
+  API_BASE = url.replace(/localhost:8000/g, '127.0.0.1:8000').replace(/\/$/, '');
+}
 export function getApiBase() { return API_BASE; }
 
-function isNgrokUrl(url: string) { return url.includes('ngrok'); }
+import { femState } from '../stores/femResults.svelte';
+import { uiState } from '../stores/uiState.svelte';
 
-async function fetchApi(url: string, init?: RequestInit): Promise<Response> {
+export async function healthCheck(): Promise<boolean> {
+  const candidates: string[] = [];
+  if (API_BASE) candidates.push(API_BASE);
+  if (typeof window !== 'undefined' && window.location.origin && !candidates.includes(window.location.origin)) {
+    candidates.push(window.location.origin);
+  }
+  if (typeof window === 'undefined' || window.location.protocol !== 'https:') {
+    if (!candidates.includes('http://127.0.0.1:8000')) candidates.push('http://127.0.0.1:8000');
+    if (!candidates.includes('http://localhost:8000')) candidates.push('http://localhost:8000');
+  }
+
+  for (const url of candidates) {
+    if (!url) continue;
+    try {
+      const cleanUrl = url.replace(/\/$/, '');
+      const res = await fetch(`${cleanUrl}/api/health`, {
+        method: 'GET',
+        headers: { 'Bypass-Tunnel-Reminder': 'true', 'ngrok-skip-browser-warning': 'true' }
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        API_BASE = cleanUrl;
+        const solverLabel = data?.solver || 'PyNite FEModel3D';
+        femState.solverName = solverLabel;
+        femState.backendConnected = true;
+        uiState.backendConnected = true;
+        console.log(`%c[PyAPI Health Check] Connected to backend at ${API_BASE} (${solverLabel})`, 'color: #4caf50; font-weight: bold;');
+        return true;
+      }
+    } catch (_) {}
+  }
+  femState.backendConnected = false;
+  uiState.backendConnected = false;
+  return false;
+}
+
+async function fetchApi(url: string, init?: RequestInit, timeoutMs: number = 120000): Promise<Response> {
+  const tStart = performance.now();
+  console.log(`%c[PyAPI Req] ${init?.method || 'GET'} ${url}`, 'color: #00bcd4; font-weight: bold;');
+
+  if (typeof window !== 'undefined' && window.location.protocol === 'https:' && url.startsWith('http://')) {
+    const errStr = `Browser blocked unencrypted connection (${url}) from an HTTPS page (${window.location.origin}). ` +
+      `Please open Reslo via http://localhost:5173 or provide a HTTPS backend API URL via ?api=https://...`;
+    console.error(`%c[PyAPI Security Error]\n${errStr}`, 'color: #ff1744; font-weight: bold; font-size: 13px;');
+    throw new PyApiError(errStr);
+  }
+
   const headers = new Headers(init?.headers);
-  if (isNgrokUrl(API_BASE)) headers.set('ngrok-skip-browser-warning', 'true');
+  headers.set('Bypass-Tunnel-Reminder', 'true');
+  headers.set('ngrok-skip-browser-warning', 'true');
 
   let lastErr: any = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  const maxAttempts = 3;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       const controller = new AbortController();
-      const id = setTimeout(() => controller.abort(), 25000);
-      const res = await fetch(url, { ...init, headers, signal: controller.signal });
-      clearTimeout(id);
-      if (res.ok) return res;
-      if (res.status >= 500 && attempt < 2) {
-        await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+      const timerId = setTimeout(() => controller.abort(`Request timeout after ${timeoutMs / 1000}s`), timeoutMs);
+      
+      let signal = controller.signal;
+      if (init?.signal) {
+        if (init.signal.aborted) {
+          clearTimeout(timerId);
+          throw new PyApiError('Request aborted before start');
+        }
+        init.signal.addEventListener('abort', () => controller.abort(init.signal?.reason || 'Aborted'), { once: true });
+      }
+
+      const res = await fetch(url, { ...init, headers, signal });
+      clearTimeout(timerId);
+      const elapsed = Math.round(performance.now() - tStart);
+      if (res.ok) {
+        console.log(`%c[PyAPI Success] ${res.status} OK (${elapsed}ms) - ${url}`, 'color: #4caf50; font-weight: bold;');
+        return res;
+      }
+      console.warn(`%c[PyAPI Status Warning] HTTP ${res.status} (${elapsed}ms) - ${url}`, 'color: #ff9800; font-weight: bold;');
+      if (res.status >= 500 && attempt < maxAttempts - 1) {
+        await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
         continue;
       }
       return res;
     } catch (err: any) {
       lastErr = err;
-      if (typeof window !== 'undefined' && (url.includes('.trycloudflare.com') || url.includes('.ngrok')) && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')) {
-        const localUrl = url.replace(/https:\/\/[^/]+/, 'http://localhost:8000');
-        try {
-          const resLocal = await fetch(localUrl, { ...init, headers });
-          if (resLocal.ok) return resLocal;
-        } catch { /* ignore fallback error */ }
+      if (err?.name === 'AbortError' || err?.message?.includes('aborted')) {
+        break;
       }
-      if (attempt < 2) {
-        await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+      if (attempt < maxAttempts - 1) {
+        await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
       }
     }
   }
-  if (lastErr?.name === 'TypeError' || lastErr?.message?.includes('fetch') || lastErr?.name === 'AbortError') {
-    throw new PyApiError(
-      `Unable to reach FEA Backend API at ${API_BASE}. ` +
-      `Please ensure the backend server is running and accessible.`
-    );
-  }
-  throw lastErr;
+
+  const elapsed = Math.round(performance.now() - tStart);
+  const detail = lastErr?.message ? ` (${lastErr.message})` : '';
+  const errorMsg = `Unable to reach FEA Backend API at ${API_BASE}${detail}. Please ensure the backend server is running and accessible.`;
+  
+  console.error(
+    `%c[PyAPI Connection Error] (${elapsed}ms)\n` +
+    `URL: ${url}\n` +
+    `Reason: ${errorMsg}\n` +
+    `Troubleshooting:\n` +
+    ` 1. Is Python backend running at http://127.0.0.1:8000?\n` +
+    ` 2. Check backend.log in your workspace.\n` +
+    ` 3. Run .\\start_tunnel.ps1 to start the backend API.`,
+    'color: #ff1744; font-weight: bold; font-size: 13px;'
+  );
+
+  throw new PyApiError(errorMsg);
 }
 
 interface PyNode { id: number; x: number; y: number }
@@ -117,26 +192,49 @@ interface PyAnalysisResult {
   error?: string;
 }
 
-export async function healthCheck(): Promise<boolean> {
-  try {
-    const r = await fetchApi(`${API_BASE}/api/health`);
-    if (r.ok) return true;
-  } catch (_) {}
 
-  if (typeof window !== 'undefined' && API_BASE !== 'http://127.0.0.1:8000' && API_BASE !== 'http://localhost:8000') {
-    try {
-      const rLocal = await fetch('http://127.0.0.1:8000/api/health');
-      if (rLocal.ok) {
-        API_BASE = 'http://127.0.0.1:8000';
-        return true;
-      }
-    } catch (_) {}
-  }
-  return false;
-}
 
 export class PyApiError extends Error {
   constructor(msg: string) { super(msg); this.name = 'PyApiError'; }
+}
+
+/**
+ * Convert a mesh from the local TypeScript mesher into the backend's PyMesh shape.
+ *
+ * The TS mesher emits 0-indexed node/element ids; the Python solvers index nodes
+ * from 1 (node id N maps to array row N-1). Without this remap every fallback
+ * mesh is off by one node, which silently shifts supports and corrupts results.
+ * Elements with fewer than 3 distinct nodes are dropped — degenerate elements
+ * produce a zero-area Jacobian and make the stiffness matrix singular.
+ */
+function tsMeshToPyMesh(tsMesh: { nodes: { id: number; x: number; y: number }[]; elements: { id: number; nodeIds: number[]; area?: number }[]; unconnectedNodeIds?: number[] }): PyMesh {
+  const idRemap = new Map<number, number>();
+  const nodes: PyNode[] = tsMesh.nodes.map((n, i) => {
+    idRemap.set(n.id, i + 1);
+    return { id: i + 1, x: n.x, y: n.y };
+  });
+
+  const elements: PyElement[] = [];
+  for (const el of tsMesh.elements) {
+    const mapped = el.nodeIds.map(nid => idRemap.get(nid)).filter((v): v is number => v !== undefined);
+    const distinct = [...new Set(mapped)];
+    if (distinct.length < 3) continue;
+    elements.push({ id: elements.length + 1, nodeIds: distinct, area: el.area ?? 0 });
+  }
+
+  const connected = new Set<number>();
+  for (const el of elements) for (const nid of el.nodeIds) connected.add(nid);
+
+  return {
+    nodeCount: nodes.length,
+    elementCount: elements.length,
+    nodes,
+    elements,
+    minAngle: 30,
+    maxAspectRatio: 1.5,
+    meshQuality: 'fallback',
+    unconnectedNodeIds: nodes.filter(n => !connected.has(n.id)).map(n => n.id),
+  };
 }
 
 function computePartitionWallSegments(
@@ -159,6 +257,35 @@ function computePartitionWallSegments(
     }
   }
   return segments;
+}
+
+/**
+ * 1-indexed ids of nodes lying on the mesh outer boundary.
+ *
+ * An edge referenced by exactly one element is on the perimeter; interior
+ * edges are shared by two. Used as a fallback support set so a slab with no
+ * connected columns/walls still solves instead of aborting the analysis.
+ */
+function perimeterNodeIds(mesh: { elements: { nodeIds: number[] }[] }): number[] {
+  const edgeCount = new Map<string, number>();
+  for (const el of mesh.elements) {
+    const n = el.nodeIds;
+    if (n.length < 3) continue;
+    for (let i = 0; i < n.length; i++) {
+      const a = n[i], b = n[(i + 1) % n.length];
+      if (a === b) continue;
+      const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+      edgeCount.set(key, (edgeCount.get(key) ?? 0) + 1);
+    }
+  }
+  const boundary = new Set<number>();
+  for (const [key, count] of edgeCount) {
+    if (count !== 1) continue;
+    const [a, b] = key.split('_');
+    boundary.add(Number(a));
+    boundary.add(Number(b));
+  }
+  return [...boundary];
 }
 
 export async function meshAndAnalyze(
@@ -199,6 +326,13 @@ export async function meshAndAnalyze(
     const tsMesh = generateSlabMesh(slabPolygon as any, meshSize, false);
     mesh = tsMeshToPyMesh(tsMesh);
   }
+  if (!mesh || mesh.elementCount === 0) {
+    throw new PyApiError(
+      'Could not mesh this slab. The outline may be self-intersecting, too small ' +
+      'relative to the mesh size, or have fewer than 3 distinct corners.'
+    );
+  }
+  const pyMesh: PyMesh = mesh;
   const wallNodeIds: number[] = [];
   const wallNodesCount = new Array(walls.length).fill(0);
   
@@ -210,17 +344,17 @@ export async function meshAndAnalyze(
     return { w, dx, dy, len2 };
   });
 
-  for (const n of mesh.nodes) {
+  for (const n of pyMesh.nodes) {
     for (let wi = 0; wi < wallPrecalc.length; wi++) {
       const { w, dx, dy, len2 } = wallPrecalc[wi];
       if (len2 < 1e-12) continue;
       const t = ((n.x - w.startPoint.x) * dx + (n.y - w.startPoint.y) * dy) / len2;
       if (t >= -0.01 && t <= 1.01) {
-        const clampT = t < 0 ? 0 : (t > 1 ? 1 : t);
         const px = w.startPoint.x + clampT * dx;
         const py = w.startPoint.y + clampT * dy;
         const dist2 = (n.x - px) ** 2 + (n.y - py) ** 2;
-        const wallTolSq = Math.max(0.0625, (meshSize * 0.5) * (meshSize * 0.5)); // 0.25m tolerance squared for robust boundary capture
+        const wallTol = Math.max(0.02, Math.min(0.06, meshSize * 0.08));
+        const wallTolSq = wallTol * wallTol;
         if (dist2 <= wallTolSq) {
           wallNodeIds.push(n.id);
           wallNodesCount[wi]++;
@@ -245,8 +379,8 @@ export async function meshAndAnalyze(
   for (let ci = 0; ci < columns.length; ci++) {
     const c = columns[ci] as any;
     const isInside = pointInPolygon(c.position, slabPolygon.vertices);
-    let best = mesh.nodes[0], bestD2 = Infinity;
-    for (const n of mesh.nodes) {
+    let best = pyMesh.nodes[0], bestD2 = Infinity;
+    for (const n of pyMesh.nodes) {
       const d2 = (n.x - c.position.x) * (n.x - c.position.x) + (n.y - c.position.y) * (n.y - c.position.y);
       if (d2 < bestD2) { bestD2 = d2; best = n; }
     }
@@ -297,13 +431,15 @@ export async function meshAndAnalyze(
       const beamTol = Math.max(0.15, meshSize * 0.5);
       const nearNodes: { id: number; t: number }[] = [];
 
-      for (const n of mesh.nodes) {
+      for (const n of pyMesh.nodes) {
         const t = ((n.x - sx) * dx + (n.y - sy) * dy) / L2;
         if (t >= -0.01 && t <= 1.01) {
           const clampT = Math.max(0, Math.min(1, t));
           const px = sx + clampT * dx;
           const py = sy + clampT * dy;
           if (Math.hypot(n.x - px, n.y - py) <= beamTol) {
+            n.x = px;
+            n.y = py;
             nearNodes.push({ id: n.id, t: clampT });
           }
         }
@@ -346,21 +482,34 @@ export async function meshAndAnalyze(
     columnShapes: colShapes, columnDiameters: colDiameters,
     columnGrades: colGrades,
     columnBoundaryConditions: columns.map(c => c.boundaryCondition || 'fixed-fixed'),
-    wallBoundaryConditions: walls.map(w => w.boundaryCondition || 'fixed-free'),
+    wallBoundaryConditions: walls.map(w => w.boundaryCondition || 'fixed-fixed'),
     beamNodeIdA, beamNodeIdB, beamWidths, beamDepths, beamElasticModuli,
     dropPanels: dropPanels.map(dp => ({ vertices: dp.vertices, drop: dp.drop })),
     partitionWallSegments: computePartitionWallSegments(nonStructuralWalls, polylineNonStructuralWalls)
   };
 
-  if (colNodeIds.length === 0 && wallNodeIds.length === 0) {
-    throw new PyApiError(
-      'No column or wall supports found on the slab mesh. ' +
-      'Please place at least one column or wall INSIDE the slab polygon, then re-run the analysis.'
-    );
-  }
-
   // ── Connectivity validation ──
   const warnings: string[] = [];
+
+  // No support snapped to the mesh. Rather than aborting the whole analysis,
+  // fall back to supporting the slab's outer boundary so the user still gets
+  // deflections, and warn. Unconnected columns/walls are reported separately
+  // below and highlighted on the canvas via disconnectedIds.
+  if (colNodeIds.length === 0 && wallNodeIds.length === 0) {
+    const boundaryNodeIds = perimeterNodeIds(pyMesh);
+    if (boundaryNodeIds.length === 0) {
+      throw new PyApiError(
+        'No column or wall supports are connected to this slab, and its boundary ' +
+        'could not be determined. Place at least one column or wall on the slab.'
+      );
+    }
+    arBody.wallNodeIds = boundaryNodeIds;
+    warnings.push(
+      'No column or wall is connected to this slab. Analyzed with the slab edge ' +
+      'treated as simply supported — results are indicative only. Move supports ' +
+      'onto the slab for an accurate model.'
+    );
+  }
   if (skippedColumns.length > 0) {
     warnings.push(`Column${skippedColumns.length > 1 ? 's' : ''} ${skippedColumns.join(', ')} ${skippedColumns.length > 1 ? 'are' : 'is'} outside the slab mesh (>${COL_SNAP_TOL}m away) and ${skippedColumns.length > 1 ? 'were' : 'was'} skipped.`);
   }
@@ -377,8 +526,8 @@ export async function meshAndAnalyze(
     warnings.push(`Wall${disconnectedWallIds.length > 1 ? 's' : ''} ${disconnectedWallIds.join(', ')} ${disconnectedWallIds.length > 1 ? 'have' : 'has'} no mesh nodes along its length — it may be outside the slab.`);
   }
 
-  if (mesh.unconnectedNodeIds && mesh.unconnectedNodeIds.length > 0) {
-    warnings.push(`${mesh.unconnectedNodeIds.length} node${mesh.unconnectedNodeIds.length > 1 ? 's' : ''} (ID: ${mesh.unconnectedNodeIds.join(', ')}) in the mesh ${mesh.unconnectedNodeIds.length > 1 ? 'are' : 'is'} not connected to any slab elements. These nodes will be highlighted on the canvas in red and automatically constrained to prevent solver errors.`);
+  if (pyMesh.unconnectedNodeIds && pyMesh.unconnectedNodeIds.length > 0) {
+    warnings.push(`${pyMesh.unconnectedNodeIds.length} node${pyMesh.unconnectedNodeIds.length > 1 ? 's' : ''} (ID: ${pyMesh.unconnectedNodeIds.join(', ')}) in the mesh ${pyMesh.unconnectedNodeIds.length > 1 ? 'are' : 'is'} not connected to any slab elements. These nodes will be highlighted on the canvas in red and automatically constrained to prevent solver errors.`);
   }
 
   const disconnectedIds = [...skippedColumnIds, ...disconnectedWallIds];
@@ -395,7 +544,21 @@ export async function meshAndAnalyze(
   const result: PyAnalysisResult = await ar.json();
   if (!result.success) throw new PyApiError(`Analysis failed: ${result.error}`);
 
-  return { mesh, result, slabId: slabPolygon.vertices.length > 0 ? `slab_${Date.now()}` : 'slab_0', warnings, disconnectedIds };
+  return { mesh: pyMesh, result, slabId: slabPolygon.vertices.length > 0 ? `slab_${Date.now()}` : 'slab_0', warnings, disconnectedIds };
+}
+
+function safeArrayMin(arr: number[]): number {
+  if (!arr || arr.length === 0) return 0;
+  let min = arr[0];
+  for (let i = 1; i < arr.length; i++) { if (arr[i] < min) min = arr[i]; }
+  return min;
+}
+
+function safeArrayMax(arr: number[]): number {
+  if (!arr || arr.length === 0) return 0;
+  let max = arr[0];
+  for (let i = 1; i < arr.length; i++) { if (arr[i] > max) max = arr[i]; }
+  return max;
 }
 
 function toFrontendResult(slabId: string, mesh: any, result: any): any {
@@ -421,8 +584,9 @@ function toFrontendResult(slabId: string, mesh: any, result: any): any {
   const membraneForces: any[] = result.elementMembraneForces || [];
   const columnPunching: any[] = result.columnPunching || [];
 
-  const localMinWz = nodeDeflections.length ? Math.min(...nodeDeflections.map((d: any) => d.wz)) : 0;
-  const localMaxWz = nodeDeflections.length ? Math.max(...nodeDeflections.map((d: any) => Math.abs(d.wz))) : 0;
+  const wzVals = nodeDeflections.map((d: any) => d.wz);
+  const localMinWz = safeArrayMin(wzVals);
+  const localMaxWz = safeArrayMax(wzVals);
 
   return {
     slabId,
@@ -433,8 +597,8 @@ function toFrontendResult(slabId: string, mesh: any, result: any): any {
       unconnectedNodeIds: mesh.unconnectedNodeIds || [],
     },
     nodeDeflections, momentMx, momentMy, momentMxy, stresses, shears, membraneForces, columnPunching,
-    minWz: result.minWz !== undefined ? result.minWz * 1000 : localMinWz,
-    maxWz: result.maxWz !== undefined ? result.maxWz * 1000 : localMaxWz,
+    minWz: localMinWz,
+    maxWz: localMaxWz,
     minMx: result.minMx ?? 0,
     maxMx: result.maxMx ?? 0,
     minMy: result.minMy ?? 0,
@@ -455,21 +619,11 @@ function toFrontendResult(slabId: string, mesh: any, result: any): any {
 }
 
 
-export async function analyzeSlabViaApi(
-  slab: { id?: string; vertices: { x: number; y: number }[]; thickness: number; uniformLoad: number; partitionLoad: number; elasticModulus: number; crackingModifier?: number },
-  columns: { position: { x: number; y: number }; width: number; depth: number; height: number; elasticModulus: number; shape?: 'rectangular' | 'circular'; diameter?: number; boundaryCondition?: string }[],
-  walls: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; elasticModulus: number; thickness?: number; height?: number; boundaryCondition?: string }[],
-  polylineWalls: { vertices: { x: number; y: number }[]; thickness: number; height: number; elasticModulus: number; shearModulus?: number; concreteDensity?: number; boundaryCondition?: string }[],
-  meshSize: number, poissonRatio: number,
-  beams: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; width: number; depth: number; elasticModulus: number }[] = [],
-  dropPanels: { vertices: { x: number; y: number }[]; drop: number }[] = [],
-  nonStructuralWalls: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; thickness?: number; height?: number; partitionUnitWeight?: number }[] = [],
-  polylineNonStructuralWalls: { vertices: { x: number; y: number }[]; thickness?: number; height?: number; partitionUnitWeight?: number }[] = []
-): Promise<any> {
-  const allWalls = [...walls];
+function flattenAllWalls(walls: any[], polylineWalls: any[] = []): any[] {
+  const allWalls = [...(walls || [])];
   const COLLINEAR_TOL = 0.001745; // 0.1° — same tolerance as mathEngine.ts
-  for (const pw of polylineWalls) {
-    // Build raw segment list (filter zero-length)
+  for (const pw of (polylineWalls || [])) {
+    if (!pw || !pw.vertices || pw.vertices.length < 2) continue;
     const rawSegs: { x1: number; y1: number; x2: number; y2: number; alpha: number }[] = [];
     for (let i = 0; i < pw.vertices.length - 1; i++) {
       const a = pw.vertices[i], b = pw.vertices[i + 1];
@@ -478,7 +632,6 @@ export async function analyzeSlabViaApi(
       if (L < 1e-10) continue;
       rawSegs.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, alpha: Math.atan2(dy, dx) });
     }
-    // Merge collinear runs into piers (matches mathEngine.ts pier logic)
     let si = 0;
     while (si < rawSegs.length) {
       const alpha0 = rawSegs[si].alpha;
@@ -492,13 +645,29 @@ export async function analyzeSlabViaApi(
       allWalls.push({
         startPoint: { x: pierX1, y: pierY1 },
         endPoint: { x: rawSegs[sj].x2, y: rawSegs[sj].y2 },
-        elasticModulus: pw.elasticModulus,
-        thickness: pw.thickness, height: pw.height,
-        boundaryCondition: pw.boundaryCondition
-      } as any);
+        elasticModulus: pw.elasticModulus ?? 25e9,
+        thickness: pw.thickness ?? 0.25,
+        height: pw.height ?? 3.0,
+        boundaryCondition: pw.boundaryCondition ?? 'fixed-fixed'
+      });
       si = sj + 1;
     }
   }
+  return allWalls;
+}
+
+export async function analyzeSlabViaApi(
+  slab: { id?: string; vertices: { x: number; y: number }[]; thickness: number; uniformLoad: number; partitionLoad: number; elasticModulus: number; crackingModifier?: number },
+  columns: { position: { x: number; y: number }; width: number; depth: number; height: number; elasticModulus: number; shape?: 'rectangular' | 'circular'; diameter?: number; boundaryCondition?: string }[],
+  walls: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; elasticModulus: number; thickness?: number; height?: number; boundaryCondition?: string }[],
+  polylineWalls: { vertices: { x: number; y: number }[]; thickness: number; height: number; elasticModulus: number; shearModulus?: number; concreteDensity?: number; boundaryCondition?: string }[],
+  meshSize: number, poissonRatio: number,
+  beams: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; width: number; depth: number; elasticModulus: number }[] = [],
+  dropPanels: { vertices: { x: number; y: number }[]; drop: number }[] = [],
+  nonStructuralWalls: { startPoint: { x: number; y: number }; endPoint: { x: number; y: number }; thickness?: number; height?: number; partitionUnitWeight?: number }[] = [],
+  polylineNonStructuralWalls: { vertices: { x: number; y: number }[]; thickness?: number; height?: number; partitionUnitWeight?: number }[] = []
+): Promise<any> {
+  const allWalls = flattenAllWalls(walls, polylineWalls);
   const { mesh, result } = await meshAndAnalyze(slab, allWalls, columns, meshSize, poissonRatio, beams, dropPanels, nonStructuralWalls, polylineNonStructuralWalls);
   return toFrontendResult(slab.id || 'slab_0', mesh, result);
 }
@@ -512,9 +681,12 @@ export async function meshAndAnalyzeAllSlabs(
   beams: any[] = [],
   dropPanels: any[] = [],
   nonStructuralWalls: any[] = [],
-  polylineNonStructuralWalls: any[] = []
+  polylineNonStructuralWalls: any[] = [],
+  polylineWalls: any[] = []
 ): Promise<{ results: any[]; warnings: string[]; disconnectedIds: string[] }> {
   if (slabs.length === 0) return { results: [], warnings: [], disconnectedIds: [] };
+
+  const allWalls = flattenAllWalls(walls, polylineWalls);
 
   // Attempt single-payload batch backend execution first (< 40ms single round-trip)
   try {
@@ -524,40 +696,78 @@ export async function meshAndAnalyzeAllSlabs(
         geometry: {
           vertices: slab.vertices,
           openings: (slab.openings || []).map((op: any) => ({ vertices: op.vertices })),
-          walls: walls.map(w => ({ startPoint: w.startPoint, endPoint: w.endPoint })),
+          walls: allWalls.map(w => ({ startPoint: w.startPoint, endPoint: w.endPoint })),
           beams: (beams || []).map(b => ({ startPoint: b.startPoint, endPoint: b.endPoint })),
           columns: columns.map(c => ({ position: c.position, width: c.width || 0.3, depth: c.depth || 0.3, height: c.height || 3.0 }))
         },
         meshSize,
         thickness: slab.thickness || 0.2,
-        elasticModulus: (slab.elasticModulus ? slab.elasticModulus * 1000 : 25e9) * (slab.crackingModifier ?? 1.0),
+        elasticModulus: (slab.elasticModulus ? (slab.elasticModulus < 1e8 ? slab.elasticModulus * 1000 : slab.elasticModulus) : 25e9) * (slab.crackingModifier ?? 1.0),
         poissonRatio,
         uniformLoad: (slab.uniformLoad || 5.0) + (slab.partitionLoad ?? 0),
         selfWeight: 25 * (slab.thickness || 0.2)
       })),
-      walls: walls.map(w => ({ startPoint: w.startPoint, endPoint: w.endPoint, thickness: w.thickness ?? 0.25, height: w.height ?? 3.0, elasticModulus: w.elasticModulus || 25e9 })),
-      columns: columns.map(c => ({ position: c.position, width: c.width || 0.3, depth: c.depth || 0.3, height: c.height || 3.0, elasticModulus: (c.elasticModulus || 25e6) * 1000, shape: c.shape || 'rectangular', diameter: (c.diameter || 500) / 1000, concreteGrade: c.concreteGrade || 'M25' })),
-      beams: (beams || []).map(b => ({ startPoint: b.startPoint, endPoint: b.endPoint, width: b.width || 0.3, depth: b.depth || 0.45, elasticModulus: (b.elasticModulus || 25e6) * 1000 })),
+      walls: allWalls.map(w => ({
+        startPoint: w.startPoint,
+        endPoint: w.endPoint,
+        thickness: w.thickness ?? 0.25,
+        height: w.height ?? 3.0,
+        elasticModulus: w.elasticModulus ? (w.elasticModulus < 1e8 ? w.elasticModulus * 1000 : w.elasticModulus) : 25e9,
+        boundaryCondition: w.boundaryCondition ?? 'fixed-fixed'
+      })),
+      columns: columns.map(c => ({
+        position: c.position,
+        width: c.width || 0.3,
+        depth: c.depth || 0.3,
+        height: c.height || 3.0,
+        elasticModulus: c.elasticModulus ? (c.elasticModulus < 1e8 ? c.elasticModulus * 1000 : c.elasticModulus) : 25e9,
+        shape: c.shape || 'rectangular',
+        diameter: (c.diameter || 500) / 1000,
+        concreteGrade: c.concreteGrade || 'M25'
+      })),
+      beams: (beams || []).map(b => ({
+        startPoint: b.startPoint,
+        endPoint: b.endPoint,
+        width: b.width || 0.3,
+        depth: b.depth || 0.45,
+        elasticModulus: b.elasticModulus ? (b.elasticModulus < 1e8 ? b.elasticModulus * 1000 : b.elasticModulus) : 25e9
+      })),
       dropPanels: dropPanels.map(dp => ({ vertices: dp.vertices, drop: dp.drop })),
       partitionWallSegments: computePartitionWallSegments(nonStructuralWalls, polylineNonStructuralWalls),
       meshSize
     };
 
+    console.log(`%c[PyAPI] Initiating multi-slab FEA solve (${slabs.length} slab(s), ${walls.length} wall(s), ${columns.length} column(s))...`, 'color: #2196f3; font-weight: bold;');
+
     const mr = await fetchApi(`${API_BASE}/api/analyze_multi`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(multiPayload)
-    });
+    }, 300000); // 300s timeout for large multi-slab models
 
     if (mr.ok) {
       const data = await mr.json();
       if (data.success && data.results && data.results.length > 0) {
+        console.log(`%c[PyAPI Success] Multi-slab FEM solve complete (${data.results.length} result(s))`, 'color: #4caf50; font-weight: bold;');
         const results = data.results.map((r: any) => toFrontendResult(r.slabId, r.mesh, r.result));
         return { results, warnings: data.warnings || [], disconnectedIds: data.disconnectedIds || [] };
+      } else {
+        const errMsg = data.error || 'Unknown backend solver error';
+        console.error(
+          `%c[PyAPI Backend Error] Backend solver returned failure status!\n` +
+          `Error: ${errMsg}\n` +
+          `Warnings: ${(data.warnings || []).join('\n')}`,
+          'color: #ff1744; font-weight: bold; font-size: 13px;'
+        );
+        throw new PyApiError(`PyNite backend solver error: ${errMsg}`);
       }
+    } else {
+      const httpErr = `HTTP ${mr.status} ${mr.statusText} from /api/analyze_multi`;
+      console.error(`%c[PyAPI HTTP Error] ${httpErr}`, 'color: #ff1744; font-weight: bold;');
+      throw new PyApiError(`PyNite backend API error: ${httpErr}`);
     }
-  } catch (err) {
-    console.warn('[PyAPI] Single-payload multi-slab API attempt failed, falling back to sequential batching:', err);
+  } catch (err: any) {
+    console.warn('[PyAPI] Single-payload multi-slab API attempt failed, falling back to sequential batching:\n' + (err?.message || err));
   }
 
   // 1. Mesh all slabs sequentially (Fallback)
@@ -575,7 +785,7 @@ export async function meshAndAnalyzeAllSlabs(
     };
     const meshReq = { geometry, meshSize };
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 25000); // 25s timeout for Gmsh Delaunay triangular meshing
+    const timeout = setTimeout(() => controller.abort(), 60000); // 60s timeout for Gmsh Delaunay triangular meshing
     let meshAcquired = false;
     try {
       const mr = await fetchApi(`${API_BASE}/api/mesh`, {
@@ -629,7 +839,7 @@ export async function meshAndAnalyzeAllSlabs(
 
   allNodes.sort((a, b) => a.x - b.x);
 
-  const mergeTol = Math.max(0.12, meshSize * 0.35);
+  const mergeTol = Math.max(0.05, Math.min(0.20, meshSize * 0.25));
   interface UniquePyNodeRef extends PyNode {
     slabId: string;
     localId: number;
@@ -672,8 +882,8 @@ export async function meshAndAnalyzeAllSlabs(
       for (let u = uniqueNodes.length - 1; u >= 0; u--) {
         const un = uniqueNodes[u];
         const isUnDiscont = discontNodeKeys.has(un.slabId + '_' + un.localId);
-        // Merge coincident boundary nodes across adjacent slabs into a single node
-        if (!isUnDiscont && Math.hypot(node.x - un.x, node.y - un.y) < mergeTol) {
+        // Merge coincident boundary nodes across adjacent slabs into a single node (different slabs only)
+        if (node.slabId !== un.slabId && !isUnDiscont && Math.hypot(node.x - un.x, node.y - un.y) < mergeTol) {
           foundIdx = u;
           break;
         }
@@ -712,23 +922,50 @@ export async function meshAndAnalyzeAllSlabs(
   }
 
 
-  // Non-conformal multi-slab boundary segment coupling (C0 & C1 continuity for non-coincident boundary nodes)
-  for (let i = 0; i < uniqueNodes.length; i++) {
-    const nA = uniqueNodes[i];
-    for (let j = i + 1; j < uniqueNodes.length; j++) {
-      const nB = uniqueNodes[j];
-      if (nA.slabId !== nB.slabId) {
-        const d = Math.hypot(nA.x - nB.x, nA.y - nB.y);
-        if (d <= mergeTol && nA.id !== nB.id) {
-          const discontA = discontNodeKeys.has(nA.slabId + '_' + nA.localId);
-          const discontB = discontNodeKeys.has(nB.slabId + '_' + nB.localId);
-          const isHinge = discontA || discontB;
-          const dofsToCouple = isHinge ? [1, 2, 3, 6] : [1, 2, 3, 4, 5, 6];
-          equalDofConstraints.push({
-            nodeIdA: nA.id,
-            nodeIdB: nB.id,
-            dofs: dofsToCouple
-          });
+  // Non-conformal multi-slab boundary segment coupling (C0 & C1 continuity for non-coincident boundary nodes).
+  // Bucketed by a grid of cell size mergeTol so only genuinely nearby nodes are
+  // compared. The previous all-pairs loop was O(n^2) and dominated wall-clock
+  // time on multi-slab models (≈4.5M comparisons for 5 slabs at 3k nodes).
+  {
+    const cell = Math.max(mergeTol, 1e-9);
+    const buckets = new Map<string, number[]>();
+    const bucketKey = (x: number, y: number) => `${Math.floor(x / cell)}_${Math.floor(y / cell)}`;
+
+    for (let i = 0; i < uniqueNodes.length; i++) {
+      const n = uniqueNodes[i];
+      const k = bucketKey(n.x, n.y);
+      let arr = buckets.get(k);
+      if (!arr) { arr = []; buckets.set(k, arr); }
+      arr.push(i);
+    }
+
+    const seenPairs = new Set<string>();
+    for (let i = 0; i < uniqueNodes.length; i++) {
+      const nA = uniqueNodes[i];
+      const cx = Math.floor(nA.x / cell);
+      const cy = Math.floor(nA.y / cell);
+      // A node within mergeTol can only fall in this cell or one of its 8 neighbours.
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const neighbours = buckets.get(`${cx + ox}_${cy + oy}`);
+          if (!neighbours) continue;
+          for (const j of neighbours) {
+            if (j <= i) continue;
+            const nB = uniqueNodes[j];
+            if (nA.slabId === nB.slabId || nA.id === nB.id) continue;
+            if (Math.hypot(nA.x - nB.x, nA.y - nB.y) > mergeTol) continue;
+            const pairKey = nA.id < nB.id ? `${nA.id}_${nB.id}` : `${nB.id}_${nA.id}`;
+            if (seenPairs.has(pairKey)) continue;
+            seenPairs.add(pairKey);
+            const discontA = discontNodeKeys.has(nA.slabId + '_' + nA.localId);
+            const discontB = discontNodeKeys.has(nB.slabId + '_' + nB.localId);
+            const isHinge = discontA || discontB;
+            equalDofConstraints.push({
+              nodeIdA: nA.id,
+              nodeIdB: nB.id,
+              dofs: isHinge ? [1, 2, 3, 6] : [1, 2, 3, 4, 5, 6]
+            });
+          }
         }
       }
     }
@@ -741,10 +978,19 @@ export async function meshAndAnalyzeAllSlabs(
   const elementElasticModuli: number[] = [];
   let globalElemCounter = 1;
 
+  // Group nodes by slab once, instead of re-filtering allNodes per slab (O(slabs x nodes)).
+  const nodesBySlab = new Map<string, NodeRef[]>();
+  for (const node of allNodes) {
+    let arr = nodesBySlab.get(node.slabId);
+    if (!arr) { arr = []; nodesBySlab.set(node.slabId, arr); }
+    arr.push(node);
+  }
+
+  let droppedElements = 0;
   for (const sm of slabMeshes) {
     const nodeMapForSlab = new Map<number, number>();
-    for (const node of allNodes.filter(n => n.slabId === sm.slab.id)) {
-      nodeMapForSlab.set(node.localId, node.globalIdx! + 1); // 1-indexed
+    for (const node of nodesBySlab.get(sm.slab.id) ?? []) {
+      if (node.globalIdx !== undefined) nodeMapForSlab.set(node.localId, node.globalIdx + 1); // 1-indexed
     }
 
     const t_s = sm.slab.thickness || 0.2;
@@ -752,7 +998,15 @@ export async function meshAndAnalyzeAllSlabs(
     const q_s = (sm.slab.uniformLoad || 5.0) + (sm.slab.partitionLoad ?? 0) + 25 * t_s;
 
     for (const elem of sm.mesh.elements) {
-      const globalNodeIds = elem.nodeIds.map(nid => nodeMapForSlab.get(nid)!);
+      // Drop elements whose nodes didn't map, or that collapsed to <3 distinct
+      // nodes after merging. Passing `undefined` ids through here serializes as
+      // null and corrupts the element on the backend.
+      const mapped = elem.nodeIds
+        .map(nid => nodeMapForSlab.get(nid))
+        .filter((v): v is number => v !== undefined);
+      const globalNodeIds = [...new Set(mapped)];
+      if (globalNodeIds.length < 3) { droppedElements++; continue; }
+
       const globalElemId = globalElemCounter++;
       globalElements.push({
         id: globalElemId,
@@ -777,12 +1031,12 @@ export async function meshAndAnalyzeAllSlabs(
   };
 
   // 3. Support mapping on the global mesh (multi-slab node coupling)
-  const wallTol = Math.max(0.12, meshSize * 0.35);
+  const wallTol = Math.max(0.02, Math.min(0.06, meshSize * 0.08));
   const wallNodeIds: number[] = [];
-  const wallNodesCount = new Array(walls.length).fill(0);
+  const wallNodesCount = new Array(allWalls.length).fill(0);
   for (const n of uniqueNodes) {
-    for (let wi = 0; wi < walls.length; wi++) {
-      const w = walls[wi];
+    for (let wi = 0; wi < allWalls.length; wi++) {
+      const w = allWalls[wi];
       const dx = w.endPoint.x - w.startPoint.x, dy = w.endPoint.y - w.startPoint.y;
       const len2 = dx * dx + dy * dy;
       if (len2 < 1e-12) continue;
@@ -841,19 +1095,6 @@ export async function meshAndAnalyzeAllSlabs(
       colShapes.push(c.shape || 'rectangular');
       colDiameters.push((c.diameter || 500) / 1000);
       colGrades.push(c.concreteGrade || 'M25');
-
-      // Tie all nodes within column capital footprint across all slabs to master column node
-      const colSnapRadius = Math.max(0.35, Math.hypot(w, dp) * 0.7, meshSize * 0.5);
-      const matchingNodes = uniqueNodes.filter(n => Math.hypot(n.x - c.position.x, n.y - c.position.y) <= colSnapRadius);
-      for (const mNode of matchingNodes) {
-        if (mNode.id !== best.id) {
-          equalDofConstraints.push({
-            nodeIdA: best.id,
-            nodeIdB: mNode.id,
-            dofs: [1, 2, 3, 4, 5, 6]
-          });
-        }
-      }
     }
   }
 
@@ -862,24 +1103,47 @@ export async function meshAndAnalyzeAllSlabs(
   const slabThickness = primarySlab.thickness || 0.2;
   const selfWeight = 25 * slabThickness;
 
-  // Beam endpoints to global nodes
+  // Beam data: snap and discretize all intermediate global mesh nodes along beam line segments
   const beamNodeIdA: number[] = [];
   const beamNodeIdB: number[] = [];
   const beamWidths: number[] = [];
   const beamDepths: number[] = [];
   const beamElasticModuli: number[] = [];
   for (const b of beams) {
-    let bestA = uniqueNodes[0], bestDA = Infinity;
-    let bestB = uniqueNodes[0], bestDB = Infinity;
+    const sx = b.startPoint.x, sy = b.startPoint.y;
+    const ex = b.endPoint.x, ey = b.endPoint.y;
+    const dx = ex - sx, dy = ey - sy;
+    const L2 = dx * dx + dy * dy;
+    if (L2 < 1e-12) continue;
+
+    const beamTol = Math.max(0.15, meshSize * 0.5);
+    const nearNodes: { id: number; t: number }[] = [];
+
     for (const n of uniqueNodes) {
-      const dA = Math.hypot(n.x - b.startPoint.x, n.y - b.startPoint.y);
-      const dB = Math.hypot(n.x - b.endPoint.x, n.y - b.endPoint.y);
-      if (dA < bestDA) { bestDA = dA; bestA = n; }
-      if (dB < bestDB) { bestDB = dB; bestB = n; }
+      const t = ((n.x - sx) * dx + (n.y - sy) * dy) / L2;
+      if (t >= -0.01 && t <= 1.01) {
+        const clampT = Math.max(0, Math.min(1, t));
+        const px = sx + clampT * dx;
+        const py = sy + clampT * dy;
+        if (Math.hypot(n.x - px, n.y - py) <= beamTol) {
+          nearNodes.push({ id: n.id, t: clampT });
+        }
+      }
     }
-    if (bestA.id !== bestB.id) {
-      beamNodeIdA.push(bestA.id);
-      beamNodeIdB.push(bestB.id);
+
+    nearNodes.sort((a, b) => a.t - b.t);
+
+    // Filter out duplicate or extremely close nodes
+    const filtered: typeof nearNodes = [];
+    for (const item of nearNodes) {
+      if (!filtered.length || Math.abs(item.t - filtered[filtered.length - 1].t) * Math.sqrt(L2) > 0.05) {
+        filtered.push(item);
+      }
+    }
+
+    for (let i = 0; i < filtered.length - 1; i++) {
+      beamNodeIdA.push(filtered[i].id);
+      beamNodeIdB.push(filtered[i + 1].id);
       beamWidths.push(b.width || 0.3);
       beamDepths.push(b.depth || 0.45);
       beamElasticModuli.push((b.elasticModulus || 25e6) * 1000);
@@ -908,11 +1172,11 @@ export async function meshAndAnalyzeAllSlabs(
     elementElasticModuli,
     elementLoads,
     wallNodeIds: [...new Set(wallNodeIds)],
-    wallStartPoints: walls.map(w => w.startPoint),
-    wallEndPoints: walls.map(w => w.endPoint),
-    wallThicknesses: walls.map(w => w.thickness ?? 0.25),
-    wallHeights: walls.map(w => w.height ?? 3.0),
-    wallElasticModuli: walls.map(w => w.elasticModulus ?? primarySlabE),
+    wallStartPoints: allWalls.map(w => w.startPoint),
+    wallEndPoints: allWalls.map(w => w.endPoint),
+    wallThicknesses: allWalls.map(w => w.thickness ?? 0.25),
+    wallHeights: allWalls.map(w => w.height ?? 3.0),
+    wallElasticModuli: allWalls.map(w => w.elasticModulus ?? primarySlabE),
     columnNodeIds: colNodeIds,
     columnHeights: colHeights,
     columnStiffnesses: colStiffnesses,
@@ -922,7 +1186,7 @@ export async function meshAndAnalyzeAllSlabs(
     columnDiameters: colDiameters,
     columnGrades: colGrades,
     columnBoundaryConditions: columns.map(c => c.boundaryCondition || 'fixed-fixed'),
-    wallBoundaryConditions: walls.map(w => w.boundaryCondition || 'fixed-free'),
+    wallBoundaryConditions: allWalls.map(w => w.boundaryCondition || 'fixed-fixed'),
     beamNodeIdA,
     beamNodeIdB,
     beamWidths,
@@ -937,9 +1201,46 @@ export async function meshAndAnalyzeAllSlabs(
   if (skippedColumns.length > 0) {
     warnings.push(`Column${skippedColumns.length > 1 ? 's' : ''} ${skippedColumns.join(', ')} outside the slab mesh.`);
   }
+  // Walls that matched no mesh node contribute no support. Report them so they
+  // are highlighted on the canvas rather than silently ignored.
+  const disconnectedWallIds: string[] = [];
+  for (let wi = 0; wi < allWalls.length; wi++) {
+    if (wallNodesCount[wi] === 0) {
+      const wall = allWalls[wi] as any;
+      disconnectedWallIds.push(wall.id || wall.label || `Wall ${wi + 1}`);
+    }
+  }
+  if (disconnectedWallIds.length > 0) {
+    warnings.push(
+      `Wall${disconnectedWallIds.length > 1 ? 's' : ''} ${disconnectedWallIds.join(', ')} ` +
+      `${disconnectedWallIds.length > 1 ? 'have' : 'has'} no mesh nodes along ${disconnectedWallIds.length > 1 ? 'their' : 'its'} length ` +
+      `and provided no support. Analysis continued without ${disconnectedWallIds.length > 1 ? 'them' : 'it'}.`
+    );
+  }
+  if (droppedElements > 0) {
+    warnings.push(`${droppedElements} mesh element${droppedElements > 1 ? 's were' : ' was'} degenerate after node merging and excluded from the analysis.`);
+  }
+  if (globalElements.length === 0) {
+    throw new PyApiError('No valid mesh elements remained after merging slabs. Check that the slab outlines are valid and not overlapping.');
+  }
+
+  // Same fallback as the single-slab path: if nothing snapped to a support,
+  // hold the combined mesh boundary rather than sending an unsupported model
+  // to the solver (which fails with a singular stiffness matrix).
+  if (colNodeIds.length === 0 && wallNodeIds.length === 0) {
+    const boundaryNodeIds = perimeterNodeIds(globalMesh);
+    if (boundaryNodeIds.length === 0) {
+      throw new PyApiError('No supports are connected to these slabs and the mesh boundary could not be determined.');
+    }
+    arBody.wallNodeIds = boundaryNodeIds;
+    warnings.push(
+      'No column or wall is connected to these slabs. Analyzed with the outer ' +
+      'edge treated as simply supported — results are indicative only.'
+    );
+  }
 
   const analyzeController = new AbortController();
-  const analyzeTimeout = setTimeout(() => analyzeController.abort(), 60000); // 60s timeout
+  const analyzeTimeout = setTimeout(() => analyzeController.abort(), 120000); // 120s timeout
   let result: PyAnalysisResult;
   try {
     const ar = await fetchApi(`${API_BASE}/api/analyze`, {
@@ -954,26 +1255,27 @@ export async function meshAndAnalyzeAllSlabs(
     if (!result.success) throw new PyApiError(`Analysis failed: ${result.error}`);
   } catch (e: any) {
     clearTimeout(analyzeTimeout);
-    if (e.name === 'AbortError') throw new PyApiError('Analysis request timed out (60s). Try a coarser mesh size.');
+    if (e.name === 'AbortError') throw new PyApiError('Analysis request timed out (120s). Try a coarser mesh size.');
     throw e;
   }
 
   // 4. Map global results back to individual SlabFEMResult outputs per slab
   const results: any[] = [];
+  // Build the deflection lookup once — it is identical for every slab.
+  const defMap = new Map<number, { wz: number; rx: number; ry: number }>();
+  for (const d of (result.nodeDeflections || [])) {
+    defMap.set(d.nodeId, { wz: d.wz, rx: d.rx ?? 0, ry: d.ry ?? 0 });
+  }
+
   for (const sm of slabMeshes) {
     const localNodeMap = new Map<number, number>();
-    for (const node of allNodes.filter(n => n.slabId === sm.slab.id)) {
-      localNodeMap.set(node.localId, node.globalIdx! + 1); // 1-indexed
-    }
-
-    const defMap = new Map<number, { wz: number; rx: number; ry: number }>();
-    for (const d of (result.nodeDeflections || [])) {
-      defMap.set(d.nodeId, { wz: d.wz, rx: d.rx ?? 0, ry: d.ry ?? 0 });
+    for (const node of nodesBySlab.get(sm.slab.id) ?? []) {
+      if (node.globalIdx !== undefined) localNodeMap.set(node.localId, node.globalIdx + 1); // 1-indexed
     }
 
     const nodeDeflections = sm.mesh.nodes.map(n => {
-      const gNodeId = localNodeMap.get(n.id)!;
-      const defData = defMap.get(gNodeId);
+      const gNodeId = localNodeMap.get(n.id);
+      const defData = gNodeId === undefined ? undefined : defMap.get(gNodeId);
       return {
         nodeId: n.id,
         wz: defData?.wz ?? 0,
@@ -1013,8 +1315,8 @@ export async function meshAndAnalyzeAllSlabs(
       stresses,
       shears,
       columnPunching,
-      minWz: nodeDeflections.length ? Math.min(...nodeDeflections.map(d => d.wz)) : 0,
-      maxWz: nodeDeflections.length ? Math.max(...nodeDeflections.map(d => d.wz)) : 0,
+      minWz: safeArrayMin(nodeDeflections.map(d => d.wz)),
+      maxWz: safeArrayMax(nodeDeflections.map(d => d.wz)),
       minMx: result.minMx ?? 0,
       maxMx: result.maxMx ?? 0,
       minMy: result.minMy ?? 0,
@@ -1028,6 +1330,6 @@ export async function meshAndAnalyzeAllSlabs(
     });
   }
 
-  return { results, warnings, disconnectedIds: skippedColumnIds };
+  return { results, warnings, disconnectedIds: [...skippedColumnIds, ...disconnectedWallIds] };
 }
 

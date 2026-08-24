@@ -66,11 +66,12 @@ export function computeDKTStiffness(x: number[], y: number[], D: number[][]): nu
     [-(y[0] - y[2]) / detJ, (x[0] - x[2]) / detJ]
   ];
 
-  // 12x9 Transformation matrix T
+  // 12x9 Transformation matrix T: corner DOFs [w_i, θx_i, θy_i] → 6-node (12) β DOFs [βx_m, βy_m]
+  // In shell coordinates: RX = θx = βy, RY = θy = -βx → βx = -RY, βy = +RX
   const T = Array(12).fill(0).map(() => Array(9).fill(0));
   for (let n = 0; n < 3; n++) {
-    T[2 * n][3 * n + 1] = 1.0;
-    T[2 * n + 1][3 * n + 2] = 1.0;
+    T[2 * n][3 * n + 2] = -1.0;  // βxn = -θyn (-RY)
+    T[2 * n + 1][3 * n + 1] = 1.0; // βyn = +θxn (+RX)
   }
 
   for (let k = 0; k < 3; k++) {
@@ -84,16 +85,16 @@ export function computeDKTStiffness(x: number[], y: number[], D: number[][]): nu
     T[r6][3 * j] = tx * c;
     T[r7][3 * j] = ty * c;
 
-    const c1 = 0.5 * ty * ty - 0.25 * tx * tx;
-    const c2 = -0.75 * tx * ty;
-    const c3 = -0.75 * tx * ty;
-    const c4 = 0.5 * tx * tx - 0.25 * ty * ty;
+    const c_rx_bx = -0.75 * tx * ty;
+    const c_ry_bx = -0.5 * ty * ty + 0.25 * tx * tx;
+    const c_rx_by = 0.5 * tx * tx - 0.25 * ty * ty;
+    const c_ry_by = 0.75 * tx * ty;
 
     for (const idx of [i, j]) {
-      T[r6][3 * idx + 1] = c1;
-      T[r6][3 * idx + 2] = c2;
-      T[r7][3 * idx + 1] = c3;
-      T[r7][3 * idx + 2] = c4;
+      T[r6][3 * idx + 1] = c_rx_bx;
+      T[r6][3 * idx + 2] = c_ry_bx;
+      T[r7][3 * idx + 1] = c_rx_by;
+      T[r7][3 * idx + 2] = c_ry_by;
     }
   }
 

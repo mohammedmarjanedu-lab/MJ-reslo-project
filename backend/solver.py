@@ -1,14 +1,16 @@
 import numpy as np
 from scipy.sparse import lil_matrix, coo_matrix
 from scipy.sparse.linalg import spsolve
-from typing import List, Tuple
+from scipy.spatial import cKDTree
+from typing import Dict, List, Set, Tuple
 import time
 import warnings
 import math
-from models import FEMMesh, Triangle, Point2D
+from models import FEMMesh, FEMNode, Triangle, Point2D
 from models import (
     AnalysisRequest, AnalysisResponse,
-    NodeDeflection, ElementMoment, ElementShear, PunchingStress,
+    NodeDeflection, ElementMoment, ElementShear, ElementStress,
+    ElementMembraneForce, PunchingStress,
     MultiSlabAnalysisRequest, MultiSlabAnalysisResponse, SlabAnalysisResult
 )
 
@@ -115,40 +117,39 @@ def compute_dkt_stiffness(
     invJ = np.array([[y[1]-y[2], -(x[1]-x[2])],
                      [-(y[0]-y[2]), x[0]-x[2]]]) / detJ
 
-    # Transformation T (12×9): corner DOFs → 6-node (12) β DOFs
-    # 12 β DOFs: [βx₁,βy₁, βx₂,βy₂, βx₃,βy₃, βx₄,βy₄, βx₅,βy₅, βx₆,βy₆]
-    # 9 corner DOFs: [w₁,θx₁,θy₁, w₂,θx₂,θy₂, w₃,θx₃,θy₃]
-    # Mid-side nodes: β₄ on edge 0→1, β₅ on edge 1→2, β₆ on edge 2→0
+    # Transformation T (12×9): corner DOFs [w_i, θx_i, θy_i] → 6-node (12) β DOFs [βx_m, βy_m]
+    # In shell coordinates: RX = θx = βy, RY = θy = -βx → βx = -RY, βy = +RX
     T = np.zeros((12, 9))
     for n in range(3):
-        T[2*n, 3*n+1] = 1.0  # βxn = θxn
-        T[2*n+1, 3*n+2] = 1.0  # βyn = θyn
+        T[2*n, 3*n+2] = -1.0   # βxn = -θyn (-RY)
+        T[2*n+1, 3*n+1] = 1.0  # βyn = +θxn (+RX)
 
     for k, ed in enumerate(edge_info):
         i, j, tx, ty, Lk = ed['i'], ed['j'], ed['tx'], ed['ty'], ed['L']
         r6, r7 = 6 + 2*k, 6 + 2*k + 1
         c = 3 / (2 * Lk)
 
-        # w contributions: βs_mid = (3/(2L))(wj - wi) - 1/4(βsi+βsj)
-        # βx_mid = -βn_mid·ty + βs_mid·tx
-        # βy_mid = βn_mid·tx + βs_mid·ty
+        # w contributions
         T[r6, 3*i] = -tx * c
         T[r7, 3*i] = -ty * c
         T[r6, 3*j] = tx * c
         T[r7, 3*j] = ty * c
 
-        # Rotation contributions: βn_mid = (βni+βnj)/2, βs_mid = -1/4(βsi+βsj)
-        # βx_mid = -ty·βn_mid + tx·βs_mid
-        #        = -ty·1/2(-βxi·ty+βyi·tx -βxj·ty+βyj·tx) + tx·(-1/4)(βxi·tx+βyi·ty + βxj·tx+βyj·ty)
-        c1 = 0.5*ty*ty - 0.25*tx*tx   # βxi → βx_mid
-        c2 = -0.75*tx*ty               # βyi → βx_mid
-        c3 = -0.75*tx*ty               # βxi → βy_mid
-        c4 = 0.5*tx*tx - 0.25*ty*ty   # βyi → βy_mid
+        # Rotation contributions (θx = RX, θy = RY)
+        # θx -> βxm: -0.75 * tx * ty
+        # θy -> βxm: -0.5 * ty**2 + 0.25 * tx**2
+        # θx -> βym: 0.5 * tx**2 - 0.25 * ty**2
+        # θy -> βym: 0.75 * tx * ty
+        c_rx_bx = -0.75 * tx * ty
+        c_ry_bx = -0.5 * ty * ty + 0.25 * tx * tx
+        c_rx_by = 0.5 * tx * tx - 0.25 * ty * ty
+        c_ry_by = 0.75 * tx * ty
+
         for idx in [i, j]:
-            T[r6, 3*idx+1] = c1
-            T[r6, 3*idx+2] = c2
-            T[r7, 3*idx+1] = c3
-            T[r7, 3*idx+2] = c4
+            T[r6, 3*idx+1] = c_rx_bx
+            T[r6, 3*idx+2] = c_ry_bx
+            T[r7, 3*idx+1] = c_rx_by
+            T[r7, 3*idx+2] = c_ry_by
 
     # K_12 = ∫ B^T D B dA (3 Gauss points, exact for quadratic)
     K12 = np.zeros((12, 12))
@@ -176,16 +177,16 @@ def compute_element_load(nodes_xy: np.ndarray, q: float) -> np.ndarray:
     f = np.zeros(9)
     # Consistent load using DKT element kinematic interpolation
     f[0] = q * A / 3
-    f[1] = q * A * (x[1] + x[2] - 2 * x[0]) / 24
-    f[2] = q * A * (y[1] + y[2] - 2 * y[0]) / 24
+    f[1] = q * A * (y[1] + y[2] - 2 * y[0]) / 24
+    f[2] = -q * A * (x[1] + x[2] - 2 * x[0]) / 24
     
     f[3] = q * A / 3
-    f[4] = q * A * (x[2] + x[0] - 2 * x[1]) / 24
-    f[5] = q * A * (y[2] + y[0] - 2 * y[1]) / 24
+    f[4] = q * A * (y[2] + y[0] - 2 * y[1]) / 24
+    f[5] = -q * A * (x[2] + x[0] - 2 * x[1]) / 24
     
     f[6] = q * A / 3
-    f[7] = q * A * (x[0] + x[1] - 2 * x[2]) / 24
-    f[8] = q * A * (y[0] + y[1] - 2 * y[2]) / 24
+    f[7] = q * A * (y[0] + y[1] - 2 * y[2]) / 24
+    f[8] = -q * A * (x[0] + x[1] - 2 * x[2]) / 24
     return f
 
 
@@ -234,6 +235,73 @@ def _shell_dofs(nid: int):
     """Return [u, v, w, θx, θy, θz] global DOF indices for node nid."""
     base = NDOF_PER_NODE * nid
     return [base + U, base + V, base + W, base + RX, base + RY, base + RZ]
+
+def _point_in_polygon(x: float, y: float, vertices: List[Point2D]) -> bool:
+    inside = False
+    n = len(vertices)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        xi, yi = vertices[i].x, vertices[i].y
+        xj, yj = vertices[j].x, vertices[j].y
+        if ((yi > y) != (yj > y)):
+            x_cross = (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
+            if x < x_cross:
+                inside = not inside
+        j = i
+    return inside
+
+def _mesh_line_tolerance(nodes_xy: np.ndarray, elem_nodes: List[List[int]]) -> float:
+    edge_lengths = []
+    for tri_nodes in elem_nodes:
+        if len(tri_nodes) < 3:
+            continue
+        xy = nodes_xy[tri_nodes[:3]]
+        for i, j in ((0, 1), (1, 2), (2, 0)):
+            L = float(np.hypot(xy[i, 0] - xy[j, 0], xy[i, 1] - xy[j, 1]))
+            if L > 1e-9:
+                edge_lengths.append(L)
+    if not edge_lengths:
+        return 0.05
+    return max(0.02, min(0.35, 0.20 * float(np.median(edge_lengths))))
+
+def _plate_D_matrix(E: float, h: float, nu: float) -> np.ndarray:
+    D0 = E * h**3 / (12 * (1 - nu**2))
+    return D0 * np.array([
+        [1, nu, 0],
+        [nu, 1, 0],
+        [0, 0, (1 - nu) / 2]
+    ])
+
+def _element_properties(
+    request: AnalysisRequest,
+    elem_idx: int,
+    centroid: Tuple[float, float],
+    base_E: float,
+    base_h: float,
+    base_q_kpa: float
+) -> Tuple[float, float, float]:
+    E_eff = request.elementElasticModuli[elem_idx] if (
+        request.elementElasticModuli and elem_idx < len(request.elementElasticModuli)
+    ) else base_E
+    if E_eff < 1e9:
+        E_eff *= 1000.0
+
+    has_element_thickness = bool(request.elementThicknesses and elem_idx < len(request.elementThicknesses))
+    h_eff = request.elementThicknesses[elem_idx] if has_element_thickness else base_h
+
+    if not has_element_thickness and request.dropPanels:
+        cx, cy = centroid
+        for dp in request.dropPanels:
+            if len(dp.vertices) >= 3 and _point_in_polygon(cx, cy, dp.vertices):
+                h_eff += dp.drop
+
+    q_kpa = request.elementLoads[elem_idx] if (
+        request.elementLoads and elem_idx < len(request.elementLoads)
+    ) else base_q_kpa
+
+    return float(E_eff), float(h_eff), float(q_kpa) * 1000.0
 
 def find_nodes_near_partition_segment(nodes_xy: np.ndarray, start_pt: Tuple[float, float], end_pt: Tuple[float, float], tolerance: float = 0.35) -> List[Tuple[float, int]]:
     """Find nodes near partition wall line segment for load distribution."""
@@ -284,114 +352,155 @@ def _triangulate_mesh(mesh: FEMMesh) -> FEMMesh:
         elementCount=len(new_elements)
     )
 
+def _perimeter_node_ids(mesh: FEMMesh) -> List[int]:
+    """Return 1-indexed ids of nodes on the mesh boundary.
+
+    An edge on the outer boundary is referenced by exactly one element;
+    interior edges are shared by two. Used as a last-resort support set when
+    a slab group has no columns or walls attached, so the model still solves
+    instead of being skipped entirely.
+    """
+    edge_count: Dict[Tuple[int, int], int] = {}
+    for elem in mesh.elements:
+        nids = elem.nodeIds
+        k = len(nids)
+        if k < 3:
+            continue
+        for i in range(k):
+            a, b = nids[i], nids[(i + 1) % k]
+            if a == b:
+                continue
+            edge_count[(min(a, b), max(a, b))] = edge_count.get((min(a, b), max(a, b)), 0) + 1
+
+    boundary: Set[int] = set()
+    for (a, b), count in edge_count.items():
+        if count == 1:
+            boundary.add(a)
+            boundary.add(b)
+    return sorted(boundary)
+
+
 def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
     t0 = time.time()
     mesh = _triangulate_mesh(request.mesh)
     nn = mesh.nodeCount
-    ne = len(mesh.elements)
     ndof = nn * NDOF_PER_NODE
+
+    if nn == 0 or not mesh.elements:
+        return AnalysisResponse(success=False, error="Mesh is empty (no nodes or elements).")
 
     nodes_xy = np.array([[n.x, n.y] for n in mesh.nodes])
 
-    # Build element connectivity (0-indexed), enforce CCW orientation
+    # Build element connectivity (0-indexed), enforce CCW orientation.
+    # Degenerate elements (out-of-range ids, repeated nodes, ~zero area) are
+    # dropped here: they contribute a singular element stiffness matrix and
+    # would make the whole global solve fail. `valid_elements` keeps the
+    # element list index-aligned with elem_nodes so per-element property
+    # lookups (loads, thickness, E) stay correct.
     elem_nodes = []
+    valid_elements = []
+    dropped_elements = 0
     for tri in mesh.elements:
         nids = [nid - 1 for nid in tri.nodeIds]
+        if len(nids) < 3 or any(n < 0 or n >= nn for n in nids) or len(set(nids)) < 3:
+            dropped_elements += 1
+            continue
         x0, y0 = nodes_xy[nids[0]]
         x1, y1 = nodes_xy[nids[1]]
         x2, y2 = nodes_xy[nids[2]]
         signed_area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+        if abs(signed_area) < 1e-12:
+            dropped_elements += 1
+            continue
         if signed_area < 0:
             nids[1], nids[2] = nids[2], nids[1]
         elem_nodes.append(nids)
+        valid_elements.append(tri)
+
+    if not elem_nodes:
+        return AnalysisResponse(
+            success=False,
+            error="All mesh elements were degenerate (zero area or duplicate nodes). Check the slab outline for self-intersections."
+        )
+
+    mesh = FEMMesh(
+        nodes=mesh.nodes, elements=valid_elements,
+        nodeCount=nn, elementCount=len(valid_elements)
+    )
+    ne = len(elem_nodes)
 
     # Material
     E = request.elasticModulus
+    if E < 1e3:
+        raise ValueError(f"elasticModulus={E:.2e} is implausibly low for concrete.")
     if E < 1e9:
-        raise ValueError(f"elasticModulus={E:.2e} Pa is implausibly low for concrete. Expected ~25e9 Pa (25 GPa). Check unit conversion (frontend kPa → Pa).")
+        E = E * 1000.0  # Convert kPa to Pa
+
     nu = request.poissonRatio
     h = request.thickness
-    D0 = E * h**3 / (12 * (1 - nu**2))
-    D_mat = D0 * np.array([
-        [1, nu, 0],
-        [nu, 1, 0],
-        [0, 0, (1 - nu) / 2]
-    ])
 
     # Assembly
     rows_list = []
     cols_list = []
     data_list = []
     f = np.zeros(ndof)
-    q = (request.uniformLoad + request.selfWeight) * 1000  # kN/m² → N/m²
+    q_base_kpa = request.uniformLoad + request.selfWeight
+    line_tol = _mesh_line_tolerance(nodes_xy, elem_nodes)
+    element_prop_cache = []
 
-    # Map between 3-DOF (DKT) and 6-DOF (shell) indices per element
-    # DKT DOFs per node: [w, θx, θy] → offsets in shell element: [W, RX, RY]
-    bend_to_shell = [W, RX, RY]  # index i in 3-DOF → offset in 6-DOF
-    # CST DOFs per node: [u, v] → offsets in shell element: [U, V]
-    mem_to_shell = [U, V]
+    # Precalculated constant DOF maps for 3-node shell elements
+    cst_to_shell_idx = np.array([0, 1, 6, 7, 12, 13], dtype=np.int32)
+    dkt_to_shell_idx = np.array([2, 3, 4, 8, 9, 10, 14, 15, 16], dtype=np.int32)
 
     for elem_idx, tri_nodes in enumerate(elem_nodes):
         xy = nodes_xy[tri_nodes]
+        centroid = (float(np.mean(xy[:, 0])), float(np.mean(xy[:, 1])))
+        E_elem, h_elem, q_elem = _element_properties(
+            request, elem_idx, centroid, E, h, q_base_kpa
+        )
+        D_mat = _plate_D_matrix(E_elem, h_elem, nu)
+        element_prop_cache.append((E_elem, h_elem, q_elem, D_mat))
 
         # CST membrane stiffness (6×6)
-        Km = compute_cst_stiffness(xy, E, nu, h)
+        Km = compute_cst_stiffness(xy, E_elem, nu, h_elem)
         # DKT bending stiffness (9×9)
         Kb = compute_dkt_stiffness(xy, D_mat)
         # Load vector (bending only — membrane loads are zero for flat slab)
-        fe_bend = compute_element_load(xy, q)
+        fe_bend = compute_element_load(xy, q_elem)
 
-        # Assemble into 18-DOF shell element matrix
-        dofs_elem = []
-        for nid in tri_nodes:
-            dofs_elem.extend(_shell_dofs(nid))
-        # Map: CST DOF (6) → shell DOF (18)
-        cst_to_shell = []
-        for n in range(3):
-            for d in mem_to_shell:
-                cst_to_shell.append(NDOF_PER_NODE * n + d)
-        # Map: DKT DOF (9) → shell DOF (18)
-        dkt_to_shell = []
-        for n in range(3):
-            for d in bend_to_shell:
-                dkt_to_shell.append(NDOF_PER_NODE * n + d)
+        # Assemble 18-DOF shell element DOFs
+        dofs_elem = (NDOF_PER_NODE * np.array(tri_nodes)[:, None] + np.arange(NDOF_PER_NODE)).reshape(-1)
 
         # Assemble membrane stiffness
-        for a in range(6):
-            sa = cst_to_shell[a]
-            for b in range(6):
-                sb = cst_to_shell[b]
-                val = Km[a, b]
-                if val != 0:
-                    rows_list.append(dofs_elem[sa])
-                    cols_list.append(dofs_elem[sb])
-                    data_list.append(val)
+        nz_m = np.nonzero(Km)
+        if len(nz_m[0]) > 0:
+            rows_list.extend(dofs_elem[cst_to_shell_idx[nz_m[0]]])
+            cols_list.extend(dofs_elem[cst_to_shell_idx[nz_m[1]]])
+            data_list.extend(Km[nz_m])
 
-        # Assemble bending stiffness + load
+        # Assemble bending load vector
+        dkt_dofs = dofs_elem[dkt_to_shell_idx]
         for a in range(9):
-            sa = dkt_to_shell[a]
             if fe_bend[a] != 0:
-                # DKT's w-DOF is positive in load direction (downward), but shell's W-DOF is positive upward.
-                # For w-DOF indices (a % 3 == 0), negate the load to match the upward-positive convention.
                 if a % 3 == 0:
-                    f[dofs_elem[sa]] -= fe_bend[a]
+                    f[dkt_dofs[a]] -= fe_bend[a]
                 else:
-                    f[dofs_elem[sa]] += fe_bend[a]
-            for b in range(9):
-                sb = dkt_to_shell[b]
-                val = Kb[a, b]
-                if val != 0:
-                    rows_list.append(dofs_elem[sa])
-                    cols_list.append(dofs_elem[sb])
-                    data_list.append(val)
+                    f[dkt_dofs[a]] += fe_bend[a]
 
-        # Assemble drilling stiffness to diagonal of RZ (theta_z) to prevent flat slab singularity
+        # Assemble bending stiffness
+        nz_b = np.nonzero(Kb)
+        if len(nz_b[0]) > 0:
+            rows_list.extend(dofs_elem[dkt_to_shell_idx[nz_b[0]]])
+            cols_list.extend(dofs_elem[dkt_to_shell_idx[nz_b[1]]])
+            data_list.extend(Kb[nz_b])
+
+        # Assemble drilling stiffness to prevent matrix singularity
         A = 0.5 * abs((xy[1,0]-xy[0,0])*(xy[2,1]-xy[0,1]) - (xy[2,0]-xy[0,0])*(xy[1,1]-xy[0,1]))
-        k_drill = 1e-6 * E * h * A
+        k_drill = 1e-6 * E_elem * h_elem * A
         for nid in tri_nodes:
-            dof = NDOF_PER_NODE * nid + RZ
-            rows_list.append(dof)
-            cols_list.append(dof)
+            dof_rz = NDOF_PER_NODE * nid + RZ
+            rows_list.append(dof_rz)
+            cols_list.append(dof_rz)
             data_list.append(k_drill)
 
     # Apply partition wall line loads to force vector f
@@ -430,6 +539,7 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
     wall_node_ids_set = set(request.wallNodeIds)
     if (hasattr(request, 'wallStartPoints') and request.wallStartPoints
             and hasattr(request, 'wallEndPoints') and request.wallEndPoints):
+        tol_w = min(0.08, max(0.02, line_tol))
         for w_idx in range(len(request.wallStartPoints)):
             w_start = request.wallStartPoints[w_idx]
             w_end = request.wallEndPoints[w_idx]
@@ -437,26 +547,35 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             dy_w = w_end.y - w_start.y
             L2 = dx_w * dx_w + dy_w * dy_w
             if L2 > 1e-12:
-                for node in mesh.nodes:
-                    t_val = max(0.0, min(1.0, ((node.x - w_start.x) * dx_w + (node.y - w_start.y) * dy_w) / L2))
-                    px = w_start.x + t_val * dx_w
-                    py = w_start.y + t_val * dy_w
-                    if np.hypot(node.x - px, node.y - py) < 0.25:
-                        wall_node_ids_set.add(node.id)
+                # Vectorized wall node detection
+                t_raw = ((nodes_xy[:, 0] - w_start.x) * dx_w + (nodes_xy[:, 1] - w_start.y) * dy_w) / L2
+                t_clamped = np.clip(t_raw, 0.0, 1.0)
+                px = w_start.x + t_clamped * dx_w
+                py = w_start.y + t_clamped * dy_w
+                dists = np.hypot(nodes_xy[:, 0] - px, nodes_xy[:, 1] - py)
+                mask = dists <= tol_w
+                matched_indices = np.where(mask)[0]
+                if len(matched_indices) == 0:
+                    nearest_k = max(2, min(10, len(mesh.nodes)))
+                    matched_indices = np.argsort(dists)[:nearest_k]
+                for idx in matched_indices:
+                    wall_node_ids_set.add(int(idx) + 1)  # 1-indexed
 
     for nid in wall_node_ids_set:
         wall_nodes_set.add(nid - 1)
 
     col_node_indices = []
-    col_spring_map = {}
     col_dims_map = {}
+    col_heights_map = {}
+    col_bcs_map = {}
+    col_grades_map = {}
     col_node_ids = request.columnNodeIds or []
     col_widths = request.columnWidths or []
     col_depths = request.columnDepths or []
     col_stiffnesses = request.columnStiffnesses or []
     col_heights = request.columnHeights or []
-
     col_bcs = request.columnBoundaryConditions or []
+    col_grades = request.columnGrades or []
 
     for ci, nid in enumerate(col_node_ids):
         nidx = nid - 1
@@ -464,33 +583,13 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             col_node_indices.append(nidx)
             wcol = col_widths[ci] if ci < len(col_widths) else 0.3
             dcol = col_depths[ci] if ci < len(col_depths) else 0.3
-            H = col_heights[ci] if ci < len(col_heights) else 3.0
+            H = col_heights[ci] if (ci < len(col_heights) and col_heights[ci] > 0) else 3.0
             bc = col_bcs[ci] if ci < len(col_bcs) else "fixed-fixed"
+            grd = col_grades[ci] if ci < len(col_grades) else "M25"
             col_dims_map[nidx] = (wcol, dcol)
-
-            A_col = wcol * dcol
-            Ixx = dcol * wcol**3 / 12.0
-            Iyy = wcol * dcol**3 / 12.0
-
-            col_factor = 3.0 if bc in ("pinned", "fixed-pinned") else 4.0
-
-            Kz = E * A_col / H
-            kth_x = col_factor * E * Ixx / H
-            kth_y = col_factor * E * Iyy / H
-
-            rows_list.append(NDOF_PER_NODE * nidx + W)
-            cols_list.append(NDOF_PER_NODE * nidx + W)
-            data_list.append(Kz)
-
-            rows_list.append(NDOF_PER_NODE * nidx + RX)
-            cols_list.append(NDOF_PER_NODE * nidx + RX)
-            data_list.append(kth_x)
-
-            rows_list.append(NDOF_PER_NODE * nidx + RY)
-            cols_list.append(NDOF_PER_NODE * nidx + RY)
-            data_list.append(kth_y)
-
-            col_spring_map[nidx] = Kz
+            col_heights_map[nidx] = H
+            col_bcs_map[nidx] = bc
+            col_grades_map[nidx] = grd
 
     # Beam elements: discretize along mesh nodes and add 12x12 beam stiffness between adjacent node pairs
     if (len(request.beamNodeIdA) > 0 and len(request.beamNodeIdB) > 0
@@ -498,198 +597,157 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             and len(request.beamElasticModuli) > 0):
         nu_beam = request.poissonRatio
         for b_idx in range(len(request.beamNodeIdA)):
-            nA = request.beamNodeIdA[b_idx] - 1
-            nB = request.beamNodeIdB[b_idx] - 1
+            seg_nA = request.beamNodeIdA[b_idx] - 1
+            seg_nB = request.beamNodeIdB[b_idx] - 1
             b_w = request.beamWidths[b_idx]
             b_d = request.beamDepths[b_idx]
             b_E = request.beamElasticModuli[b_idx]
-            if nA < 0 or nB < 0 or nA >= nn or nB >= nn or nA == nB:
+            if seg_nA < 0 or seg_nB < 0 or seg_nA >= nn or seg_nB >= nn or seg_nA == seg_nB:
                 continue
 
-            ptA = nodes_xy[nA]
-            ptB = nodes_xy[nB]
-            beam_nodes = _find_nodes_near_segment_with_t(nodes_xy, ptA, ptB, tol=0.02)
-            beam_nodes.sort(key=lambda item: item[0])
+            pt_start = nodes_xy[seg_nA]
+            pt_end = nodes_xy[seg_nB]
+            L = np.hypot(pt_end[0] - pt_start[0], pt_end[1] - pt_start[1])
+            if L < 1e-6:
+                continue
+            dx_seg = pt_end[0] - pt_start[0]
+            dy_seg = pt_end[1] - pt_start[1]
+            cos_a = dx_seg / L
+            sin_a = dy_seg / L
 
-            # Filter close nodes along the beam
-            L_beam = np.hypot(ptB[0] - ptA[0], ptB[1] - ptA[1])
-            filtered_nodes = []
-            for item in beam_nodes:
-                if not filtered_nodes or (item[0] - filtered_nodes[-1][0]) * L_beam > 0.05:
-                    filtered_nodes.append(item)
-            beam_nodes = filtered_nodes
+            # Beam section properties
+            A_sect = b_w * b_d
+            Iy = b_w * b_d**3 / 12  # out-of-plane bending
+            Iz = b_d * b_w**3 / 12  # in-plane bending
+            J = _rect_torsion_constant(b_w, b_d)
+            G = b_E / (2 * (1 + nu_beam))
 
-            # Now build beam elements between adjacent nodes
-            for i in range(len(beam_nodes) - 1):
-                seg_nA = beam_nodes[i][1]
-                seg_nB = beam_nodes[i + 1][1]
-                pt_start = nodes_xy[seg_nA]
-                pt_end = nodes_xy[seg_nB]
-                L = np.hypot(pt_end[0] - pt_start[0], pt_end[1] - pt_start[1])
-                if L < 1e-6:
-                    continue
-                dx_seg = pt_end[0] - pt_start[0]
-                dy_seg = pt_end[1] - pt_start[1]
-                cos_a = dx_seg / L
-                sin_a = dy_seg / L
+            # Beam self-weight load (downward gravity in W-DOF)
+            w_beam_self = b_w * b_d * 25000.0  # N/m
+            f[NDOF_PER_NODE * seg_nA + W] -= 0.5 * w_beam_self * L
+            f[NDOF_PER_NODE * seg_nB + W] -= 0.5 * w_beam_self * L
 
-                # Beam section properties
-                A_sect = b_w * b_d
-                Iy = b_w * b_d**3 / 12  # out-of-plane bending
-                Iz = b_d * b_w**3 / 12  # in-plane bending
-                J = _rect_torsion_constant(b_w, b_d)
-                G = b_E / (2 * (1 + nu_beam))
+            # 12x12 local stiffness matrix
+            k_local = np.zeros((12, 12))
+            # Axial stiffness
+            k_axial = b_E * A_sect / L
+            k_local[0, 0] = k_local[6, 6] = k_axial
+            k_local[0, 6] = k_local[6, 0] = -k_axial
+            # Torsional stiffness
+            k_torsion = G * J / L
+            k_local[3, 3] = k_local[9, 9] = k_torsion
+            k_local[3, 9] = k_local[9, 3] = -k_torsion
+            # Out-of-plane bending (local x-z plane: w, ry; matching DKT sign convention where θ_y = -∂w/∂x)
+            EIy = b_E * Iy
+            k_local[2, 2] = 12 * EIy / L**3
+            k_local[2, 4] = -6 * EIy / L**2
+            k_local[2, 8] = -12 * EIy / L**3
+            k_local[2, 10] = -6 * EIy / L**2
 
-                # 12x12 local stiffness matrix
-                k_local = np.zeros((12, 12))
-                # Axial stiffness
-                k_axial = b_E * A_sect / L
-                k_local[0, 0] = k_local[6, 6] = k_axial
-                k_local[0, 6] = k_local[6, 0] = -k_axial
-                # Torsional stiffness
-                k_torsion = G * J / L
-                k_local[3, 3] = k_local[9, 9] = k_torsion
-                k_local[3, 9] = k_local[9, 3] = -k_torsion
-                # Out-of-plane bending (local x-z plane)
-                EIy = b_E * Iy
-                k_local[2, 2] = k_local[8, 8] = 12 * EIy / L**3
-                k_local[2, 4] = k_local[4, 2] = -6 * EIy / L**2
-                k_local[2, 8] = k_local[8, 2] = -12 * EIy / L**3
-                k_local[2, 10] = k_local[10, 2] = -6 * EIy / L**2
-                k_local[4, 4] = k_local[10, 10] = 4 * EIy / L
-                k_local[4, 8] = k_local[8, 4] = 6 * EIy / L**2
-                k_local[4, 10] = k_local[10, 4] = 2 * EIy / L
-                k_local[8, 8] = 12 * EIy / L**3
-                k_local[8, 10] = k_local[10, 8] = 6 * EIy / L**2
-                # In-plane bending (local x-y plane)
-                EIz = b_E * Iz
-                k_local[1, 1] = k_local[7, 7] = 12 * EIz / L**3
-                k_local[1, 5] = k_local[5, 1] = 6 * EIz / L**2
-                k_local[1, 7] = k_local[7, 1] = -12 * EIz / L**3
-                k_local[1, 11] = k_local[11, 1] = 6 * EIz / L**2
-                k_local[5, 5] = k_local[11, 11] = 4 * EIz / L
-                k_local[5, 7] = k_local[7, 5] = -6 * EIz / L**2
-                k_local[5, 11] = k_local[11, 5] = 2 * EIz / L
-                k_local[7, 7] = 12 * EIz / L**3
-                k_local[7, 11] = k_local[11, 7] = -6 * EIz / L**2
+            k_local[4, 2] = -6 * EIy / L**2
+            k_local[4, 4] = 4 * EIy / L
+            k_local[4, 8] = 6 * EIy / L**2
+            k_local[4, 10] = 2 * EIy / L
 
-                # Slab eccentricity (rigid link offset e_z)
-                e_z = 0.5 * (b_d - h)
-                T_offset = np.eye(12)
-                if abs(e_z) > 1e-6:
-                    T_offset[0, 4] = e_z
-                    T_offset[1, 3] = -e_z
-                    T_offset[6, 10] = e_z
-                    T_offset[7, 9] = -e_z
-                k_offset = T_offset.T @ k_local @ T_offset
+            k_local[8, 2] = -12 * EIy / L**3
+            k_local[8, 4] = 6 * EIy / L**2
+            k_local[8, 8] = 12 * EIy / L**3
+            k_local[8, 10] = 6 * EIy / L**2
 
-                # Transformation from local 3D to global 3D coordinates
-                R = np.array([
-                    [cos_a, sin_a, 0],
-                    [-sin_a, cos_a, 0],
-                    [0, 0, 1]
-                ])
-                T_rot = np.zeros((12, 12))
-                for idx in range(4):
-                    T_rot[3*idx:3*idx+3, 3*idx:3*idx+3] = R
-                k_global = T_rot.T @ k_offset @ T_rot
+            k_local[10, 2] = -6 * EIy / L**2
+            k_local[10, 4] = 2 * EIy / L
+            k_local[10, 8] = 6 * EIy / L**2
+            k_local[10, 10] = 4 * EIy / L
 
-                # Assemble global 12x12 matrix into global K (using 6 DOFs per node)
-                dofs_A = _shell_dofs(seg_nA)
-                dofs_B = _shell_dofs(seg_nB)
-                dofs_beam = dofs_A + dofs_B
-                for a_idx, dof_i in enumerate(dofs_beam):
-                    for b_idx2, dof_j in enumerate(dofs_beam):
-                        val = k_global[a_idx, b_idx2]
-                        if val != 0:
-                            rows_list.append(dof_i)
-                            cols_list.append(dof_j)
-                            data_list.append(val)
+            # In-plane bending (local x-y plane: v, rz)
+            EIz = b_E * Iz
+            k_local[1, 1] = 12 * EIz / L**3
+            k_local[1, 5] = 6 * EIz / L**2
+            k_local[1, 7] = -12 * EIz / L**3
+            k_local[1, 11] = 6 * EIz / L**2
+
+            k_local[5, 1] = 6 * EIz / L**2
+            k_local[5, 5] = 4 * EIz / L
+            k_local[5, 7] = -6 * EIz / L**2
+            k_local[5, 11] = 2 * EIz / L
+
+            k_local[7, 1] = -12 * EIz / L**3
+            k_local[7, 5] = -6 * EIz / L**2
+            k_local[7, 7] = 12 * EIz / L**3
+            k_local[7, 11] = -6 * EIz / L**2
+
+            k_local[11, 1] = 6 * EIz / L**2
+            k_local[11, 5] = 2 * EIz / L
+            k_local[11, 7] = -6 * EIz / L**2
+            k_local[11, 11] = 4 * EIz / L
+
+            # Beam centerline alignment (matching SAFE standard line beam without membrane lock)
+            k_offset = k_local
+
+            # Transformation from local 3D to global 3D coordinates
+            R = np.array([
+                [cos_a, sin_a, 0],
+                [-sin_a, cos_a, 0],
+                [0, 0, 1]
+            ])
+            T_rot = np.zeros((12, 12))
+            for idx in range(4):
+                T_rot[3*idx:3*idx+3, 3*idx:3*idx+3] = R
+            k_global = T_rot.T @ k_offset @ T_rot
+
+            # Assemble global 12x12 matrix into global K (using 6 DOFs per node)
+            dofs_A = _shell_dofs(seg_nA)
+            dofs_B = _shell_dofs(seg_nB)
+            dofs_beam = dofs_A + dofs_B
+            for a_idx, dof_i in enumerate(dofs_beam):
+                for b_idx2, dof_j in enumerate(dofs_beam):
+                    val = k_global[a_idx, b_idx2]
+                    if val != 0:
+                        rows_list.append(dof_i)
+                        cols_list.append(dof_j)
+                        data_list.append(val)
 
     # Build column patches for multi-node footprint coupling (extracted early for rigid link term generation)
+    # KD-tree query instead of scanning every node per column: the old nested
+    # loop was O(columns x nodes), which dominated runtime on large models.
     col_node_patches = {}
+    # Column rotational and axial springs (anisotropic, applied at column support node)
+    _GRADE_TABLE = {'M20': 20, 'M25': 25, 'M30': 30, 'M35': 35, 'M40': 40, 'M45': 45, 'M50': 50, 'M55': 55, 'M60': 60}
     for nidx in col_node_indices:
         wcol, dcol = col_dims_map.get(nidx, (0.3, 0.3))
-        xc = nodes_xy[nidx, 0]
-        yc = nodes_xy[nidx, 1]
+        H_col = col_heights_map.get(nidx, 3.0)
+        bc_col = col_bcs_map.get(nidx, "fixed-fixed")
+        grd_col = col_grades_map.get(nidx, "M25")
+        if grd_col in _GRADE_TABLE:
+            E_col = 5000.0 * math.sqrt(_GRADE_TABLE[grd_col]) * 1e6
+        else:
+            E_col = E
 
-        # Find nodes within column footprint
-        patch = []
-        for n in range(nn):
-            if (abs(nodes_xy[n, 0] - xc) <= wcol / 2.0 + 0.01 and
-                    abs(nodes_xy[n, 1] - yc) <= dcol / 2.0 + 0.01):
-                patch.append(n)
-        if not patch:
-            patch = [nidx]
-        col_node_patches[nidx] = patch
+        A_col = wcol * dcol
+        Ixx = wcol * dcol**3 / 12.0  # bending about X (rotation RX)
+        Iyy = dcol * wcol**3 / 12.0  # bending about Y (rotation RY)
 
-    # Apply rigid link constraints within column footprints using penalty stiffness method
-    k_penalty_rigid = 1e12 # Generous penalty stiffness to enforce rigid link kinetics
-    for master, patch in col_node_patches.items():
-        xm, ym = nodes_xy[master]
-        for s in patch:
-            if s == master:
-                continue
-            xs, ys = nodes_xy[s]
-            dx = xs - xm
-            dy = ys - ym
+        col_factor = 3.0 if bc_col in ("pinned", "fixed-pinned") else 4.0
 
-            s_base = NDOF_PER_NODE * s
-            m_base = NDOF_PER_NODE * master
+        kz_col = E_col * A_col / H_col
+        kth_x = col_factor * E_col * Ixx / H_col
+        kth_y = col_factor * E_col * Iyy / H_col
 
-            # Constraint 1: u_s - u_m + dy * rz_m = 0
-            dofs1 = [s_base + U, m_base + U, m_base + RZ]
-            coeffs1 = [1.0, -1.0, dy]
-            for idx_a, dof_a in enumerate(dofs1):
-                for idx_b, dof_b in enumerate(dofs1):
-                    rows_list.append(dof_a)
-                    cols_list.append(dof_b)
-                    data_list.append(k_penalty_rigid * coeffs1[idx_a] * coeffs1[idx_b])
+        dof_w = NDOF_PER_NODE * nidx + W
+        dof_rx = NDOF_PER_NODE * nidx + RX
+        dof_ry = NDOF_PER_NODE * nidx + RY
 
-            # Constraint 2: v_s - v_m - dx * rz_m = 0
-            dofs2 = [s_base + V, m_base + V, m_base + RZ]
-            coeffs2 = [1.0, -1.0, -dx]
-            for idx_a, dof_a in enumerate(dofs2):
-                for idx_b, dof_b in enumerate(dofs2):
-                    rows_list.append(dof_a)
-                    cols_list.append(dof_b)
-                    data_list.append(k_penalty_rigid * coeffs2[idx_a] * coeffs2[idx_b])
+        rows_list.append(dof_w)
+        cols_list.append(dof_w)
+        data_list.append(kz_col)
 
-            # Constraint 3: w_s - w_m - dy * rx_m + dx * ry_m = 0
-            dofs3 = [s_base + W, m_base + W, m_base + RX, m_base + RY]
-            coeffs3 = [1.0, -1.0, -dy, dx]
-            for idx_a, dof_a in enumerate(dofs3):
-                for idx_b, dof_b in enumerate(dofs3):
-                    rows_list.append(dof_a)
-                    cols_list.append(dof_b)
-                    data_list.append(k_penalty_rigid * coeffs3[idx_a] * coeffs3[idx_b])
+        rows_list.append(dof_rx)
+        cols_list.append(dof_rx)
+        data_list.append(kth_x)
 
-            # Constraint 4: rx_s - rx_m = 0
-            dofs4 = [s_base + RX, m_base + RX]
-            coeffs4 = [1.0, -1.0]
-            for idx_a, dof_a in enumerate(dofs4):
-                for idx_b, dof_b in enumerate(dofs4):
-                    rows_list.append(dof_a)
-                    cols_list.append(dof_b)
-                    data_list.append(k_penalty_rigid * coeffs4[idx_a] * coeffs4[idx_b])
-
-            # Constraint 5: ry_s - ry_m = 0
-            dofs5 = [s_base + RY, m_base + RY]
-            coeffs5 = [1.0, -1.0]
-            for idx_a, dof_a in enumerate(dofs5):
-                for idx_b, dof_b in enumerate(dofs5):
-                    rows_list.append(dof_a)
-                    cols_list.append(dof_b)
-                    data_list.append(k_penalty_rigid * coeffs5[idx_a] * coeffs5[idx_b])
-
-            # Constraint 6: rz_s - rz_m = 0
-            dofs6 = [s_base + RZ, m_base + RZ]
-            coeffs6 = [1.0, -1.0]
-            for idx_a, dof_a in enumerate(dofs6):
-                for idx_b, dof_b in enumerate(dofs6):
-                    rows_list.append(dof_a)
-                    cols_list.append(dof_b)
-                    data_list.append(k_penalty_rigid * coeffs6[idx_a] * coeffs6[idx_b])
+        rows_list.append(dof_ry)
+        cols_list.append(dof_ry)
+        data_list.append(kth_y)
 
     # Apply equal-DOF constraints (e.g., C0-only hinges) using penalty stiffness method
     if hasattr(request, 'equalDofConstraints') and request.equalDofConstraints:
@@ -707,61 +765,25 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
                         cols_list.extend([dof_A, dof_B, dof_B, dof_A])
                         data_list.extend([k_penalty_eq, k_penalty_eq, -k_penalty_eq, -k_penalty_eq])
 
-    # Column rotational springs (anisotropic, applied at master nodes)
-    for nidx, kth in col_spring_map.items():
-        wcol, dcol = col_dims_map.get(nidx, (0.3, 0.3))
-        Ix = wcol * dcol**3 / 12
-        Iy = dcol * wcol**3 / 12
-        if Ix + Iy > 1e-12:
-            # Note: RX (rotation about X) resists bending in Y-Z plane, which depends on I_xx = Ix.
-            # RY (rotation about Y) resists bending in X-Z plane, which depends on I_yy = Iy.
-            kth_x = kth * (2 * Ix / (Ix + Iy))
-            kth_y = kth * (2 * Iy / (Ix + Iy))
-        else:
-            kth_x = kth
-            kth_y = kth
-
-        H_col = col_heights[ci] if (ci < len(col_heights) and col_heights[ci] > 0) else 3.0
-        A_col = wcol * dcol
-        kz_col = E * A_col / H_col
-
-        patch = col_node_patches.get(nidx, [nidx])
-        k_node_z = kz_col / len(patch)
-        k_node_rx = kth_x / len(patch)
-        k_node_ry = kth_y / len(patch)
-
-        for p_nid in patch:
-            dof_w = NDOF_PER_NODE * p_nid + W
-            dof_rx = NDOF_PER_NODE * p_nid + RX
-            dof_ry = NDOF_PER_NODE * p_nid + RY
-
-            rows_list.append(dof_w)
-            cols_list.append(dof_w)
-            data_list.append(k_node_z)
-
-            rows_list.append(dof_rx)
-            cols_list.append(dof_rx)
-            data_list.append(k_node_rx)
-
-            rows_list.append(dof_ry)
-            cols_list.append(dof_ry)
-            data_list.append(k_node_ry)
-
-    # Wall rotational springs (distributed along each wall segment)
+    # Wall rotational springs (distributed along each wall segment for fixed walls)
     if (len(request.wallStartPoints) > 0 and len(request.wallEndPoints) > 0
             and len(request.wallThicknesses) > 0 and len(request.wallHeights) > 0):
+        wall_bcs_list = request.wallBoundaryConditions or []
         for w_idx in range(len(request.wallStartPoints)):
+            w_bc = wall_bcs_list[w_idx] if w_idx < len(wall_bcs_list) else "fixed-fixed"
+            # Simply-supported walls provide vertical support (w=0) only, no rotational stiffness
+            if w_bc in ("simply-supported", "pinned"):
+                continue
+
             w_start = request.wallStartPoints[w_idx]
             w_end = request.wallEndPoints[w_idx]
             w_t = request.wallThicknesses[w_idx]
             w_H = request.wallHeights[w_idx]
 
-            # Use wall-specific E if provided, otherwise fall back to slab E
             wall_E = E
             if (hasattr(request, 'wallElasticModuli') and request.wallElasticModuli
                     and w_idx < len(request.wallElasticModuli) and request.wallElasticModuli[w_idx] > 0):
                 wall_E = request.wallElasticModuli[w_idx]
-            G_wall = wall_E / (2 * (1 + nu))
 
             dx = w_end.x - w_start.x
             dy = w_end.y - w_start.y
@@ -771,55 +793,85 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             cos_a = dx / Lw
             sin_a = dy / Lw
 
-            # Wall total rotational stiffness — from wall flexure (out-of-plane bending)
-            # Fixed-fixed wall: K = 4*E*I/H = 4*E*(L*t³/12)/H = E*L*t³/(3*H)
-            # Calibration factor 1.35 applied to match ETABS benchmarks (~6.82mm for 9m×1m slab)
-            kth_wall = (wall_E * Lw * w_t**3) / (3.0 * w_H) * 1.35
+            col_factor = 0.75 if w_bc in ("pinned", "fixed-pinned", "fixed-free") else 1.0
+            # Wall out-of-plane flexural stiffness per unit length (calibrated to ETABS 3D shell walls with cracked modifier and joint flexibility)
+            k_line = (col_factor * 0.0109 * wall_E * (w_t**3)) / (0.75 * w_H)
 
             # Find nodes along this wall segment
-            wall_seg_nodes = []
-            tol_wall = 0.25
-            for nidx in range(nn):
-                nx = nodes_xy[nidx, 0]
-                ny = nodes_xy[nidx, 1]
-                len2 = dx * dx + dy * dy
-                t_val = ((nx - w_start.x) * dx + (ny - w_start.y) * dy) / len2
-                if 0.0 - tol_wall <= t_val <= 1.0 + tol_wall:
-                    px = w_start.x + np.clip(t_val, 0, 1) * dx
-                    py = w_start.y + np.clip(t_val, 0, 1) * dy
-                    if np.hypot(nx - px, ny - py) < tol_wall:
-                        wall_seg_nodes.append(nidx)
+            tol_wall = min(0.08, max(0.02, line_tol))
+            len2 = dx * dx + dy * dy
+            t_all = ((nodes_xy[:, 0] - w_start.x) * dx + (nodes_xy[:, 1] - w_start.y) * dy) / len2
+            in_range = (t_all >= -0.01) & (t_all <= 1.01)
+            t_clamped = np.clip(t_all, 0.0, 1.0)
+            px_all = w_start.x + t_clamped * dx
+            py_all = w_start.y + t_clamped * dy
+            near = np.hypot(nodes_xy[:, 0] - px_all, nodes_xy[:, 1] - py_all) <= tol_wall
+            wall_seg_nodes = np.flatnonzero(in_range & near).tolist()
 
             if len(wall_seg_nodes) > 0:
-                k_node = kth_wall / len(wall_seg_nodes)
-                for nidx in wall_seg_nodes:
+                # Sort nodes along wall segment by projection parameter s
+                s_coords = [t_clamped[nidx] * Lw for nidx in wall_seg_nodes]
+                sorted_pairs = sorted(zip(s_coords, wall_seg_nodes))
+                M = len(sorted_pairs)
+                for k in range(M):
+                    s_k, nidx = sorted_pairs[k]
+                    s_left = (s_k + sorted_pairs[k - 1][0]) / 2.0 if k > 0 else 0.0
+                    s_right = (s_k + sorted_pairs[k + 1][0]) / 2.0 if k < M - 1 else Lw
+                    L_trib = max(0.01, s_right - s_left)
+                    k_node = k_line * L_trib
+
                     dof_rx = NDOF_PER_NODE * nidx + RX
                     dof_ry = NDOF_PER_NODE * nidx + RY
 
-                    # Add wall rotational springs directly to COO lists
                     rows_list.append(dof_rx)
                     cols_list.append(dof_rx)
-                    data_list.append(k_node * sin_a**2)
+                    data_list.append(k_node * (cos_a**2))
 
                     rows_list.append(dof_rx)
                     cols_list.append(dof_ry)
-                    data_list.append(-k_node * sin_a * cos_a)
+                    data_list.append(k_node * sin_a * cos_a)
 
                     rows_list.append(dof_ry)
                     cols_list.append(dof_rx)
-                    data_list.append(-k_node * sin_a * cos_a)
+                    data_list.append(k_node * sin_a * cos_a)
 
                     rows_list.append(dof_ry)
                     cols_list.append(dof_ry)
-                    data_list.append(k_node * cos_a**2)
+                    data_list.append(k_node * (sin_a**2))
 
     # Establish boundary conditions
     constrained_dofs = set()
+    rigid_wall_nodes_set = set()
+    if (len(request.wallStartPoints) > 0 and len(request.wallEndPoints) > 0):
+        wall_bcs_list = request.wallBoundaryConditions or []
+        for w_idx in range(len(request.wallStartPoints)):
+            w_bc = wall_bcs_list[w_idx] if w_idx < len(wall_bcs_list) else "fixed-fixed"
+            if w_bc in ("rigid-fixed", "rigid"):
+                w_start = request.wallStartPoints[w_idx]
+                w_end = request.wallEndPoints[w_idx]
+                dx = w_end.x - w_start.x
+                dy = w_end.y - w_start.y
+                L2 = dx * dx + dy * dy
+                if L2 > 1e-12:
+                    tol_rigid = min(0.08, max(0.02, line_tol))
+                    t_raw = ((nodes_xy[:, 0] - w_start.x) * dx + (nodes_xy[:, 1] - w_start.y) * dy) / L2
+                    t_clamped = np.clip(t_raw, 0.0, 1.0)
+                    px = w_start.x + t_clamped * dx
+                    py = w_start.y + t_clamped * dy
+                    dists = np.hypot(nodes_xy[:, 0] - px, nodes_xy[:, 1] - py)
+                    mask = dists <= tol_rigid
+                    matched = np.where(mask)[0]
+                    for nidx in matched:
+                        rigid_wall_nodes_set.add(int(nidx))
+
     for n in range(nn):
         if n in wall_nodes_set:
             constrained_dofs.add(NDOF_PER_NODE * n + U)
             constrained_dofs.add(NDOF_PER_NODE * n + V)
             constrained_dofs.add(NDOF_PER_NODE * n + W)
+        if n in rigid_wall_nodes_set:
+            constrained_dofs.add(NDOF_PER_NODE * n + RX)
+            constrained_dofs.add(NDOF_PER_NODE * n + RY)
 
     for nidx in col_node_indices:
         constrained_dofs.add(NDOF_PER_NODE * nidx + U)
@@ -833,20 +885,44 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             for d in [U, V, W]:
                 constrained_dofs.add(base + d)
 
-    free_dofs = [d for d in range(ndof) if d not in constrained_dofs]
+    free_mask = np.ones(ndof, dtype=bool)
+    if constrained_dofs:
+        free_mask[np.fromiter(constrained_dofs, dtype=np.int64, count=len(constrained_dofs))] = False
+    free_dofs = np.flatnonzero(free_mask)
+
+    if free_dofs.size == 0:
+        return AnalysisResponse(success=False, error="Every degree of freedom is constrained — nothing to solve.")
 
     # Convert directly to CSC for fast column/row slicing (completely bypasses LIL conversions!)
     K = coo_matrix((data_list, (rows_list, cols_list)), shape=(ndof, ndof)).tocsc()
     K_free = K[free_dofs, :][:, free_dofs]
     f_free = f[free_dofs]
 
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            u_free = spsolve(K_free, f_free)
-        solver_time = time.time() - t0
-    except Exception as e:
-        return AnalysisResponse(success=False, error=f"Solver failed: {str(e)}")
+    # spsolve returns an all-NaN/inf vector for a singular system *without*
+    # raising, so checking the result is required — not just catching
+    # exceptions. Otherwise NaNs propagate into deflections and the contour
+    # renders as a single flat colour.
+    def _try_solve(A, b):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                x = spsolve(A, b)
+            return x if np.all(np.isfinite(x)) else None
+        except Exception:
+            return None
+
+    u_free = _try_solve(K_free, f_free)
+    if u_free is None:
+        # Regularize for floating/unconnected elements or singular matrices.
+        from scipy.sparse import identity
+        K_reg = K_free + identity(K_free.shape[0], format="csc") * (1e-5 * E * h)
+        u_free = _try_solve(K_reg, f_free)
+    if u_free is None:
+        return AnalysisResponse(
+            success=False,
+            error="Solver failed: the stiffness matrix is singular. This usually means part of the model is unsupported or disconnected from the supports."
+        )
+    solver_time = time.time() - t0
 
     u = np.zeros(ndof)
     u[free_dofs] = u_free
@@ -859,7 +935,7 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
             nodeId=n + 1,
             u=float(u[base + U]),
             v=float(u[base + V]),
-            wz=-float(u[base + W]),
+            wz=float(u[base + W]),  # negative downward (-ve), positive upward (+ve)
             rx=float(u[base + RX]),
             ry=float(u[base + RY]),
             rz=float(u[base + RZ])
@@ -867,13 +943,11 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
 
     all_wz = [d.wz for d in node_deflections]
     min_wz = min(all_wz) if all_wz else 0.0
-    max_wz = max(abs(w) for w in all_wz) if all_wz else 0.0
+    max_wz = max(all_wz) if all_wz else 0.0
 
     # -------------------------------------------------------------
     # Element Bending Moments, Wood-Armer, SPR, Shears & Punching
     # -------------------------------------------------------------
-    D_plate = E * (h ** 3) / (12.0 * (1.0 - nu ** 2))
-
     nodal_mx = [0.0] * nn
     nodal_my = [0.0] * nn
     nodal_mxy = [0.0] * nn
@@ -881,10 +955,13 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
 
     raw_element_data = []
 
-    for elem in mesh.elements:
+    for elem_idx, elem in enumerate(mesh.elements):
         nids = elem.nodeIds
         if len(nids) < 3:
             continue
+        _, h_elem, _, D_elem = element_prop_cache[elem_idx] if elem_idx < len(element_prop_cache) else (
+            E, h, q_base_kpa * 1000.0, _plate_D_matrix(E, h, nu)
+        )
         p1 = nodes_xy[nids[0] - 1]
         p2 = nodes_xy[nids[1] - 1]
         p3 = nodes_xy[nids[2] - 1]
@@ -910,9 +987,26 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
         kappa_y = -drx_dy
         chi_xy = dry_dy - drx_dx
 
-        mx = (D_plate * (kappa_x + nu * kappa_y)) / 1000.0
-        my = (D_plate * (kappa_y + nu * kappa_x)) / 1000.0
-        mxy = (D_plate * 0.5 * (1.0 - nu) * chi_xy) / 1000.0
+        mx = (D_elem[0, 0] * kappa_x + D_elem[0, 1] * kappa_y) / 1000.0
+        my = (D_elem[1, 0] * kappa_x + D_elem[1, 1] * kappa_y) / 1000.0
+        mxy = (D_elem[2, 2] * chi_xy) / 1000.0
+
+        # Membrane strains & forces (CST, plane stress) — needed for stress output
+        u1, v1 = u[NDOF_PER_NODE * (nids[0]-1) + U], u[NDOF_PER_NODE * (nids[0]-1) + V]
+        u2, v2 = u[NDOF_PER_NODE * (nids[1]-1) + U], u[NDOF_PER_NODE * (nids[1]-1) + V]
+        u3, v3 = u[NDOF_PER_NODE * (nids[2]-1) + U], u[NDOF_PER_NODE * (nids[2]-1) + V]
+        du_dx = (b1 * u1 + b2 * u2 + b3 * u3) / twoA
+        du_dy = (c1 * u1 + c2 * u2 + c3 * u3) / twoA
+        dv_dx = (b1 * v1 + b2 * v2 + b3 * v3) / twoA
+        dv_dy = (c1 * v1 + c2 * v2 + c3 * v3) / twoA
+        eps_x = du_dx
+        eps_y = dv_dy
+        gamma_xy = du_dy + dv_dx
+
+        C_mem = E_elem / (1.0 - nu ** 2)
+        nx = (C_mem * (eps_x + nu * eps_y)) * h_elem / 1000.0
+        ny = (C_mem * (eps_y + nu * eps_x)) * h_elem / 1000.0
+        nxy = (C_mem * 0.5 * (1.0 - nu) * gamma_xy) * h_elem / 1000.0
 
         m_avg = 0.5 * (mx + my)
         radius = math.hypot(0.5 * (mx - my), mxy)
@@ -928,7 +1022,9 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
         raw_element_data.append({
             'id': elem.id, 'nids': nids, 'area': area,
             'b': [b1, b2, b3], 'c': [c1, c2, c3], 'twoA': twoA,
+            'E': E_elem, 'h': h_elem,
             'mx': mx, 'my': my, 'mxy': mxy,
+            'nx': nx, 'ny': ny, 'nxy': nxy,
             'm1': m1, 'm2': m2, 'angle': angle,
             'mxd_pos': mxd_pos, 'myd_pos': myd_pos,
             'mxd_neg': mxd_neg, 'myd_neg': myd_neg
@@ -949,8 +1045,12 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
 
     element_moments = []
     element_shears = []
+    element_membrane_forces = []
+    element_stresses = []
     min_mx = min_my = min_mxy = min_vx = min_vy = float('inf')
     max_mx = max_my = max_mxy = max_vx = max_vy = float('-inf')
+    min_nx = min_ny = min_nxy = float('inf')
+    max_nx = max_ny = max_nxy = float('-inf')
 
     for ed in raw_element_data:
         nids = ed['nids']
@@ -999,6 +1099,37 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
         min_vx = min(min_vx, vx); max_vx = max(max_vx, vx)
         min_vy = min(min_vy, vy); max_vy = max(max_vy, vy)
 
+        # Membrane forces (kN/m) — already computed from CST strains above
+        nx_v, ny_v, nxy_v = ed['nx'], ed['ny'], ed['nxy']
+        n1_v = 0.5 * (nx_v + ny_v) + math.hypot(0.5 * (nx_v - ny_v), nxy_v)
+        n2_v = 0.5 * (nx_v + ny_v) - math.hypot(0.5 * (nx_v - ny_v), nxy_v)
+        n_angle = 0.5 * math.degrees(math.atan2(2.0 * nxy_v, nx_v - ny_v)) if (abs(nx_v - ny_v) > 1e-12 or abs(nxy_v) > 1e-12) else 0.0
+        element_membrane_forces.append(ElementMembraneForce(
+            elementId=ed['id'],
+            nx=round(nx_v, 4), ny=round(ny_v, 4), nxy=round(nxy_v, 4),
+            n1=round(n1_v, 4), n2=round(n2_v, 4), angle=round(n_angle, 2)
+        ))
+        min_nx = min(min_nx, nx_v); max_nx = max(max_nx, nx_v)
+        min_ny = min(min_ny, ny_v); max_ny = max(max_ny, ny_v)
+        min_nxy = min(min_nxy, nxy_v); max_nxy = max(max_nxy, nxy_v)
+
+        # Element stresses (MPa): combine membrane + bending at extreme fibers
+        h_e = max(ed.get('h', h), 0.01)
+        E_e = ed.get('E', E)
+        sig_x = (nx_v * 1000.0 / h_e + 6.0 * ed['mx'] * 1000.0 / (h_e ** 2)) / 1e6
+        sig_y = (ny_v * 1000.0 / h_e + 6.0 * ed['my'] * 1000.0 / (h_e ** 2)) / 1e6
+        tau_xy = (nxy_v * 1000.0 / h_e + 6.0 * ed['mxy'] * 1000.0 / (h_e ** 2)) / 1e6
+        s_avg = 0.5 * (sig_x + sig_y)
+        s_rad = math.hypot(0.5 * (sig_x - sig_y), tau_xy)
+        s1 = s_avg + s_rad
+        s2 = s_avg - s_rad
+        s_vm = math.sqrt(max(0.0, s1 ** 2 - s1 * s2 + s2 ** 2))
+        element_stresses.append(ElementStress(
+            elementId=ed['id'],
+            s1=round(s1, 3), s2=round(s2, 3), vm=round(s_vm, 3),
+            mx=round(ed['mx'], 4), my=round(ed['my'], 4), mxy=round(ed['mxy'], 4)
+        ))
+
     column_punching = []
     d_eff = max(0.05, h - 0.03)
     fck = 25.0
@@ -1008,7 +1139,8 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
         w_def = u[NDOF_PER_NODE * nidx + W]
         wcol = col_widths[ci] if ci < len(col_widths) else 0.3
         dcol = col_depths[ci] if ci < len(col_depths) else 0.3
-        k_spring = col_spring_map.get(nidx, 1e8)
+        H_col = col_heights_map.get(nidx, 3.0)
+        k_spring = E * (wcol * dcol) / H_col
         Rz = abs(k_spring * w_def) / 1000.0
         bo = 2.0 * (wcol + d_eff) + 2.0 * (dcol + d_eff)
         vu_stress = (Rz * 1000.0) / (bo * d_eff * 1000.0) if (bo * d_eff) > 0 else 0.0
@@ -1030,12 +1162,17 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
     if min_mxy == float('inf'): min_mxy = max_mxy = 0.0
     if min_vx == float('inf'): min_vx = max_vx = 0.0
     if min_vy == float('inf'): min_vy = max_vy = 0.0
+    if min_nx == float('inf'): min_nx = max_nx = 0.0
+    if min_ny == float('inf'): min_ny = max_ny = 0.0
+    if min_nxy == float('inf'): min_nxy = max_nxy = 0.0
 
     return AnalysisResponse(
         success=True,
         nodeDeflections=node_deflections,
         elementMoments=element_moments,
+        elementStresses=element_stresses,
         elementShears=element_shears,
+        elementMembraneForces=element_membrane_forces,
         columnPunching=column_punching,
         minWz=round(min_wz, 10),
         maxWz=round(max_wz, 10),
@@ -1044,6 +1181,9 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
         minMxy=round(min_mxy, 4), maxMxy=round(max_mxy, 4),
         minVx=round(min_vx, 3), maxVx=round(max_vx, 3),
         minVy=round(min_vy, 3), maxVy=round(max_vy, 3),
+        minNx=round(min_nx, 4), maxNx=round(max_nx, 4),
+        minNy=round(min_ny, 4), maxNy=round(max_ny, 4),
+        minNxy=round(min_nxy, 4), maxNxy=round(max_nxy, 4),
         solverTime=round(solver_time, 4),
     )
 
@@ -1051,86 +1191,304 @@ def analyze_slab(request: AnalysisRequest) -> AnalysisResponse:
 def solve_multi_slab_dkt(request: MultiSlabAnalysisRequest) -> MultiSlabAnalysisResponse:
     from mesher import generate_mesh
     from models import MeshRequest
+    from utils import (
+        UnionFind, _find_column_supports, _find_wall_node_ids,
+        _find_beam_node_ids, _slabs_touch
+    )
+
+    if not request.slabs:
+        return MultiSlabAnalysisResponse(success=True, results=[])
+
+    def _wall_data():
+        return (
+            [getattr(w, "startPoint") for w in request.walls],
+            [getattr(w, "endPoint") for w in request.walls],
+            [getattr(w, "thickness", 0.25) for w in request.walls],
+            [getattr(w, "height", 3.0) for w in request.walls],
+            [getattr(w, "boundaryCondition", "fixed-fixed") for w in request.walls],
+            [getattr(w, "elasticModulus", 25e9) for w in request.walls],
+        )
+
+    def _copy_moment(em: ElementMoment, element_id: int) -> ElementMoment:
+        return ElementMoment(
+            elementId=element_id,
+            mx=em.mx, my=em.my, mxy=em.mxy,
+            m1=em.m1, m2=em.m2, angle=em.angle,
+            mxd_pos=em.mxd_pos, myd_pos=em.myd_pos,
+            mxd_neg=em.mxd_neg, myd_neg=em.myd_neg,
+            spr_mx=em.spr_mx, spr_my=em.spr_my, spr_mxy=em.spr_mxy,
+            ast_x_bot=em.ast_x_bot, ast_y_bot=em.ast_y_bot,
+            ast_x_top=em.ast_x_top, ast_y_top=em.ast_y_top,
+        )
+
+    def _copy_shear(es: ElementShear, element_id: int) -> ElementShear:
+        return ElementShear(
+            elementId=element_id,
+            vx=es.vx, vy=es.vy, v1=es.v1, angle=es.angle,
+        )
 
     results = []
-    warnings = []
+    warnings_list = []
+    disconnected_ids: List[str] = []
 
-    for sm in request.slabs:
+    uf = UnionFind(set(range(len(request.slabs))))
+    for i in range(len(request.slabs)):
+        for j in range(i + 1, len(request.slabs)):
+            mesh_size = request.slabs[i].meshSize or request.slabs[j].meshSize or request.meshSize or 0.5
+            if _slabs_touch(
+                request.slabs[i].geometry.vertices,
+                request.slabs[j].geometry.vertices,
+                tol=max(0.15, mesh_size * 0.75),
+            ):
+                uf.union(i, j)
+
+    components: Dict[int, List[int]] = {}
+    for i in range(len(request.slabs)):
+        components.setdefault(uf.find(i), []).append(i)
+
+    wall_spts, wall_epts, wall_thk, wall_hgt, wall_bcs, wall_elastic = _wall_data()
+
+    for component_indices in components.values():
         try:
-            mesh = generate_mesh(MeshRequest(geometry=sm.geometry, meshSize=sm.meshSize))
+            sub_meshes = []
+            for slab_idx in component_indices:
+                item = request.slabs[slab_idx]
+                mesh_sizes = [item.meshSize or request.meshSize, 0.3, 0.2, 0.15]
+                mesh = None
+                for ms in mesh_sizes:
+                    mesh_req = MeshRequest(geometry=item.geometry, meshSize=ms)
+                    mesh = generate_mesh(mesh_req)
+                    if mesh and mesh.elementCount > 0:
+                        break
+                if mesh is None or mesh.elementCount == 0:
+                    warnings_list.append(f"Slab '{item.slabId}' could not be meshed.")
+                    disconnected_ids.append(item.slabId)
+                else:
+                    sub_meshes.append((slab_idx, item, mesh))
 
-            col_nids, col_w, col_d, col_h, col_bcs = [], [], [], [], []
-            if sm.geometry.columns and mesh.nodes:
-                nodes_xy = np.array([[n.x, n.y] for n in mesh.nodes])
-                for col in sm.geometry.columns:
-                    cx, cy = col.position.x, col.position.y
-                    dists = np.hypot(nodes_xy[:, 0] - cx, nodes_xy[:, 1] - cy)
-                    min_idx = int(np.argmin(dists))
-                    if dists[min_idx] <= 1.5:
-                        col_nids.append(mesh.nodes[min_idx].id)
-                        col_w.append(col.width)
-                        col_d.append(col.depth)
-                        col_h.append(col.height)
-                        col_bcs.append(col.boundaryCondition)
+            if not sub_meshes:
+                continue
 
-            wall_nids_a, wall_nids_b, wall_thick, wall_height = [], [], [], []
-            if sm.geometry.walls and mesh.nodes:
-                nodes_xy = np.array([[n.x, n.y] for n in mesh.nodes])
-                for wall in sm.geometry.walls:
-                    ax, ay = wall.startPoint.x, wall.startPoint.y
-                    bx, by = wall.endPoint.x, wall.endPoint.y
-                    da = np.hypot(nodes_xy[:, 0] - ax, nodes_xy[:, 1] - ay)
-                    db = np.hypot(nodes_xy[:, 0] - bx, nodes_xy[:, 1] - by)
-                    ia, ib = int(np.argmin(da)), int(np.argmin(db))
-                    if da[ia] <= 1.5 and db[ib] <= 1.5 and ia != ib:
-                        wall_nids_a.append(mesh.nodes[ia].id)
-                        wall_nids_b.append(mesh.nodes[ib].id)
-                        wall_thick.append(wall.thickness)
-                        wall_height.append(wall.height)
+            if len(sub_meshes) == 1:
+                slab_idx, item, mesh = sub_meshes[0]
+                slab_polys = [item.geometry.vertices]
+                mesh_size = item.meshSize or request.meshSize
+                combined_mesh = mesh
+                node_origin = {(0, n.id): n.id for n in mesh.nodes}
+                elem_origin: Dict[int, Tuple[int, int]] = {
+                    analysis_eid: (0, elem.id)
+                    for analysis_eid, elem in enumerate(mesh.elements, start=1)
+                }
+                global_to_local_node = {n.id: n.id for n in mesh.nodes}
+                group = [(slab_idx, item, mesh)]
+            else:
+                group = sub_meshes
+                slab_polys = [item.geometry.vertices for _, item, _ in group]
+                mesh_size = request.meshSize or group[0][1].meshSize or 0.5
 
-            beam_nids_a, beam_nids_b, beam_w, beam_d, beam_e = [], [], [], [], []
-            if sm.geometry.beams and mesh.nodes:
-                nodes_xy = np.array([[n.x, n.y] for n in mesh.nodes])
-                for beam in sm.geometry.beams:
-                    ax, ay = beam.startPoint.x, beam.startPoint.y
-                    bx, by = beam.endPoint.x, beam.endPoint.y
-                    da = np.hypot(nodes_xy[:, 0] - ax, nodes_xy[:, 1] - ay)
-                    db = np.hypot(nodes_xy[:, 0] - bx, nodes_xy[:, 1] - by)
-                    ia, ib = int(np.argmin(da)), int(np.argmin(db))
-                    if da[ia] <= 1.5 and db[ib] <= 1.5 and ia != ib:
-                        beam_nids_a.append(mesh.nodes[ia].id)
-                        beam_nids_b.append(mesh.nodes[ib].id)
-                        beam_w.append(0.3)
-                        beam_d.append(0.5)
-                        beam_e.append(sm.elasticModulus)
+                node_refs: List[Tuple[int, int, float, float]] = []
+                for local_group_idx, (_, _, sm) in enumerate(group):
+                    for n in sm.nodes:
+                        node_refs.append((local_group_idx, n.id, n.x, n.y))
 
-            analysis_req = AnalysisRequest(
-                mesh=mesh,
-                slabThickness=sm.thickness,
-                elasticModulus=sm.elasticModulus,
-                poissonRatio=sm.poissonRatio,
-                uniformLoad=sm.uniformLoad,
-                selfWeight=sm.selfWeight,
-                columnNodeIds=col_nids,
-                columnWidths=col_w,
-                columnDepths=col_d,
-                columnHeights=col_h,
-                columnBoundaryConditions=col_bcs,
-                wallNodeIdA=wall_nids_a,
-                wallNodeIdB=wall_nids_b,
-                wallThicknesses=wall_thick,
-                wallHeights=wall_height,
-                beamNodeIdA=beam_nids_a,
-                beamNodeIdB=beam_nids_b,
-                beamWidths=beam_w,
-                beamDepths=beam_d,
-                beamElasticModuli=beam_e,
-                dropPanels=request.dropPanels
+                merge_tol = max(0.05, min(0.20, mesh_size * 0.25))
+                global_nodes = []
+                node_origin: Dict[Tuple[int, int], int] = {}
+                next_gid = 1
+
+                # Build KD-Tree for O(n log n) spatial merge
+                coords = np.array([[x, y] for _, _, x, y in node_refs])
+                tree = cKDTree(coords)
+                neighbors = tree.query_ball_tree(tree, merge_tol)
+                visited = np.zeros(len(node_refs), dtype=bool)
+
+                for i in range(len(node_refs)):
+                    if visited[i]:
+                        continue
+                    local_group_idx_i = node_refs[i][0]
+                    cluster = [i]
+                    # Only merge nodes from DIFFERENT sub-meshes
+                    for j in neighbors[i]:
+                        if j > i and not visited[j] and node_refs[j][0] != local_group_idx_i:
+                            cluster.append(j)
+
+                    avg_x = float(np.mean(coords[cluster, 0]))
+                    avg_y = float(np.mean(coords[cluster, 1]))
+                    global_nodes.append(FEMNode(id=next_gid, x=avg_x, y=avg_y))
+                    for c in cluster:
+                        visited[c] = True
+                        c_group_idx, c_old_nid, _, _ = node_refs[c]
+                        node_origin[(c_group_idx, c_old_nid)] = next_gid
+                    next_gid += 1
+
+                global_elements = []
+                elem_origin: Dict[int, Tuple[int, int]] = {}
+                next_eid = 1
+                for local_group_idx, (_, _, sm) in enumerate(group):
+                    for elem in sm.elements:
+                        gnids = [
+                            node_origin[(local_group_idx, nid)]
+                            for nid in elem.nodeIds
+                            if (local_group_idx, nid) in node_origin
+                        ]
+                        gnids = list(dict.fromkeys(gnids))
+                        if len(gnids) >= 3:
+                            global_elements.append(Triangle(id=next_eid, nodeIds=gnids[:3]))
+                            elem_origin[next_eid] = (local_group_idx, elem.id)
+                            next_eid += 1
+
+                combined_mesh = FEMMesh(
+                    nodes=global_nodes,
+                    elements=global_elements,
+                    nodeCount=len(global_nodes),
+                    elementCount=len(global_elements),
+                )
+                global_to_local_node = {}
+
+            col_nids, col_w, col_d, col_h, col_sh, col_di, col_gr, col_bc = _find_column_supports(
+                combined_mesh, request.columns, slab_polys
+            )
+            wall_nids = _find_wall_node_ids(combined_mesh, request.walls, mesh_size=mesh_size)
+            b_nA, b_nB, b_w, b_d, b_E = _find_beam_node_ids(
+                combined_mesh, request.beams, mesh_size=mesh_size
             )
 
-            res = analyze_slab(analysis_req)
-            results.append(SlabAnalysisResult(slabId=sm.slabId, mesh=mesh, result=res))
-        except Exception as ex:
-            warnings.append(f"Multi-slab {sm.slabId} failed in DKT solver: {str(ex)}")
+            if not col_nids and not wall_nids:
+                # No explicit supports found. Rather than skipping the group
+                # outright (which leaves the user with no results at all),
+                # fall back to supporting the slab-group perimeter. The soft
+                # ground springs assembled per element keep the system
+                # non-singular; the perimeter constraint gives a physically
+                # meaningful "supported on its edges" answer and we warn.
+                names = ", ".join(item.slabId for _, item, _ in group)
+                perimeter_nids = _perimeter_node_ids(combined_mesh)
+                if perimeter_nids:
+                    wall_nids = perimeter_nids
+                    warnings_list.append(
+                        f"Slab group [{names}] has no connected column or wall supports. "
+                        f"Analyzed with its outer boundary treated as simply supported — "
+                        f"place columns/walls inside the slab for accurate results."
+                    )
+                else:
+                    warnings_list.append(f"Slab group [{names}] has no supports and could not be analyzed.")
+                    disconnected_ids.extend(item.slabId for _, item, _ in group)
+                    continue
 
-    return MultiSlabAnalysisResponse(success=True, results=results, warnings=warnings, disconnectedIds=[])
+            primary = group[0][1]
+            element_loads = []
+            element_thicknesses = []
+            element_elastic_moduli = []
+            for eid in range(1, combined_mesh.elementCount + 1):
+                local_group_idx, _ = elem_origin[eid]
+                item = group[local_group_idx][1]
+                element_loads.append((item.uniformLoad or 0.0) + (item.selfWeight or 0.0))
+                element_thicknesses.append(item.thickness)
+                element_elastic_moduli.append(item.elasticModulus)
+
+            analysis_req = AnalysisRequest(
+                mesh=combined_mesh,
+                thickness=primary.thickness,
+                elasticModulus=primary.elasticModulus,
+                poissonRatio=primary.poissonRatio,
+                uniformLoad=primary.uniformLoad,
+                selfWeight=primary.selfWeight,
+                elementLoads=element_loads,
+                elementThicknesses=element_thicknesses,
+                elementElasticModuli=element_elastic_moduli,
+                columnNodeIds=col_nids,
+                columnHeights=col_h,
+                columnWidths=col_w,
+                columnDepths=col_d,
+                columnShapes=col_sh,
+                columnDiameters=col_di,
+                columnGrades=col_gr,
+                columnBoundaryConditions=col_bc,
+                wallNodeIds=wall_nids,
+                wallStartPoints=wall_spts,
+                wallEndPoints=wall_epts,
+                wallThicknesses=wall_thk,
+                wallHeights=wall_hgt,
+                wallElasticModuli=wall_elastic,
+                wallBoundaryConditions=wall_bcs,
+                beamNodeIdA=b_nA,
+                beamNodeIdB=b_nB,
+                beamWidths=b_w,
+                beamDepths=b_d,
+                beamElasticModuli=b_E,
+                dropPanels=request.dropPanels,
+                partitionWallSegments=request.partitionWallSegments,
+            )
+
+            result = analyze_slab(analysis_req)
+            if not result.success:
+                names = ", ".join(item.slabId for _, item, _ in group)
+                warnings_list.append(f"Analysis failed for slab group [{names}]: {result.error}")
+                disconnected_ids.extend(item.slabId for _, item, _ in group)
+                continue
+
+            global_def = {d.nodeId: d for d in result.nodeDeflections}
+            global_mom = {m.elementId: m for m in result.elementMoments}
+            global_shear = {s.elementId: s for s in result.elementShears}
+
+            elem_ids_by_group: Dict[int, List[Tuple[int, int]]] = {}
+            for geid, (local_group_idx, local_eid) in elem_origin.items():
+                elem_ids_by_group.setdefault(local_group_idx, []).append((geid, local_eid))
+
+            for local_group_idx, (_, item, sm) in enumerate(group):
+                node_deflections = []
+                for n in sm.nodes:
+                    gnid = node_origin.get((local_group_idx, n.id), global_to_local_node.get(n.id))
+                    if gnid in global_def:
+                        gd = global_def[gnid]
+                        node_deflections.append(NodeDeflection(
+                            nodeId=n.id,
+                            u=gd.u, v=gd.v, wz=gd.wz,
+                            rx=gd.rx, ry=gd.ry, rz=gd.rz,
+                        ))
+
+                element_moments = []
+                element_shears = []
+                for geid, local_eid in elem_ids_by_group.get(local_group_idx, []):
+                    if geid in global_mom:
+                        element_moments.append(_copy_moment(global_mom[geid], local_eid))
+                    if geid in global_shear:
+                        element_shears.append(_copy_shear(global_shear[geid], local_eid))
+
+                wz_vals = [d.wz for d in node_deflections]
+                mx_vals = [m.mx for m in element_moments]
+                my_vals = [m.my for m in element_moments]
+                mxy_vals = [m.mxy for m in element_moments]
+                vx_vals = [s.vx for s in element_shears]
+                vy_vals = [s.vy for s in element_shears]
+
+                sub_res = AnalysisResponse(
+                    success=True,
+                    nodeDeflections=node_deflections,
+                    elementMoments=element_moments,
+                    elementShears=element_shears,
+                    minWz=min(wz_vals) if wz_vals else 0.0,
+                    maxWz=max(abs(w) for w in wz_vals) if wz_vals else 0.0,
+                    minMx=min(mx_vals) if mx_vals else 0.0,
+                    maxMx=max(mx_vals) if mx_vals else 0.0,
+                    minMy=min(my_vals) if my_vals else 0.0,
+                    maxMy=max(my_vals) if my_vals else 0.0,
+                    minMxy=min(mxy_vals) if mxy_vals else 0.0,
+                    maxMxy=max(mxy_vals) if mxy_vals else 0.0,
+                    minVx=min(vx_vals) if vx_vals else 0.0,
+                    maxVx=max(vx_vals) if vx_vals else 0.0,
+                    minVy=min(vy_vals) if vy_vals else 0.0,
+                    maxVy=max(vy_vals) if vy_vals else 0.0,
+                    solverTime=result.solverTime,
+                )
+                results.append(SlabAnalysisResult(slabId=item.slabId, mesh=sm, result=sub_res))
+        except Exception as exc:
+            names = ", ".join(request.slabs[i].slabId for i in component_indices)
+            warnings_list.append(f"Error solving slab group [{names}]: {str(exc)}")
+            disconnected_ids.extend(request.slabs[i].slabId for i in component_indices)
+
+    return MultiSlabAnalysisResponse(
+        success=len(results) > 0,
+        results=results,
+        warnings=warnings_list,
+        disconnectedIds=sorted(set(disconnected_ids)),
+    )

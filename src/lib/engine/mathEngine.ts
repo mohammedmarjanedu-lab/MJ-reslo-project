@@ -141,8 +141,9 @@ export function computeShearWallStiffness(wall: ShearWallElement): ElementStiffn
   const G = shearModulusFallback(G_in, E);
   const nu = wall.poissonRatio ?? 0.2;
   const alpha = Math.atan2(dy, dx);
-  const k_in = shearWallInPlaneStiffness(L, t, H, E, G, 3);
-  const k_out = shearWallOutOfPlaneStiffness(L, t, H, E, 3, nu);
+  const endFixity = boundaryCondition === 'fixed-free' ? 3 : 12;
+  const k_in = shearWallInPlaneStiffness(L, t, H, E, G, endFixity);
+  const k_out = shearWallOutOfPlaneStiffness(L, t, H, E, endFixity, nu);
   const { kx, ky, kxy } = rotateWallStiffness(k_in, k_out, alpha);
   return { id: wall.id, position, kx, ky, kxy, weight };
 }
@@ -164,6 +165,7 @@ export function computePolylineWallStiffness(wall: PolylineWallElement): Element
   let wposX = 0, wposY = 0, wSum = 0;
   const G = shearModulusFallback(wall.shearModulus, wall.elasticModulus);
   const nu = wall.poissonRatio ?? 0.2;
+  const endFixity = wall.boundaryCondition === 'fixed-free' ? 3 : 12;
   for (let i = 0; i < wall.vertices.length - 1; i++) {
     const a = wall.vertices[i];
     const b = wall.vertices[i + 1];
@@ -172,8 +174,8 @@ export function computePolylineWallStiffness(wall: PolylineWallElement): Element
     const L = Math.sqrt(dx * dx + dy * dy);
     if (L < 1e-10) continue;
     const alpha = Math.atan2(dy, dx);
-    const k_seg_in = shearWallInPlaneStiffness(L, wall.thickness, wall.height, wall.elasticModulus, G, 3);
-    const k_seg_out = shearWallOutOfPlaneStiffness(L, wall.thickness, wall.height, wall.elasticModulus, 3, nu);
+    const k_seg_in = shearWallInPlaneStiffness(L, wall.thickness, wall.height, wall.elasticModulus, G, endFixity);
+    const k_seg_out = shearWallOutOfPlaneStiffness(L, wall.thickness, wall.height, wall.elasticModulus, endFixity, nu);
     const { kx: segKx, ky: segKy, kxy: segKxy } = rotateWallStiffness(k_seg_in, k_seg_out, alpha);
     kx += segKx;
     ky += segKy;
@@ -402,38 +404,12 @@ export function computeGlobalMetrics(
     cr = { ...cm };
   }
 
-  const staticCr = { ...cr };
-  const usingBackend = !!backendCR;
   if (backendCR) {
     cr = backendCR;
   }
 
   const ex = Math.abs(cm.x - cr.x);
   const ey = Math.abs(cm.y - cr.y);
-
-  if (typeof console !== 'undefined') {
-    const detailRows = allStiff.map(s =>
-      `  ${s.id.padEnd(12)} pos=(${s.position.x.toFixed(3)},${s.position.y.toFixed(3)})  kx=${s.kx.toExponential(3)}  ky=${s.ky.toExponential(3)}  kxy=${s.kxy.toExponential(3)}`
-    ).join('\n');
-    const label = usingBackend ? '3D Finite Element (Kratos Multiphysics)' : 'Weighted-Centroid (no kθ)';
-    console.log(
-      `%c[CR Debug]%c Center-of-Rigidity calculation\n` +
-      `─ Method ─────────────────────────────────────\n` +
-      `  Using ${label}\n` +
-      `  Xcr = Σ(x·ky) / Σ(ky)\n` +
-      `  Ycr = Σ(y·kx) / Σ(kx)\n` +
-      `─ Elements ───────────────────────────────────\n${detailRows}\n` +
-      `─ Weighted Sums ────────────────────────────\n` +
-      `  Σkx = ${sumKx.toExponential(4)}   Σky = ${sumKy.toExponential(4)}\n` +
-      `─ CR Result ───────────────────────────────\n` +
-      `  CR  = (${staticCr.x.toFixed(4)}, ${staticCr.y.toFixed(4)})\n` +
-      `─ Final Results ─────────────────────────────\n` +
-      `  CR  = (${cr.x.toFixed(4)}, ${cr.y.toFixed(4)})\n` +
-      `  CM  = (${cm.x.toFixed(4)}, ${cm.y.toFixed(4)})\n` +
-      `  ex  = ${ex.toFixed(4)}   ey   = ${ey.toFixed(4)}`,
-      'color:#6366f1;font-weight:700', 'color:inherit;font-weight:400'
-    );
-  }
 
   const slabBbox = allSlabVerts.length >= 3 ? computeBoundingBox(allSlabVerts) : null;
   const planDimX = slabBbox ? slabBbox.width : 1;

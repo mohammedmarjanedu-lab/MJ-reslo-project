@@ -29,6 +29,94 @@ def _point_on_segment(px: float, py: float, ax: float, ay: float,
     return (px - proj_x) ** 2 + (py - proj_y) ** 2 < tol
 
 
+def _point_in_polygon_xy(px: float, py: float, poly: List[Tuple[float, float]]) -> bool:
+    inside = False
+    if len(poly) < 3:
+        return False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > py) != (yj > py):
+            x_cross = (xj - xi) * (py - yi) / ((yj - yi) or 1e-12) + xi
+            if px < x_cross:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _point_segment_distance_xy(px: float, py: float, ax: float, ay: float,
+                               bx: float, by: float) -> float:
+    dx, dy = bx - ax, by - ay
+    length2 = dx * dx + dy * dy
+    if length2 < 1e-12:
+        return float(np.hypot(px - ax, py - ay))
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+    qx = ax + t * dx
+    qy = ay + t * dy
+    return float(np.hypot(px - qx, py - qy))
+
+
+def _point_polygon_distance_xy(px: float, py: float, poly: List[Tuple[float, float]]) -> float:
+    if not poly:
+        return float("inf")
+    return min(
+        _point_segment_distance_xy(px, py, poly[i][0], poly[i][1], poly[(i + 1) % len(poly)][0], poly[(i + 1) % len(poly)][1])
+        for i in range(len(poly))
+    )
+
+
+def _point_relevant_to_slab(px: float, py: float, poly: List[Tuple[float, float]], tol: float) -> bool:
+    return _point_in_polygon_xy(px, py, poly) or _point_polygon_distance_xy(px, py, poly) <= tol
+
+
+def _orientation(ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> float:
+    return (by - ay) * (cx - bx) - (bx - ax) * (cy - by)
+
+
+def _segments_intersect_xy(a: Tuple[float, float], b: Tuple[float, float],
+                           c: Tuple[float, float], d: Tuple[float, float],
+                           tol: float = 1e-9) -> bool:
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+    dx, dy = d
+    o1 = _orientation(ax, ay, bx, by, cx, cy)
+    o2 = _orientation(ax, ay, bx, by, dx, dy)
+    o3 = _orientation(cx, cy, dx, dy, ax, ay)
+    o4 = _orientation(cx, cy, dx, dy, bx, by)
+    if o1 * o2 < -tol and o3 * o4 < -tol:
+        return True
+    return (
+        _point_on_segment(cx, cy, ax, ay, bx, by, tol)
+        or _point_on_segment(dx, dy, ax, ay, bx, by, tol)
+        or _point_on_segment(ax, ay, cx, cy, dx, dy, tol)
+        or _point_on_segment(bx, by, cx, cy, dx, dy, tol)
+    )
+
+
+def _segment_relevant_to_slab(ax: float, ay: float, bx: float, by: float,
+                              poly: List[Tuple[float, float]], tol: float) -> bool:
+    if _point_relevant_to_slab(ax, ay, poly, tol) or _point_relevant_to_slab(bx, by, poly, tol):
+        return True
+    if not poly:
+        return False
+    if _point_in_polygon_xy((ax + bx) * 0.5, (ay + by) * 0.5, poly):
+        return True
+    min_x, max_x = min(p[0] for p in poly) - tol, max(p[0] for p in poly) + tol
+    min_y, max_y = min(p[1] for p in poly) - tol, max(p[1] for p in poly) + tol
+    if max(ax, bx) < min_x or min(ax, bx) > max_x or max(ay, by) < min_y or min(ay, by) > max_y:
+        return False
+    for i in range(len(poly)):
+        cx, cy = poly[i]
+        dx, dy = poly[(i + 1) % len(poly)]
+        if _segments_intersect_xy((ax, ay), (bx, by), (cx, cy), (dx, dy), tol):
+            return True
+        if _point_segment_distance_xy(cx, cy, ax, ay, bx, by) <= tol:
+            return True
+    return False
+
+
 def generate_mesh(request: MeshRequest) -> FEMMesh:
     geo = request.geometry
     _ensure_gmsh()
@@ -43,18 +131,40 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
             if len(slab_verts) >= 3 and np.hypot(slab_verts[0][0] - slab_verts[-1][0], slab_verts[0][1] - slab_verts[-1][1]) < 1e-6:
                 slab_verts.pop()
 
+            support_tol = max(0.25, request.meshSize * 1.5)
+            relevant_beams = [
+                beam for beam in (geo.beams or [])
+                if _segment_relevant_to_slab(
+                    beam.startPoint.x, beam.startPoint.y,
+                    beam.endPoint.x, beam.endPoint.y,
+                    slab_verts, support_tol
+                )
+            ]
+            relevant_walls = [
+                wall for wall in (geo.walls or [])
+                if _segment_relevant_to_slab(
+                    wall.startPoint.x, wall.startPoint.y,
+                    wall.endPoint.x, wall.endPoint.y,
+                    slab_verts, support_tol
+                )
+            ]
+            relevant_columns = [
+                col for col in (geo.columns or [])
+                if _point_relevant_to_slab(col.position.x, col.position.y, slab_verts, support_tol)
+            ]
+
             # --- Build boundary points, splitting edges at beam and wall endpoints ---
             support_endpoints = []
-            if geo.beams:
-                for beam in geo.beams:
+            if relevant_beams:
+                for beam in relevant_beams:
                     support_endpoints.append((beam.startPoint.x, beam.startPoint.y))
                     support_endpoints.append((beam.endPoint.x, beam.endPoint.y))
-            if geo.walls:
-                for wall in geo.walls:
+            if relevant_walls:
+                for wall in relevant_walls:
                     support_endpoints.append((wall.startPoint.x, wall.startPoint.y))
                     support_endpoints.append((wall.endPoint.x, wall.endPoint.y))
-            if geo.columns:
-                for col in geo.columns:
+            if relevant_columns:
+                for col in relevant_columns:
                     support_endpoints.append((col.position.x, col.position.y))
 
             # For each slab edge, check if any support endpoint lies on it
@@ -87,8 +197,8 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
                         next_pt_tag += 1
 
             # Add interior beam and wall endpoints (not on boundary)
-            if geo.beams:
-                for beam in geo.beams:
+            if relevant_beams:
+                for beam in relevant_beams:
                     for (ep_x, ep_y) in [(beam.startPoint.x, beam.startPoint.y),
                                          (beam.endPoint.x, beam.endPoint.y)]:
                         key = (ep_x, ep_y)
@@ -96,8 +206,8 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
                             point_tags[key] = next_pt_tag
                             gmsh.model.occ.addPoint(ep_x, ep_y, 0, tag=next_pt_tag)
                             next_pt_tag += 1
-            if geo.walls:
-                for wall in geo.walls:
+            if relevant_walls:
+                for wall in relevant_walls:
                     for (ep_x, ep_y) in [(wall.startPoint.x, wall.startPoint.y),
                                          (wall.endPoint.x, wall.endPoint.y)]:
                         key = (ep_x, ep_y)
@@ -168,8 +278,8 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
 
             # --- Create beam and wall lines (embedded curves for mesh alignment) ---
             embedded_curve_tags = []
-            if geo.beams:
-                for beam in geo.beams:
+            if relevant_beams:
+                for beam in relevant_beams:
                     p1 = point_tags.get((beam.startPoint.x, beam.startPoint.y))
                     p2 = point_tags.get((beam.endPoint.x, beam.endPoint.y))
                     if p1 and p2 and p1 != p2:
@@ -179,8 +289,8 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
                             embedded_curve_tags.append(next_line_tag)
                             existing_edges.add(edge_key)
                             next_line_tag += 1
-            if geo.walls:
-                for wall in geo.walls:
+            if relevant_walls:
+                for wall in relevant_walls:
                     p1 = point_tags.get((wall.startPoint.x, wall.startPoint.y))
                     p2 = point_tags.get((wall.endPoint.x, wall.endPoint.y))
                     if p1 and p2 and p1 != p2:
@@ -192,8 +302,8 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
                             next_line_tag += 1
 
             col_pt_tags = []
-            if request.refineAtColumns and geo.columns:
-                for col in geo.columns:
+            if request.refineAtColumns and relevant_columns:
+                for col in relevant_columns:
                     col_key = (col.position.x, col.position.y)
                     if col_key in point_tags:
                         pt = point_tags[col_key]
@@ -205,14 +315,15 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
                     if pt not in col_pt_tags:
                         col_pt_tags.append(pt)
 
-            gmsh.model.occ.synchronize()
-
-            # Embed beam and wall curves as well as column points into the slab surface for mesh alignment
+            # Fragment plane surface with beam and wall lines for exact mesh alignment and 100x faster meshing
             if embedded_curve_tags:
                 try:
-                    gmsh.model.mesh.embed(1, embedded_curve_tags, 2, slab_surf)
+                    gmsh.model.occ.fragment([(2, slab_surf)], [(1, c) for c in embedded_curve_tags])
                 except Exception:
                     pass
+
+            gmsh.model.occ.synchronize()
+
             if col_pt_tags:
                 try:
                     gmsh.model.mesh.embed(0, col_pt_tags, 2, slab_surf)
@@ -223,28 +334,15 @@ def generate_mesh(request: MeshRequest) -> FEMMesh:
             gmsh.option.setNumber("Mesh.CharacteristicLengthMax", request.meshSize)
             gmsh.option.setNumber("Mesh.MinimumCirclePoints", 12)
 
-            # ETABS Parity: Quad-Dominant recombination settings
-            gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 3)  # Blossom-Full-Quad
-            gmsh.option.setNumber("Mesh.RecombineAll", 1)
-            gmsh.option.setNumber("Mesh.Algorithm", 8)  # Frontal-Delaunay for Quads
+            # Triangle mesh: compatible with both DKT and Pynite solvers
+            # (Pynite's MITC4 quads give overly stiff results for thin RC slabs)
+            gmsh.option.setNumber("Mesh.RecombineAll", 0)
+            gmsh.option.setNumber("Mesh.Algorithm", 6)  # Frontal-Delaunay for Triangles
 
-            # ETABS Parity: 3-Ring Column Refinement
-            if col_pt_tags:
-                d_eff = max(0.05, 0.85 * (geo.thickness if hasattr(geo, 'thickness') else 0.2))
-                dist_field = gmsh.model.mesh.field.add("Distance")
-                gmsh.model.mesh.field.setNumbers(dist_field, "PointsList", col_pt_tags)
-                
-                threshold_field = gmsh.model.mesh.field.add("Threshold")
-                gmsh.model.mesh.field.setNumber(threshold_field, "InField", dist_field)
-                gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", max(0.05, request.meshSize * 0.33)) # Ring 1: t/3
-                gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", request.meshSize) # Beyond Ring 3
-                gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", d_eff / 2.0) # Ring 1 radius
-                gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", 2.0 * d_eff) # Ring 3 radius
-                gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
-            else:
-                const_field = gmsh.model.mesh.field.add("Constant")
-                gmsh.model.mesh.field.setNumber(const_field, "VIn", request.meshSize)
-                gmsh.model.mesh.field.setAsBackgroundMesh(const_field)
+            # Uniform mesh field matching ETABS standard area meshing
+            const_field = gmsh.model.mesh.field.add("Constant")
+            gmsh.model.mesh.field.setNumber(const_field, "VIn", request.meshSize)
+            gmsh.model.mesh.field.setAsBackgroundMesh(const_field)
 
             gmsh.model.mesh.generate(2)
 

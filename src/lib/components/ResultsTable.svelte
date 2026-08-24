@@ -17,6 +17,12 @@
 
   const rows = $derived(results ?? [...femState.slabResults.values()]);
   const activeId = $derived(activeSlabId ?? femState.activeSlabId);
+  const skippedSlabs = $derived(
+    model.slabs.filter((s) =>
+      (femState.disconnectedIds.has(s.id) || femState.disconnectedIds.has(s.label)) &&
+      !rows.some((r) => r.slabId === s.id || r.slabId === s.label)
+    )
+  );
 
   const fmt = (v: number | undefined, digits = 2): string => {
     if (v === undefined || !isFinite(v)) return '—';
@@ -55,7 +61,7 @@
     Slab Results
   </div>
 
-  {#if rows.length === 0}
+  {#if rows.length === 0 && skippedSlabs.length === 0}
     <div class="px-3 py-4 text-center text-slate-500">No analysis results</div>
   {:else}
     <div class="overflow-x-auto custom-scrollbar">
@@ -83,6 +89,15 @@
               <td class="px-2 py-1.5 text-center font-mono font-bold {statusClass(worstStatus(r))}">
                 {worstStatus(r) ?? '—'}
               </td>
+            </tr>
+          {/each}
+          {#each skippedSlabs as slab (slab.id)}
+            <tr class="border-t border-red-900/50 bg-red-950/20">
+              <td class="px-2 py-1.5 font-medium text-red-200">{slab.label || slab.id}</td>
+              <td class="px-2 py-1.5 text-right font-mono text-slate-500">0</td>
+              <td class="px-2 py-1.5 text-right font-mono text-slate-500">0</td>
+              <td class="px-2 py-1.5 text-right font-mono text-slate-500">—</td>
+              <td class="px-2 py-1.5 text-center font-mono font-bold text-red-300">UNSUPPORTED</td>
             </tr>
           {/each}
         </tbody>

@@ -245,7 +245,7 @@ export function checkDeflection(
 ): DeflectionCheckResult {
   let maxDefl = 0;
   for (const d of result.nodeDeflections) {
-    const abs = Math.abs(d.wz * 1000); // mm
+    const abs = Math.abs(d.wz); // mm
     if (abs > maxDefl) maxDefl = abs;
   }
   // Determine effective span: longest clear span of the slab
